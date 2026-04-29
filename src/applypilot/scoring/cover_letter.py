@@ -67,13 +67,17 @@ def _build_cover_letter_prompt(profile: dict) -> str:
 
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
 
-STRUCTURE: 3 short paragraphs. Under 250 words. Every sentence must earn its place.
+STRUCTURE: 3 short paragraphs. Under 250 words. Every sentence must earn its place. There should be a blank line seperating each paragraph. Font should be Times New Roman throughout. Font size should be 12 throughout. Text should be left-aligned, not centered. 
+
+Start with "Dear Hiring Manager,". The first paragraph that follows should be seperated by a blank line.
 
 PARAGRAPH 1 (2-3 sentences): Open with a specific thing YOU built that solves THEIR problem. Not "I'm excited about this role." Not "This role aligns with my experience." Start with the work.
 
 PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST relevant to THIS job. Use numbers. Frame as solving their problem, not listing your accomplishments.{projects_hint}{metrics_hint}
 
 PARAGRAPH 3 (1-2 sentences): One specific thing about the company from the job description (a product, a technical challenge, a team structure). Then close. "Happy to walk through any of this in more detail." or "Let's discuss." Nothing else.
+
+Make sure each and every paragraph is included. 
 
 BANNED WORDS AND PHRASES (automated validator rejects ANY of these — do not use even once):
 {all_banned}

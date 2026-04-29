@@ -18,7 +18,7 @@ def parse_resume(text: str) -> dict:
     """Parse a structured text resume into sections.
 
     Expects a format with header lines (name, title, location, contact)
-    followed by ALL-CAPS section headers (SUMMARY, TECHNICAL SKILLS, etc.).
+    followed by ALL-CAPS section headers (TECHNICAL SKILLS, etc.).
 
     Args:
         text: Full resume text.
@@ -28,30 +28,30 @@ def parse_resume(text: str) -> dict:
     """
     lines = [line.rstrip() for line in text.strip().split("\n")]
 
-    # Header: first few lines before SUMMARY
+    # Header: first few lines before EDUCATION
     header_lines: list[str] = []
     body_start = 0
     for i, line in enumerate(lines):
-        if line.strip().upper() == "SUMMARY":
+        if line.strip().upper() == "EDUCATION":
             body_start = i
             break
         if line.strip():
             header_lines.append(line.strip())
 
     name = header_lines[0] if len(header_lines) > 0 else ""
-    title = header_lines[1] if len(header_lines) > 1 else ""
+    # title = header_lines[1] if len(header_lines) > 1 else ""
     # The header may have 3 or 4 lines depending on whether location is included
     location = ""
     contact = ""
-    if len(header_lines) > 3:
-        location = header_lines[2]
-        contact = header_lines[3]
-    elif len(header_lines) > 2:
+    if len(header_lines) > 2:
+        location = header_lines[1]
+        contact = header_lines[2]
+    elif len(header_lines) > 1:
         # Could be location or contact -- check for email/phone indicators
-        if "@" in header_lines[2] or "|" in header_lines[2]:
-            contact = header_lines[2]
+        if "@" in header_lines[1] or "|" in header_lines[1]:
+            contact = header_lines[1]
         else:
-            location = header_lines[2]
+            location = header_lines[1]
 
     # Split body into sections by ALL-CAPS headers
     sections: dict[str, str] = {}
@@ -80,7 +80,6 @@ def parse_resume(text: str) -> dict:
 
     return {
         "name": name,
-        "title": title,
         "location": location,
         "contact": contact,
         "sections": sections,
@@ -106,13 +105,13 @@ def parse_skills(text: str) -> list[tuple[str, str]]:
 
 
 def parse_entries(text: str) -> list[dict]:
-    """Parse experience/project entries from section text.
+    f"""Parse experience/project entries from section text.
 
     Args:
         text: The EXPERIENCE or PROJECTS section text.
 
     Returns:
-        List of {"title": str, "subtitle": str, "bullets": list[str]} dicts.
+        List of {"bullets": list[str]} dicts.
     """
     entries: list[dict] = []
     lines = text.strip().split("\n")
@@ -197,9 +196,9 @@ def build_html(resume: dict) -> str:
         edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
 
     # Summary
-    summary_html = ""
-    if "SUMMARY" in sections:
-        summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
+    # summary_html = ""
+    # if "SUMMARY" in sections:
+    #     summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
 
     # Contact line parsing
     contact = resume["contact"]
@@ -272,11 +271,6 @@ body {{
     padding-bottom: 1px;
     margin-bottom: 3px;
 }}
-.summary {{
-    font-size: 9.5pt;
-    color: #333;
-    line-height: 1.4;
-}}
 .skill-row {{
     font-size: 9.5pt;
     margin: 0;
@@ -318,15 +312,14 @@ li {{
 <body>
 <div class="header">
     <div class="name">{resume['name']}</div>
-    <div class="title">{resume['title']}</div>
     {location_html}
     <div class="contact">{contact_html}</div>
 </div>
-{summary_html}
-{skills_html}
+{edu_html}
 {exp_html}
 {proj_html}
-{edu_html}
+{skills_html}
+
 </body>
 </html>"""
 

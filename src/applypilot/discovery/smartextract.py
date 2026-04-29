@@ -27,6 +27,7 @@ import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
@@ -167,7 +168,17 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
         page.on("response", on_response)
 
         page.goto(url, timeout=60000)
-        page.wait_for_load_state("networkidle")
+
+        # Two-tier wait: DOM first (cheap, almost always succeeds), then a
+        # short networkidle attempt. Many job boards (PowerToFly, Himalayas,
+        # CareerJet, etc.) never reach networkidle because of continuous
+        # analytics/ads/poll traffic, so we cap the wait at 8s and proceed
+        # with whatever DOM is already present.
+        page.wait_for_load_state("domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeoutError:
+            pass
 
         intel["page_title"] = page.title()
 
@@ -855,7 +866,12 @@ def _run_one_site(name: str, url: str) -> dict:
     # Step 1: Collect intelligence
     log.info("[1] Collecting page intelligence...")
     t0 = time.time()
-    intel = collect_page_intelligence(url)
+    try:
+        intel = collect_page_intelligence(url)
+    except Exception as e:
+        elapsed = time.time() - t0
+        log.error("PAGE_LOAD_ERROR after %.1fs: %s", elapsed, e)
+        return {"name": name, "status": "PAGE_LOAD_ERROR", "error": str(e)}
     collect_time = time.time() - t0
     log.info("Done in %.1fs | JSON-LD: %d | API: %d | testids: %d | cards: %d",
              collect_time, len(intel["json_ld"]), len(intel["api_responses"]),
@@ -869,7 +885,10 @@ def _run_one_site(name: str, url: str) -> dict:
     _is_captcha = any(s in full_html.lower() for s in _captcha_signals) if full_html else False
     if len(cleaned_check) < 5000 and full_html and not _is_captcha:
         log.info("Cleaned HTML only %s chars -- retrying headful...", f"{len(cleaned_check):,}")
-        intel = collect_page_intelligence(url, headless=False)
+        try:
+            intel = collect_page_intelligence(url, headless=False)
+        except Exception as e:
+            log.warning("Headful retry failed: %s -- continuing with headless intel", e)
         collect_time = time.time() - t0
         log.info("Headful done in %.1fs | JSON-LD: %d | API: %d",
                  collect_time, len(intel["json_ld"]), len(intel["api_responses"]))
@@ -1043,16 +1062,28 @@ def _run_all(
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
 
+    def _safe_run(target: dict) -> dict:
+        """Run one site with a top-level guard so an unexpected exception
+        (e.g., Playwright crash, stuck browser) cannot abort the batch."""
+        try:
+            return _run_one_site(target["name"], target["url"])
+        except Exception as e:
+            log.error("UNEXPECTED_ERROR on %s: %s", target["name"], e, exc_info=True)
+            return {"name": target["name"], "status": "UNEXPECTED_ERROR", "error": str(e)}
+
     if workers > 1 and len(targets) > 1:
         # Parallel mode
         with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
             future_to_target = {
-                pool.submit(_run_one_site, target["name"], target["url"]): target
-                for target in targets
+                pool.submit(_safe_run, target): target for target in targets
             }
             for future in as_completed(future_to_target):
                 target = future_to_target[future]
-                r = future.result()
+                try:
+                    r = future.result()
+                except Exception as e:
+                    log.error("FUTURE_ERROR on %s: %s", target["name"], e, exc_info=True)
+                    r = {"name": target["name"], "status": "UNEXPECTED_ERROR", "error": str(e)}
                 results.append(r)
                 _process_result(r, target)
     else:
@@ -1063,7 +1094,7 @@ def _run_all(
                 label = f"{target['name']} [{target['query']}]"
             log.info("[%d/%d] %s", i + 1, len(targets), label)
 
-            r = _run_one_site(target["name"], target["url"])
+            r = _safe_run(target)
             results.append(r)
             _process_result(r, target)
 

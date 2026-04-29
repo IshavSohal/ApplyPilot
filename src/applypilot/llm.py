@@ -157,11 +157,20 @@ class LLMClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        # OpenAI's Chat Completions API renamed `max_tokens` to
+        # `max_completion_tokens` for newer models (e.g. gpt-5*, o-series).
+        # Gemini's OpenAI-compat layer and local OpenAI-compat servers still
+        # expect the legacy `max_tokens`, so keep the rename scoped to OpenAI.
+        token_param = (
+            "max_completion_tokens"
+            if self.base_url.startswith("https://api.openai.com")
+            else "max_tokens"
+        )
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            token_param: max_tokens,
         }
 
         resp = self._client.post(

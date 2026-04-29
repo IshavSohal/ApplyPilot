@@ -73,10 +73,8 @@ def _build_tailor_prompt(profile: dict) -> str:
 Take the base resume and job description. Return a tailored resume as a JSON object.
 
 ## RECRUITER SCAN (6 seconds):
-1. Title -- matches what they're hiring?
-2. Summary -- 2 sentences proving you've done this work
-3. First 3 bullets of most recent role -- verbs and outcomes match?
-4. Skills -- must-haves visible immediately?
+1. Education and contact info are easy to find
+2. First 3-4 bullets of most recent role -- verbs and outcomes match?
 
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
@@ -85,15 +83,17 @@ You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, R
 
 ## TAILORING RULES:
 
-TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
+TITLE: Return the target role only as JSON metadata. Do not render it in the resume header.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+SUMMARY: Do not write or include a summary section.
+
+EDUCATION: Keep education near the top of the resume immediately after the header/contact block.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
 Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
 
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
+PROJECTS: Reorder by relevance. Drop irrelevant projects entirely. Ensure that 3-4 projects are chosen.
 
 BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
 
@@ -114,7 +114,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -139,8 +139,6 @@ VERDICT: PASS or FAIL
 ISSUES: (list any problems, or "none")
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Change the title to match the target role
-- Rewrite the summary from scratch for the target job
 - Reorder bullets and projects to put the most relevant first
 - Reframe bullets to use the job's language
 - Drop low-relevance bullets and replace with more relevant ones from other sections
@@ -238,7 +236,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
     # Header -- always code-injected from profile
     lines.append(personal.get("full_name", ""))
-    lines.append(sanitize_text(data.get("title", "Software Engineer")))
+    # lines.append(sanitize_text(data.get("title", "Software Engineer")))
 
     # Location from search config or profile -- leave blank if not available
     # The location line is optional; the original used a hardcoded city.
@@ -258,17 +256,14 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         lines.append(" | ".join(contact_parts))
     lines.append("")
 
-    # Summary
-    lines.append("SUMMARY")
-    lines.append(sanitize_text(data["summary"]))
-    lines.append("")
+    # Education
+    lines.append("EDUCATION")
+    lines.append(sanitize_text(str(data.get("education", ""))))
 
-    # Technical Skills
-    lines.append("TECHNICAL SKILLS")
-    if isinstance(data["skills"], dict):
-        for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
-    lines.append("")
+    # Summary
+    # lines.append("SUMMARY")
+    # lines.append(sanitize_text(data["summary"]))
+    # lines.append("")
 
     # Experience
     lines.append("EXPERIENCE")
@@ -290,9 +285,14 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
             lines.append(f"- {sanitize_text(b)}")
         lines.append("")
 
-    # Education
-    lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    # Technical Skills
+    lines.append("TECHNICAL SKILLS")
+    if isinstance(data["skills"], dict):
+        for cat, val in data["skills"].items():
+            lines.append(f"{cat}: {sanitize_text(str(val))}")
+    lines.append("")
+
+
 
     return "\n".join(lines)
 
