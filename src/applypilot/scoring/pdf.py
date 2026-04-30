@@ -4,12 +4,122 @@ Parses the structured text resume format, renders via an HTML/CSS template,
 and exports to PDF using headless Chromium via Playwright.
 """
 
+import html as html_lib
 import logging
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
+
+
+_BASE_CSS = """@page {
+    size: letter;
+    margin: 0.35in 0.5in;
+}
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.35;
+    color: #1a1a1a;
+}
+.header {
+    text-align: center;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+    border-bottom: 1.5px solid #2a7ab5;
+}
+.name {
+    font-size: 18pt;
+    font-weight: 700;
+    color: #1a3a5c;
+    letter-spacing: 0.5px;
+}
+.title {
+    font-size: 10.5pt;
+    color: #3a6b8c;
+    margin: 1px 0;
+}
+.location {
+    font-size: 9pt;
+    color: #555;
+}
+.contact {
+    font-size: 9pt;
+    color: #444;
+    margin-top: 1px;
+}
+.contact a {
+    color: #2c3e50;
+    text-decoration: none;
+}
+.section {
+    margin-top: 5px;
+}
+.section-title {
+    font-size: 10pt;
+    font-weight: 700;
+    color: #1a3a5c;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border-bottom: 1.5px solid #2a7ab5;
+    padding-bottom: 1px;
+    margin-bottom: 3px;
+}
+.skill-row {
+    font-size: 9.5pt;
+    margin: 0;
+    line-height: 1.35;
+}
+.skill-cat {
+    font-weight: 600;
+    color: #1a3a5c;
+}
+.entry {
+    margin-bottom: 4px;
+    break-inside: avoid;
+}
+.entry-title {
+    font-weight: 600;
+    font-size: 10pt;
+    color: #1a3a5c;
+}
+.entry-subtitle {
+    font-size: 9pt;
+    color: #4a7a9b;
+    font-style: italic;
+    margin-bottom: 1px;
+}
+ul {
+    margin-left: 14px;
+    padding: 0;
+}
+li {
+    font-size: 9.5pt;
+    margin-bottom: 1px;
+    line-height: 1.35;
+}
+.edu {
+    font-size: 10pt;
+}"""
+
+
+_COVER_LETTER_CSS = """.cl-body {
+    font-family: 'Times New Roman', serif;
+    font-size: 12pt;
+    text-align: left;
+    line-height: 1.4;
+    color: #1a1a1a;
+    margin-top: 16pt;
+}
+.cl-body p {
+    margin-bottom: 10pt;
+}"""
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -105,7 +215,7 @@ def parse_skills(text: str) -> list[tuple[str, str]]:
 
 
 def parse_entries(text: str) -> list[dict]:
-    f"""Parse experience/project entries from section text.
+    """Parse experience/project entries from section text.
 
     Args:
         text: The EXPERIENCE or PROJECTS section text.
@@ -213,100 +323,7 @@ def build_html(resume: dict) -> str:
 <head>
 <meta charset="utf-8">
 <style>
-@page {{
-    size: letter;
-    margin: 0.35in 0.5in;
-}}
-* {{
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}}
-body {{
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
-    font-size: 10pt;
-    line-height: 1.35;
-    color: #1a1a1a;
-}}
-.header {{
-    text-align: center;
-    margin-bottom: 4px;
-    padding-bottom: 4px;
-    border-bottom: 1.5px solid #2a7ab5;
-}}
-.name {{
-    font-size: 18pt;
-    font-weight: 700;
-    color: #1a3a5c;
-    letter-spacing: 0.5px;
-}}
-.title {{
-    font-size: 10.5pt;
-    color: #3a6b8c;
-    margin: 1px 0;
-}}
-.location {{
-    font-size: 9pt;
-    color: #555;
-}}
-.contact {{
-    font-size: 9pt;
-    color: #444;
-    margin-top: 1px;
-}}
-.contact a {{
-    color: #2c3e50;
-    text-decoration: none;
-}}
-.section {{
-    margin-top: 5px;
-}}
-.section-title {{
-    font-size: 10pt;
-    font-weight: 700;
-    color: #1a3a5c;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    border-bottom: 1.5px solid #2a7ab5;
-    padding-bottom: 1px;
-    margin-bottom: 3px;
-}}
-.skill-row {{
-    font-size: 9.5pt;
-    margin: 0;
-    line-height: 1.35;
-}}
-.skill-cat {{
-    font-weight: 600;
-    color: #1a3a5c;
-}}
-.entry {{
-    margin-bottom: 4px;
-    break-inside: avoid;
-}}
-.entry-title {{
-    font-weight: 600;
-    font-size: 10pt;
-    color: #1a3a5c;
-}}
-.entry-subtitle {{
-    font-size: 9pt;
-    color: #4a7a9b;
-    font-style: italic;
-    margin-bottom: 1px;
-}}
-ul {{
-    margin-left: 14px;
-    padding: 0;
-}}
-li {{
-    font-size: 9.5pt;
-    margin-bottom: 1px;
-    line-height: 1.35;
-}}
-.edu {{
-    font-size: 10pt;
-}}
+{_BASE_CSS}
 </style>
 </head>
 <body>
@@ -320,6 +337,97 @@ li {{
 {proj_html}
 {skills_html}
 
+</body>
+</html>"""
+
+
+# ── Cover Letter Template ────────────────────────────────────────────────
+
+def _is_cover_letter(text_path: Path, text: str, kind: str | None) -> bool:
+    """Determine whether a text file should render as a cover letter.
+
+    Detection order:
+      1. Explicit `kind` argument ("cover_letter" or "resume").
+      2. Filename ends with `_CL.txt` (canonical convention from cover_letter.py).
+      3. Body content sniff: stripped text starts with "Dear ".
+    """
+    if kind in ("cover_letter", "resume"):
+        return kind == "cover_letter"
+    if text_path.name.endswith("_CL.txt"):
+        return True
+    return text.lstrip().lower().startswith("dear ")
+
+
+def _build_cover_letter_body_html(letter_text: str) -> str:
+    """Convert plain cover letter text into paragraph HTML.
+
+    Blank lines split paragraphs; single newlines within a paragraph become
+    <br> soft breaks. All content is HTML-escaped.
+    """
+    normalized = letter_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    paragraphs = [p.strip() for p in normalized.split("\n\n") if p.strip()]
+    rendered: list[str] = []
+    for para in paragraphs:
+        lines = [html_lib.escape(line) for line in para.split("\n")]
+        rendered.append(f"<p>{'<br>'.join(lines)}</p>")
+    return "\n".join(rendered)
+
+
+def build_cover_letter_html(letter_text: str, profile: dict) -> str:
+    """Build cover letter HTML: resume-style header + plain Times New Roman body.
+
+    Args:
+        letter_text: Raw cover letter text (starts with "Dear Hiring Manager,").
+        profile:     User profile dict; `personal` block supplies header data.
+
+    Returns:
+        Complete HTML string ready for PDF rendering.
+    """
+    personal = profile.get("personal", {}) if isinstance(profile, dict) else {}
+
+    name = (
+        personal.get("preferred_name")
+        or personal.get("full_name")
+        or ""
+    )
+
+    location_parts = [
+        str(personal.get(k, "")).strip()
+        for k in ("city", "province_state", "country")
+    ]
+    location = ", ".join(p for p in location_parts if p)
+
+    contact_parts = [
+        str(personal.get(k, "")).strip()
+        for k in ("email", "phone", "linkedin_url")
+    ]
+    contact_parts = [p for p in contact_parts if p]
+    contact_html = " &nbsp;|&nbsp; ".join(html_lib.escape(p) for p in contact_parts)
+
+    location_html = (
+        f'<div class="location">{html_lib.escape(location)}</div>' if location else ""
+    )
+
+    body_html = _build_cover_letter_body_html(letter_text)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{_BASE_CSS}
+{_COVER_LETTER_CSS}
+</style>
+</head>
+<body>
+<div class="header">
+    <div class="name">{html_lib.escape(name)}</div>
+    {location_html}
+    <div class="contact">{contact_html}</div>
+</div>
+<div class="cl-body">
+{body_html}
+</div>
 </body>
 </html>"""
 
@@ -351,7 +459,10 @@ def render_pdf(html: str, output_path: str) -> None:
 # ── Public API ───────────────────────────────────────────────────────────
 
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    text_path: Path,
+    output_path: Path | None = None,
+    html_only: bool = False,
+    kind: str | None = None,
 ) -> Path:
     """Convert a text resume/cover letter to PDF.
 
@@ -360,14 +471,25 @@ def convert_to_pdf(
         output_path: Optional override for the output path. Defaults to same
             name with .pdf extension.
         html_only: If True, output HTML instead of PDF.
+        kind: Optional explicit document type ("resume" or "cover_letter").
+            If omitted, the type is auto-detected from the filename and
+            content (see `_is_cover_letter`).
 
     Returns:
         Path to the generated PDF (or HTML) file.
     """
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
-    resume = parse_resume(text)
-    html = build_html(resume)
+
+    if _is_cover_letter(text_path, text, kind):
+        from applypilot.config import load_profile
+        try:
+            profile = load_profile()
+        except FileNotFoundError:
+            profile = {}
+        html = build_cover_letter_html(text, profile)
+    else:
+        html = build_html(parse_resume(text))
 
     if html_only:
         out = output_path or text_path.with_suffix(".html")

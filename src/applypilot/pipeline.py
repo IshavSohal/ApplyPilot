@@ -35,7 +35,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Job discovery (Greenhouse boards only)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -60,41 +60,26 @@ _UPSTREAM: dict[str, str | None] = {
 # ---------------------------------------------------------------------------
 
 def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    """Stage: Job discovery — Greenhouse boards only.
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+    JobSpy / Workday / SmartExtract scrapers still live in `discovery/` but are
+    intentionally not invoked: the Greenhouse Boards API ships full descriptions
+    inline, so it covers discovery + enrichment in one zero-token HTTP call per
+    company.
+    """
+    stats: dict = {"greenhouse": None}
 
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
+    console.print("  [cyan]Greenhouse boards crawl...[/cyan]")
     try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
+        from applypilot.discovery.greenhouse import run_greenhouse_discovery
+        result = run_greenhouse_discovery(workers=workers)
+        stats["greenhouse"] = "ok"
+        stats.update({k: result[k] for k in ("found", "kept", "new", "existing",
+                                              "errors", "companies") if k in result})
     except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
-
-    # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+        log.error("Greenhouse crawl failed: %s", e)
+        console.print(f"  [red]Greenhouse error:[/red] {e}")
+        stats["greenhouse"] = f"error: {e}"
 
     return stats
 

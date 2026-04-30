@@ -156,6 +156,12 @@ applypilot apply --reset-failed        # reset all failed jobs for retry
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
+#### How `--limit` counts jobs
+
+- `--limit` counts **every job the worker finishes processing**, including jobs the agent rejects as out-of-scope (e.g. freelance-only listings, ineligible locations, expired postings).
+- If the first acquired job is out-of-scope and `--limit` is 1 (the default), the worker exits after that single rejection without attempting another job.
+- Pass a higher `--limit` (e.g. `-l 10`) or use `--continuous` to keep going past rejections. Permanent failures are already marked in the database, so rejected jobs won't be re-picked on later runs.
+
 ---
 
 ## CLI Reference

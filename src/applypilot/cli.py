@@ -144,10 +144,10 @@ def run(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max jobs to process per run (counts both applied and failed; default 1). Use --continuous to run indefinitely."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("opus", "--model", "-m", help="Claude model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
