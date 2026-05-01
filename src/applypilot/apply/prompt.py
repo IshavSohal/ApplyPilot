@@ -1,8 +1,10 @@
-"""Prompt builder for the autonomous job application agent.
+"""Prompt builder for the autonomous Greenhouse application agent.
 
-Constructs the full instruction prompt that tells Claude Code / the AI agent
-how to fill out a job application form using Playwright MCP tools. All
-personal data is loaded from the user's profile -- nothing is hardcoded.
+Greenhouse postings are single-page, no-auth application forms. This module
+builds a tightly scoped prompt that maps every common Greenhouse field to an
+exact value from the user's profile.json -- the agent should copy values, not
+reason about them. CAPTCHA solving (CapSolver) is preserved because Greenhouse
+may trigger an invisible CAPTCHA after Submit.
 """
 
 import logging
@@ -29,12 +31,15 @@ def _build_profile_summary(profile: dict) -> str:
     exp = p.get("experience", {})
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
+    edu = p.get("education", {})
 
     lines = [
         f"Name: {personal['full_name']}",
         f"Email: {personal['email']}",
         f"Phone: {personal['phone']}",
     ]
+    if personal.get("pronouns"):
+        lines.append(f"Pronouns: {personal['pronouns']}")
 
     # Address -- handle optional fields gracefully
     addr_parts = [
@@ -71,21 +76,33 @@ def _build_profile_summary(profile: dict) -> str:
     if exp.get("education_level"):
         lines.append(f"Education: {exp['education_level']}")
 
+    # Education detail (drives Greenhouse's education widget)
+    if edu:
+        edu_parts = [edu.get("degree", ""), edu.get("discipline", ""), edu.get("school", "")]
+        edu_line = ", ".join(p for p in edu_parts if p)
+        years = " - ".join(y for y in (edu.get("start_year", ""), edu.get("end_year", "")) if y)
+        if edu_line:
+            lines.append(f"School: {edu_line}" + (f" ({years})" if years else ""))
+        if edu.get("gpa"):
+            lines.append(f"GPA: {edu['gpa']}")
+
     # Availability
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
 
     # Standard responses
+    referral = personal.get("referral_source") or "LinkedIn"
     lines.extend([
         "Age 18+: Yes",
         "Background Check: Yes",
         "Felony: No",
         "Previously Worked Here: No",
-        "How Heard: Online Job Board",
+        f"How Heard: {referral}",
     ])
 
     # EEO
     lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
     lines.append(f"Race: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
+    lines.append(f"Hispanic/Latino: {eeo.get('hispanic_latino', 'Decline to self-identify')}")
     lines.append(f"Veteran: {eeo.get('veteran_status', 'I am not a protected veteran')}")
     lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
 
@@ -163,33 +180,28 @@ Decision tree:
 
 
 def _build_screening_section(profile: dict) -> str:
-    """Build the screening questions guidance section."""
+    """Build the trimmed screening guidance section.
+
+    Greenhouse custom screening questions vary per company. The FIELD MAP
+    handles the standard ones; this section gives short fallbacks for
+    everything else.
+    """
     personal = profile["personal"]
     exp = profile.get("experience", {})
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
-    work_auth = profile["work_authorization"]
-    relocation = profile["relocation"]
-    relocation_str = f"Lives in {city}, "
-    if relocation["willing_to_relocate"]:
-      relocation_list = relocation["willing_to_relocate_to"]
-      relocation_str += f"willing to relocate to: {relocation_list}"
+    relocation = profile.get("relocation", {})
+    if relocation.get("willing_to_relocate"):
+        relocation_str = f"Lives in {city}, willing to relocate to: {relocation.get('willing_to_relocate_to', '')}"
     else:
-      relocation_str += "unable to relocate."
+        relocation_str = f"Lives in {city}, unable to relocate."
 
-    return f"""== SCREENING QUESTIONS (be strategic) ==
-Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: {relocation_str}
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
-  - Citizenship, clearance, licenses, certifications: answer from profile only
-  - Criminal/background: answer from profile only
-
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
-
-Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
-
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+    return f"""== SCREENING QUESTIONS (short answers) ==
+Hard facts -> use FIELD MAP / APPLICANT PROFILE. Includes location/relocation ({relocation_str}), work auth, citizenship, criminal/background, clearance, licenses.
+Skills/tools -> answer YES if in this candidate's domain. Profile: {target_role}, {years} years experience. Don't sell short.
+Open-ended ("Why this role?", "Tell us about yourself") -> 2-3 sentences. Reference one detail from the job description and one achievement from the resume. No fluff.
+EEO/demographics -> use the EEO / VOLUNTARY DISCLOSURE block."""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -219,6 +231,101 @@ def _build_hard_rules(profile: dict) -> str:
 1. Never lie about: citizenship, work authorization, criminal history, education credentials, security clearance, licenses.
 2. {work_auth_rule}
 3. {name_rule}"""
+
+
+def _build_field_map(profile: dict) -> str:
+    """Map every common Greenhouse field label to an exact profile value.
+
+    The agent should copy these values verbatim. No paraphrasing, no inference.
+    """
+    personal = profile["personal"]
+    work_auth = profile["work_authorization"]
+    avail = profile.get("availability", {})
+
+    full_name = personal["full_name"]
+    name_parts = full_name.split()
+    first = personal.get("first_name") or (name_parts[0] if name_parts else "")
+    last = personal.get("last_name") or (name_parts[-1] if len(name_parts) > 1 else "")
+
+    email = personal["email"]
+    phone = personal.get("phone", "")
+    phone_digits = "".join(c for c in phone if c.isdigit())
+
+    location_parts = [
+        personal.get("city", ""),
+        personal.get("province_state", ""),
+        personal.get("country", ""),
+    ]
+    location = ", ".join(p for p in location_parts if p)
+
+    linkedin = personal.get("linkedin_url", "") or "(none)"
+    github = personal.get("github_url", "") or "(none)"
+    website = (
+        personal.get("portfolio_url")
+        or personal.get("website_url")
+        or personal.get("github_url")
+        or personal.get("linkedin_url", "")
+        or "(none)"
+    )
+
+    referral = personal.get("referral_source") or "LinkedIn"
+    pronouns = personal.get("pronouns") or "Prefer not to say"
+
+    legally_auth = work_auth.get("legally_authorized_to_work", "Yes")
+    sponsorship = work_auth.get("require_sponsorship", "No")
+    start_date = avail.get("earliest_start_date", "Immediately")
+
+    return f"""== FIELD MAP (copy these values, do not paraphrase) ==
+First Name              -> {first}
+Last Name               -> {last}
+Full Name (legal)       -> {full_name}
+Email                   -> {email}
+Phone                   -> {phone}            (digits only if field has prefix: {phone_digits})
+Current Location / City -> {location}
+LinkedIn URL            -> {linkedin}
+GitHub URL              -> {github}
+Website / Portfolio     -> {website}
+How did you hear...?    -> {referral}        (if dropdown, pick closest: LinkedIn / Other)
+Pronouns (optional)     -> {pronouns}
+Authorized to work?     -> {legally_auth}
+Require sponsorship?    -> {sponsorship}
+Earliest start date     -> {start_date}"""
+
+
+def _build_education_block(profile: dict) -> str:
+    """Map Greenhouse's education widget to exact profile values."""
+    edu = profile.get("education", {}) or {}
+    resume_facts = profile.get("resume_facts", {}) or {}
+    exp = profile.get("experience", {}) or {}
+
+    school = edu.get("school") or resume_facts.get("preserved_school", "")
+    degree = edu.get("degree") or exp.get("education_level", "")
+    discipline = edu.get("discipline", "")
+    start_year = edu.get("start_year", "")
+    end_year = edu.get("end_year", "")
+    gpa = edu.get("gpa", "") or "leave blank"
+
+    return f"""== EDUCATION BLOCK ==
+If asked, fill ONE education entry:
+School              -> {school}        (autocomplete; pick closest match)
+Degree              -> {degree}        (dropdown; pick closest match)
+Discipline / Major  -> {discipline}
+Start Year          -> {start_year}
+End Year            -> {end_year}
+GPA (if asked)      -> {gpa}
+Skip the "+ Add another" button."""
+
+
+def _build_eeo_block(profile: dict) -> str:
+    """Map the Greenhouse voluntary self-identification section."""
+    eeo = profile.get("eeo_voluntary", {}) or {}
+    return f"""== EEO / VOLUNTARY DISCLOSURE ==
+Gender              -> {eeo.get('gender', 'Decline to self-identify')}
+Race / Ethnicity    -> {eeo.get('race_ethnicity', 'Decline to self-identify')}
+Hispanic or Latino  -> {eeo.get('hispanic_latino', 'Decline to self-identify')}
+Veteran Status      -> {eeo.get('veteran_status', 'I am not a protected veteran')}
+Disability Status   -> {eeo.get('disability_status', 'I do not wish to answer')}
+If a value isn't an exact dropdown option, pick "Decline to self-identify" / "Prefer not to say"."""
 
 
 def _build_captcha_section() -> str:
@@ -489,6 +596,9 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
+    field_map = _build_field_map(profile)
+    education_block = _build_education_block(profile)
+    eeo_block = _build_eeo_block(profile)
     captcha_section = _build_captcha_section()
 
     # Cover letter fallback text
@@ -505,22 +615,13 @@ def build_prompt(job: dict, tailored_resume: str,
     # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())
 
-    # SSO domains the agent cannot sign into (loaded from config/sites.yaml)
-    from applypilot.config import load_blocked_sso
-    blocked_sso = load_blocked_sso()
-
-    # Preferred display name
-    preferred_name = personal.get("preferred_name", full_name.split()[0])
-    last_name = full_name.split()[-1] if " " in full_name else ""
-    display_name = f"{preferred_name} {last_name}".strip()
-
     # Dry-run: override submit instruction
     if dry_run:
-        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+        submit_instruction = "IMPORTANT: Do NOT click the final Submit Application button. Review the form, verify every field matches the FIELD MAP, then output RESULT:APPLIED with a note that this was a dry run."
     else:
-        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
+        submit_instruction = "Click the 'Submit Application' button. Before clicking, take ONE snapshot and verify every visible field matches the FIELD MAP / EDUCATION BLOCK / EEO block. Fix any mismatches first, then submit."
 
-    prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
+    prompt = f"""You are an autonomous Greenhouse application agent. Your ONE mission: open this Greenhouse posting, copy values from the FIELD MAP into the form, click Submit Application. Do NOT reason about the form -- just copy. The form is a single page with no authentication. A CAPTCHA may appear after Submit; solve it via CapSolver.
 
 == JOB ==
 URL: {job.get('application_url') or job['url']}
@@ -532,7 +633,7 @@ Fit Score: {job.get('fit_score', 'N/A')}/10
 Resume PDF (upload this): {pdf_path}
 Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 
-== RESUME TEXT (use when filling text fields) ==
+== RESUME TEXT (use only if a non-mapped field asks for resume content) ==
 {tailored_resume}
 
 == COVER LETTER TEXT (paste if text field, upload PDF if file field) ==
@@ -541,83 +642,70 @@ Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 == APPLICANT PROFILE ==
 {profile_summary}
 
-== YOUR MISSION ==
-Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format.
-
-If something unexpected happens and these instructions don't cover it, figure it out yourself. You are autonomous. Navigate pages, read content, try buttons, explore the site. The goal is always the same: submit the application. Do whatever it takes to reach that goal.
-
 {hard_rules}
 
 == NEVER DO THESE (immediate RESULT:FAILED if encountered) ==
-- NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
+- NEVER grant camera, microphone, screen sharing, or location permissions -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
-- NEVER set up a freelancing profile (Mercor, Toptal, Upwork, Fiverr, Turing, etc.). These are contractor marketplaces, not job applications -> RESULT:FAILED:not_a_job_application
 - NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows. You are applying for FULL-TIME salaried positions only.
 - NEVER install browser extensions, download executables, or run assessment software.
 - NEVER enter payment info, bank details, or SSN/SIN.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
-- If the site is NOT a job application form (it's a profile builder, skills marketplace, talent network signup, coding assessment platform) -> RESULT:FAILED:not_a_job_application
 
 {location_check}
+
+{field_map}
+
+{education_block}
+
+{eeo_block}
 
 {salary_section}
 
 {screening_section}
 
-== STEP-BY-STEP ==
+== STEP-BY-STEP (Greenhouse: single-page form, no auth) ==
 1. browser_navigate to the job URL.
-2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
-3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
-4. Find and click the Apply button. If email-only (page says "email resume to X"):
-   - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
-   - Output RESULT:APPLIED. Done.
-   After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
-5. Login wall?
-   5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
-   5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
-   5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-   5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code.
-   5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-   5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
-6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
-7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
-8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
-   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
-9. Answer screening questions using the rules above.
+2. browser_snapshot. Run LOCATION CHECK. If not eligible -> RESULT:FAILED:not_eligible_location. Stop.
+3. Scroll to the "Apply for this job" form on this same page. Do NOT click through to another page or site.
+4. Upload the Resume PDF using the Attach/Upload button. Path: {pdf_path}
+   - Do NOT use "Enter manually" or "Paste". Always Attach.
+   - If a file input isn't directly clickable, browser_click the visible Attach/Upload button or label first, then browser_file_upload with the path.
+5. Upload the Cover Letter PDF if a file field exists. Path: {cl_upload_path or "N/A"}
+   - If only a text field exists, paste the COVER LETTER TEXT.
+   - If neither exists, skip.
+6. Use ONE browser_fill_form call to fill EVERY visible standard field with FIELD MAP values. Do not iterate one field at a time.
+7. If an Education block is present, fill ONE entry using EDUCATION BLOCK. Skip the "+ Add another" button.
+8. Answer custom screening questions: FIELD MAP first, then SCREENING rules, then SALARY rules.
+9. Expand the "Voluntary Self-Identification" / "U.S. Equal Employment Opportunity" section if collapsed. Fill it from EEO / VOLUNTARY DISCLOSURE.
 10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
-12. Output your result.
+11. After Submit: browser_snapshot, then run CAPTCHA DETECT (see CAPTCHA section). Greenhouse triggers an invisible CAPTCHA only after Submit. If found, solve via CapSolver, then click Submit Application again if the form did not auto-submit.
+12. browser_snapshot to confirm. Look for "Application submitted", "Thank you", or a confirmation page. Output RESULT:APPLIED.
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
 RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
-RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:reason -- any other failure (brief reason)
 
 == BROWSER EFFICIENCY ==
-- browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
+- browser_snapshot ONCE per page. Then use browser_take_screenshot to verify (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
-- Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
-- Fill ALL fields in ONE browser_fill_form call. Not one at a time.
+- Fill ALL fields in ONE browser_fill_form call.
 - Keep your thinking SHORT. Don't repeat page structure back.
-- CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
+- CAPTCHA AWARENESS: Greenhouse uses invisible Turnstile / reCAPTCHA v3 -- no visible widget but blocks Submit silently. Always run CAPTCHA DETECT after the first Submit click.
 
 == FORM TRICKS ==
-- Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
-- "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
-- File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
-- Dropdown won't fill? browser_click to open it, then browser_click the option.
-- Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
-- Phone field with country prefix: just type digits {phone_digits}
+- Dropdown won't fill via fill_form? browser_click to open it, then browser_click the option.
+- Checkbox/radio won't toggle via fill_form? Use browser_click on it. Snapshot to verify.
+- File upload not working? Try: (1) browser_click the upload button/label, (2) browser_file_upload with the path. If still failing, look for a hidden file input and click its visible label first.
+- Phone field with country prefix: type digits only -> {phone_digits}
 - Date fields: {datetime.now().strftime('%m/%d/%Y')}
-- Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
+- Validation errors after Submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry Submit.
 - Honeypot fields (hidden, "leave blank"): skip them.
-- Format-sensitive fields: read the placeholder text, match it exactly.
+- Format-sensitive fields: read the placeholder, match it exactly.
 
 {captcha_section}
 

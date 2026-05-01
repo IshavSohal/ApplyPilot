@@ -1,7 +1,10 @@
 {
   "personal": {
     "full_name": "YOUR_LEGAL_NAME",
+    "first_name": "",
+    "last_name": "",
     "preferred_name": "YOUR_PREFERRED_NAME",
+    "pronouns": "",
     "email": "your.email@example.com",
     "password": "YOUR_JOB_SITE_PASSWORD",
     "phone": "555-123-4567",
@@ -13,7 +16,8 @@
     "linkedin_url": "https://www.linkedin.com/in/yourprofile",
     "github_url": "https://github.com/yourusername",
     "portfolio_url": "",
-    "website_url": ""
+    "website_url": "",
+    "referral_source": "LinkedIn"
   },
   "work_authorization": {
     "legally_authorized_to_work": "Yes",
@@ -39,6 +43,14 @@
     "current_company": "",
     "target_role": "software engineer"
   },
+  "education": {
+    "school": "Your University",
+    "degree": "Bachelor's Degree",
+    "discipline": "Computer Science",
+    "start_year": "2018",
+    "end_year": "2022",
+    "gpa": ""
+  },
   "skills_boundary": {
     "languages": ["Python", "SQL", "JavaScript"],
     "frameworks": ["FastAPI", "Flask", "React"],
@@ -55,6 +67,7 @@
   "eeo_voluntary": {
     "gender": "Decline to self-identify",
     "race_ethnicity": "Decline to self-identify",
+    "hispanic_latino": "Decline to self-identify",
     "veteran_status": "I am not a protected veteran",
     "disability_status": "I do not wish to answer"
   }
