@@ -22,9 +22,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.database import init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -224,28 +222,82 @@ def collect_detail_intelligence(page) -> dict:
 
 # -- Tier 1: JSON-LD extraction -----------------------------------------------
 
-def extract_from_json_ld(intel: dict) -> dict | None:
-    """Extract description and apply URL from JSON-LD JobPosting.
-    Returns {"full_description": str, "application_url": str|None} or None."""
-
-    def find_job_posting(data):
-        if isinstance(data, dict):
-            if data.get("@type") == "JobPosting":
-                return data
-            if "@graph" in data and isinstance(data["@graph"], list):
-                for item in data["@graph"]:
-                    result = find_job_posting(item)
-                    if result:
-                        return result
-        elif isinstance(data, list):
-            for item in data:
-                result = find_job_posting(item)
+def _find_job_posting(data):
+    """Find the first JobPosting object in a JSON-LD structure."""
+    if isinstance(data, dict):
+        if data.get("@type") == "JobPosting":
+            return data
+        if "@graph" in data and isinstance(data["@graph"], list):
+            for item in data["@graph"]:
+                result = _find_job_posting(item)
                 if result:
                     return result
-        return None
+    elif isinstance(data, list):
+        for item in data:
+            result = _find_job_posting(item)
+            if result:
+                return result
+    return None
+
+
+def _job_location(posting: dict) -> str | None:
+    """Normalize a JobPosting location into readable text."""
+    locations = posting.get("jobLocation") or posting.get("applicantLocationRequirements") or []
+    if isinstance(locations, dict):
+        locations = [locations]
+
+    labels: list[str] = []
+    for location in locations:
+        if not isinstance(location, dict):
+            continue
+        address = location.get("address", location)
+        if not isinstance(address, dict):
+            continue
+        parts = [
+            address.get("addressLocality"),
+            address.get("addressRegion"),
+            address.get("addressCountry"),
+        ]
+        label = ", ".join(str(part) for part in parts if part)
+        if label and label not in labels:
+            labels.append(label)
+
+    job_location_type = posting.get("jobLocationType")
+    if job_location_type == "TELECOMMUTE" and "Remote" not in labels:
+        labels.insert(0, "Remote")
+    return "; ".join(labels) or None
+
+
+def extract_job_metadata(intel: dict) -> dict:
+    """Extract title, company, and location from JSON-LD or page metadata."""
+    for ld in intel.get("json_ld", []):
+        posting = _find_job_posting(ld)
+        if not posting:
+            continue
+        organization = posting.get("hiringOrganization") or {}
+        company = organization.get("name") if isinstance(organization, dict) else None
+        return {
+            "title": posting.get("title") or posting.get("name"),
+            "company": company,
+            "location": _job_location(posting),
+            "posted_at": posting.get("datePosted"),
+        }
+
+    page_title = (intel.get("page_title") or "").strip()
+    return {
+        "title": re.split(r"\s+[|–—]\s+", page_title, maxsplit=1)[0] or None,
+        "company": None,
+        "location": None,
+        "posted_at": None,
+    }
+
+
+def extract_from_json_ld(intel: dict) -> dict | None:
+    """Extract description and apply URL from JSON-LD JobPosting.
+    Returns description, application URL, and available posting metadata."""
 
     for ld in intel.get("json_ld", []):
-        posting = find_job_posting(ld)
+        posting = _find_job_posting(ld)
         if not posting:
             continue
 
@@ -267,10 +319,12 @@ def extract_from_json_ld(intel: dict) -> dict | None:
         if not apply_url:
             apply_url = posting.get("url")
 
-        return {
+        result = {
             "full_description": desc_clean,
             "application_url": apply_url,
         }
+        result.update(extract_job_metadata({"json_ld": [posting]}))
+        return result
 
     return None
 
@@ -536,6 +590,10 @@ def scrape_detail_page(page, url: str) -> dict:
         "status": "error",
         "tier_used": None,
         "error": None,
+        "title": None,
+        "company": None,
+        "location": None,
+        "posted_at": None,
     }
     t0 = time.time()
 
@@ -560,6 +618,7 @@ def scrape_detail_page(page, url: str) -> dict:
         return result
 
     intel = collect_detail_intelligence(page)
+    result.update(extract_job_metadata(intel))
 
     # Tier 1: JSON-LD
     json_ld_result = extract_from_json_ld(intel)
@@ -665,8 +724,26 @@ def scrape_site_batch(
                     stats[status] += 1
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        "detail_scraped_at = ?, detail_error = NULL, "
+                        "title = CASE WHEN strategy = 'external_upload' "
+                        "THEN COALESCE(?, title) ELSE title END, "
+                        "site = CASE WHEN strategy = 'external_upload' "
+                        "THEN COALESCE(?, site) ELSE site END, "
+                        "location = CASE WHEN strategy = 'external_upload' "
+                        "THEN COALESCE(?, location) ELSE location END, "
+                        "posted_at = CASE WHEN strategy = 'external_upload' "
+                        "THEN COALESCE(?, posted_at) ELSE posted_at END "
+                        "WHERE url = ?",
+                        (
+                            result.get("full_description"),
+                            result.get("application_url") or url,
+                            now,
+                            result.get("title"),
+                            result.get("company"),
+                            result.get("location"),
+                            result.get("posted_at"),
+                            url,
+                        ),
                     )
                 else:
                     stats["error"] += 1

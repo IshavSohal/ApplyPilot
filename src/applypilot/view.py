@@ -10,17 +10,52 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
+import re
 import webbrowser
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot.config import APP_DIR, load_search_config
 from applypilot.database import get_connection
 
 console = Console()
+
+
+def format_posted_at(value: str | None) -> str:
+    """Format an available source posting date for a dashboard badge."""
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lower().startswith("posted"):
+        return text
+    if "ago" in text.lower():
+        return f"Posted {text}"
+
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        for pattern in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed:
+        label = parsed.strftime("%b %d, %Y").replace(" 0", " ")
+        return f"Posted {label}"
+    return f"Posted {text}"
+
+
+def format_applied_at(value: str | None) -> str:
+    """Format an application timestamp for a dashboard badge."""
+    posted_label = format_posted_at(value)
+    return posted_label.replace("Posted", "Applied", 1) if posted_label else ""
 
 
 def generate_dashboard(output_path: str | None = None) -> str:
@@ -48,6 +83,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
     high_fit = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
     ).fetchone()[0]
+    applied_count = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
+    ).fetchone()[0]
+    active_count = total - applied_count
 
     # Score distribution
     score_dist: dict[int, int] = {}
@@ -72,15 +111,40 @@ def generate_dashboard(output_path: str | None = None) -> str:
         FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
-    # All scored jobs (5+), ordered by score desc
-    jobs = conn.execute("""
+    # All jobs, with scored jobs first and unscored discovery results last
+    jobs = conn.execute(
+        """
         SELECT url, title, salary, description, location, site, strategy,
-               full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               full_description, application_url, detail_error, posted_at,
+               fit_score, score_reasoning, applied_at
         FROM jobs
-        WHERE fit_score >= 5
-        ORDER BY fit_score DESC, site, title
-    """).fetchall()
+        """
+    ).fetchall()
+
+    priority_terms = [
+        str(term).lower().strip()
+        for term in load_search_config().get("priority_titles", [])
+        if term
+    ]
+
+    def is_priority_job(job) -> bool:
+        title = (job["title"] or "").lower()
+        return any(
+            re.search(rf"\b{re.escape(term)}\b", title)
+            for term in priority_terms
+        )
+
+    jobs = sorted(
+        jobs,
+        key=lambda job: (
+            job["fit_score"] is None,
+            -(job["fit_score"] or 0),
+            not is_priority_job(job),
+            job["site"] or "",
+            job["title"] or "",
+        ),
+    )
+    priority_count = sum(is_priority_job(job) for job in jobs)
 
     # Color map per site
     colors = {
@@ -129,19 +193,21 @@ def generate_dashboard(output_path: str | None = None) -> str:
     current_score = None
     for j in jobs:
         score = j["fit_score"] or 0
+        priority = is_priority_job(j)
         if score != current_score:
             if current_score is not None:
                 job_sections += "</div>"
-            score_color = "#10b981" if score >= 7 else "#f59e0b"
+            score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#64748b")
             score_label = {
                 10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
-                7: "Good Fit", 6: "Moderate+", 5: "Moderate",
+                7: "Good Fit", 6: "Moderate+", 5: "Moderate", 0: "Unscored",
             }.get(score, f"Score {score}")
-            count_at_score = score_dist.get(score, 0)
+            count_at_score = total - scored if score == 0 else score_dist.get(score, 0)
+            score_badge = "&mdash;" if score == 0 else str(score)
             job_sections += f"""
-            <h2 class="score-header" style="border-color:{score_color}">
-              <span class="score-badge" style="background:{score_color}">{score}</span>
-              {score_label} ({count_at_score} jobs)
+            <h2 class="score-header" data-score-group="{score}" style="border-color:{score_color}">
+              <span class="score-badge" style="background:{score_color}">{score_badge}</span>
+              {score_label} <span class="score-group-count">({count_at_score} jobs)</span>
             </h2>
             <div class="job-grid">"""
             current_score = score
@@ -163,8 +229,14 @@ def generate_dashboard(output_path: str | None = None) -> str:
         desc_preview = escape(j["full_description"] or "")[:300]
         full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
         desc_len = len(j["full_description"] or "")
+        detail_error = escape(j["detail_error"] or "")
+        posted_label = escape(format_posted_at(j["posted_at"]))
+        applied_label = escape(format_applied_at(j["applied_at"]))
+        is_applied = bool(j["applied_at"])
 
         meta_parts = []
+        if priority:
+            meta_parts.append('<span class="meta-tag priority">Priority: early career</span>')
         meta_parts.append(
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
         )
@@ -172,24 +244,36 @@ def generate_dashboard(output_path: str | None = None) -> str:
             meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
         if location:
             meta_parts.append(f'<span class="meta-tag location">{location[:40]}</span>')
+        if posted_label:
+            meta_parts.append(f'<span class="meta-tag posted">{posted_label}</span>')
+        if applied_label:
+            meta_parts.append(f'<span class="meta-tag applied">{applied_label}</span>')
         meta_html = " ".join(meta_parts)
 
         apply_html = ""
         if apply_url:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
+        mark_applied_html = ""
+        if not is_applied:
+            mark_applied_html = (
+                f'<button class="mark-applied-btn" data-job-url="{url}" '
+                'type="button">Mark as applied</button>'
+            )
 
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
+        <div class="job-card" data-score="{score}" data-applied="{str(is_applied).lower()}"
+             data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
           <div class="card-header">
-            <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
+            <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{"&mdash;" if score == 0 else score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
           </div>
           <div class="meta-row">{meta_html}</div>
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
+          {f'<div class="import-error">Enrichment failed: {detail_error}</div>' if detail_error else ''}
           <p class="desc-preview">{desc_preview}...</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
-          <div class="card-footer">{apply_html}</div>
+          <div class="card-footer">{apply_html}{mark_applied_html}</div>
         </div>"""
 
     if current_score is not None:
@@ -207,6 +291,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   h1 {{ font-size: 1.8rem; font-weight: 700; margin-bottom: 0.5rem; }}
   .subtitle {{ color: #94a3b8; margin-bottom: 2rem; }}
+
+  /* External job import */
+  .import-panel {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }}
+  .import-panel h2 {{ font-size: 1rem; margin-bottom: 0.35rem; }}
+  .import-panel p {{ color: #94a3b8; font-size: 0.82rem; margin-bottom: 0.8rem; }}
+  .import-form {{ display: flex; gap: 0.65rem; }}
+  .import-input {{ flex: 1; min-width: 220px; background: #0f172a; border: 1px solid #475569; color: #e2e8f0; padding: 0.65rem 0.8rem; border-radius: 7px; }}
+  .import-button {{ border: 0; border-radius: 7px; padding: 0.65rem 1rem; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }}
+  .import-button:disabled {{ opacity: 0.55; cursor: wait; }}
+  .import-status {{ min-height: 1.25rem; margin-top: 0.65rem; font-size: 0.82rem; color: #93c5fd; }}
+  .import-status.error {{ color: #fca5a5; }}
+  .import-error {{ color: #fca5a5; background: #450a0a55; border-radius: 5px; padding: 0.45rem; margin-bottom: 0.5rem; font-size: 0.75rem; }}
 
   /* Summary cards */
   .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
@@ -269,17 +365,29 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   .meta-row {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }}
   .meta-tag {{ font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; background: #334155; color: #94a3b8; }}
+  .meta-tag.priority {{ background: #3b0764; color: #d8b4fe; font-weight: 600; }}
   .meta-tag.salary {{ background: #064e3b; color: #6ee7b7; }}
   .meta-tag.location {{ background: #1e3a5f; color: #93c5fd; }}
+  .meta-tag.posted {{ background: #422006; color: #fde68a; }}
+  .meta-tag.applied {{ background: #064e3b; color: #6ee7b7; font-weight: 600; }}
 
   .keywords-row {{ font-size: 0.75rem; color: #10b981; margin-bottom: 0.3rem; line-height: 1.4; }}
   .reasoning-row {{ font-size: 0.75rem; color: #94a3b8; margin-bottom: 0.5rem; font-style: italic; line-height: 1.4; }}
 
   .desc-preview {{ font-size: 0.8rem; color: #64748b; line-height: 1.5; margin-bottom: 0.75rem; max-height: 3.6em; overflow: hidden; }}
 
-  .card-footer {{ display: flex; justify-content: flex-end; }}
+  .card-footer {{ display: flex; justify-content: flex-end; gap: 0.5rem; }}
   .apply-link {{ font-size: 0.8rem; color: #60a5fa; text-decoration: none; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa33; border-radius: 6px; font-weight: 500; }}
   .apply-link:hover {{ background: #60a5fa22; }}
+  .mark-applied-btn {{ font-size: 0.8rem; color: #6ee7b7; background: transparent; padding: 0.3rem 0.8rem; border: 1px solid #10b98155; border-radius: 6px; font-weight: 500; cursor: pointer; }}
+  .mark-applied-btn:hover {{ background: #10b98122; }}
+  .mark-applied-btn:disabled {{ opacity: 0.55; cursor: wait; }}
+
+  /* Active/applied tabs */
+  .tabs {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid #334155; }}
+  .tab-btn {{ border: 0; border-bottom: 3px solid transparent; background: transparent; color: #94a3b8; padding: 0.75rem 1rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; }}
+  .tab-btn:hover {{ color: #e2e8f0; }}
+  .tab-btn.active {{ color: #60a5fa; border-bottom-color: #60a5fa; }}
 
   /* Expandable full description */
   .full-desc-details {{ margin-bottom: 0.75rem; }}
@@ -295,6 +403,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     .summary {{ grid-template-columns: repeat(2, 1fr); }}
     .score-section {{ grid-template-columns: 1fr; }}
     .job-grid {{ grid-template-columns: 1fr; }}
+    .import-form {{ flex-direction: column; }}
     body {{ padding: 1rem; }}
   }}
 </style>
@@ -302,7 +411,27 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <body>
 
 <h1>ApplyPilot Dashboard</h1>
-<p class="subtitle">{total} jobs &middot; {scored} scored &middot; {high_fit} strong matches (7+)</p>
+<p class="subtitle">{active_count} active jobs &middot; {applied_count} applied &middot; {priority_count} early-career priorities &middot; {high_fit} strong matches (7+)</p>
+
+<section class="import-panel">
+  <h2>Add a job from the web</h2>
+  <p>Paste a public job-posting URL. It will appear immediately while ApplyPilot fetches its details.</p>
+  <form id="job-import-form" class="import-form">
+    <input id="job-url" class="import-input" type="url" name="url" required
+           placeholder="https://company.com/careers/job..." autocomplete="url">
+    <button id="job-import-button" class="import-button" type="submit">Add Job</button>
+  </form>
+  <div id="import-status" class="import-status" role="status"></div>
+</section>
+
+<nav class="tabs" aria-label="Job status">
+  <button class="tab-btn active" data-tab="active" onclick="switchTab('active')">
+    Active postings ({active_count})
+  </button>
+  <button class="tab-btn" data-tab="applied" onclick="switchTab('applied')">
+    Applied ({applied_count})
+  </button>
+</nav>
 
 <div class="summary">
   <div class="stat-card stat-total"><div class="stat-num">{total}</div><div class="stat-label">Total Jobs</div></div>
@@ -313,10 +442,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
 <div class="filters">
   <span class="filter-label">Score:</span>
-  <button class="filter-btn active" onclick="filterScore(0)">All 5+</button>
-  <button class="filter-btn" onclick="filterScore(7)">7+ Strong</button>
-  <button class="filter-btn" onclick="filterScore(8)">8+ Excellent</button>
-  <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
+  <button class="filter-btn active" onclick="filterScore(0, this)">All Jobs</button>
+  <button class="filter-btn" onclick="filterScore(7, this)">7+ Strong</button>
+  <button class="filter-btn" onclick="filterScore(8, this)">8+ Excellent</button>
+  <button class="filter-btn" onclick="filterScore(9, this)">9+ Perfect</button>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
   <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
 </div>
@@ -339,11 +468,86 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <script>
 let minScore = 0;
 let searchText = '';
+let currentTab = window.location.hash === '#applied' ? 'applied' : 'active';
+const importForm = document.getElementById('job-import-form');
+const importInput = document.getElementById('job-url');
+const importButton = document.getElementById('job-import-button');
+const importStatus = document.getElementById('import-status');
 
-function filterScore(min) {{
+function setImportStatus(message, isError = false) {{
+  importStatus.textContent = message;
+  importStatus.classList.toggle('error', isError);
+}}
+
+importForm.addEventListener('submit', async event => {{
+  event.preventDefault();
+  importButton.disabled = true;
+  setImportStatus('Adding job...');
+  try {{
+    const response = await fetch('/api/jobs', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{url: importInput.value}})
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not add job');
+    if (result.created || result.status === 'pending') {{
+      sessionStorage.setItem('applypilotPendingImport', result.url);
+      window.location.reload();
+      return;
+    }}
+    setImportStatus(result.message || 'This job is already in the dashboard.');
+  }} catch (error) {{
+    const hint = window.location.protocol === 'file:'
+      ? ' Run `applypilot dashboard` and use the localhost page.'
+      : '';
+    setImportStatus(error.message + hint, true);
+  }} finally {{
+    importButton.disabled = false;
+  }}
+}});
+
+async function pollPendingImport() {{
+  const url = sessionStorage.getItem('applypilotPendingImport');
+  if (!url) return;
+  setImportStatus('Job added. Fetching title, company, location, and description...');
+  try {{
+    const response = await fetch('/api/jobs/status?url=' + encodeURIComponent(url));
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not check import');
+    if (result.status === 'pending') {{
+      window.setTimeout(pollPendingImport, 1500);
+      return;
+    }}
+    sessionStorage.removeItem('applypilotPendingImport');
+    if (result.status === 'error') {{
+      setImportStatus('Job added, but enrichment failed: ' + (result.error || 'unknown error'), true);
+      window.setTimeout(() => window.location.reload(), 2500);
+      return;
+    }}
+    setImportStatus('Job details fetched. Refreshing...');
+    window.setTimeout(() => window.location.reload(), 500);
+  }} catch (error) {{
+    sessionStorage.removeItem('applypilotPendingImport');
+    setImportStatus(error.message, true);
+  }}
+}}
+
+pollPendingImport();
+
+function switchTab(tab) {{
+  currentTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(button => {{
+    button.classList.toggle('active', button.dataset.tab === tab);
+  }});
+  history.replaceState(null, '', tab === 'applied' ? '#applied' : window.location.pathname);
+  applyFilters();
+}}
+
+function filterScore(min, button) {{
   minScore = min;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
+  button.classList.add('active');
   applyFilters();
 }}
 
@@ -359,9 +563,10 @@ function applyFilters() {{
     total++;
     const score = parseInt(card.dataset.score) || 0;
     const text = card.textContent.toLowerCase();
-    const scoreMatch = score >= (minScore || 5);
+    const scoreMatch = score >= minScore;
     const textMatch = !searchText || text.includes(searchText);
-    if (scoreMatch && textMatch) {{
+    const tabMatch = card.dataset.applied === String(currentTab === 'applied');
+    if (scoreMatch && textMatch && tabMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{
@@ -377,11 +582,35 @@ function applyFilters() {{
       const visible = grid.querySelectorAll('.job-card:not(.hidden)').length;
       header.style.display = visible ? '' : 'none';
       grid.style.display = visible ? '' : 'none';
+      const count = header.querySelector('.score-group-count');
+      if (count) count.textContent = `(${{visible}} job${{visible === 1 ? '' : 's'}})`;
     }}
   }});
 }}
 
-applyFilters();
+document.addEventListener('click', async event => {{
+  const button = event.target.closest('.mark-applied-btn');
+  if (!button) return;
+  button.disabled = true;
+  button.textContent = 'Saving...';
+  try {{
+    const response = await fetch('/api/jobs/applied', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{url: button.dataset.jobUrl}})
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not update job');
+    window.location.hash = 'applied';
+    window.location.reload();
+  }} catch (error) {{
+    button.disabled = false;
+    button.textContent = 'Mark as applied';
+    window.alert(error.message);
+  }}
+}});
+
+switchTab(currentTab);
 </script>
 
 </body>

@@ -2,6 +2,7 @@
 
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 
@@ -169,6 +170,82 @@ DEFAULTS = {
     "apply_timeout": 300,
     "viewport": "1280x900",
 }
+
+REMOTE_LOCATION_TERMS = ("remote", "anywhere", "work from home", "wfh", "distributed")
+US_STATE_CODES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+}
+CANADA_PROVINCE_CODES = {"AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT"}
+US_STATE_NAMES = {
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+    "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york",
+    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "rhode island", "south carolina", "south dakota",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming", "district of columbia",
+}
+CANADA_PROVINCE_NAMES = {
+    "alberta", "british columbia", "manitoba", "new brunswick",
+    "newfoundland and labrador", "nova scotia", "ontario",
+    "prince edward island", "quebec", "saskatchewan",
+    "northwest territories", "nunavut", "yukon",
+}
+
+
+def _has_region_code(location: str, codes: set[str]) -> bool:
+    """Match state/province codes only in comma-delimited location segments."""
+    return any(
+        re.search(rf"(?:^|,\s*){re.escape(code)}(?:\s*,|$)", location, re.IGNORECASE)
+        for code in codes
+    )
+
+
+def location_is_allowed(location: str | None, search_cfg: dict | None = None) -> bool:
+    """Apply country-aware location preferences to a job location string."""
+    search_cfg = search_cfg or load_search_config()
+    if not location:
+        return bool(search_cfg.get("accept_unknown_locations", True))
+
+    text = str(location).strip()
+    lowered = text.lower()
+    reject = search_cfg.get("location_reject_non_remote", [])
+    if any(str(pattern).lower() in lowered for pattern in reject):
+        return False
+
+    is_remote = any(term in lowered for term in REMOTE_LOCATION_TERMS)
+    if is_remote and search_cfg.get("accept_remote_anywhere", True):
+        return True
+
+    allowed_countries = {
+        str(country).lower().strip()
+        for country in search_cfg.get("allowed_countries", [])
+    }
+    if allowed_countries:
+        allow_us = bool(allowed_countries & {"united states", "usa", "us", "u.s."})
+        allow_canada = bool(allowed_countries & {"canada", "can"})
+        if allow_us and (
+            re.search(r"\b(?:united states|usa|u\.s\.|us)\b", lowered)
+            or _has_region_code(text, US_STATE_CODES)
+            or any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in US_STATE_NAMES)
+        ):
+            return True
+        if allow_canada and (
+            re.search(r"\b(?:canada|can)\b", lowered)
+            or _has_region_code(text, CANADA_PROVINCE_CODES)
+            or any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in CANADA_PROVINCE_NAMES)
+        ):
+            return True
+
+    accept = search_cfg.get("location_accept", [])
+    return any(str(pattern).lower() in lowered for pattern in accept)
 
 
 def load_env():

@@ -55,7 +55,7 @@ def _build_tailor_prompt(profile: dict) -> str:
     companies = resume_facts.get("preserved_companies", [])
     projects = resume_facts.get("preserved_projects", [])
     school = resume_facts.get("preserved_school", "")
-    real_metrics = resume_facts.get("real_metrics", [])
+    real_metrics = resume_facts.get("real_metrics", []) # Are these also preserved for all tailored resumes?
 
     companies_str = ", ".join(companies) if companies else "N/A"
     projects_str = ", ".join(projects) if projects else "N/A"
@@ -70,7 +70,7 @@ def _build_tailor_prompt(profile: dict) -> str:
 
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
-Take the base resume and job description. Return a tailored resume as a JSON object.
+Take the master resume and job description. Return a tailored resume as a JSON object.
 
 ## RECRUITER SCAN (6 seconds):
 1. Education and contact info are easy to find
@@ -82,10 +82,6 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
 
 ## TAILORING RULES:
-
-TITLE: Return the target role only as JSON metadata. Do not render it in the resume header.
-
-SUMMARY: Do not write or include a summary section.
 
 EDUCATION: Keep education near the top of the resume immediately after the header/contact block.
 
@@ -232,7 +228,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         Formatted resume text.
     """
     personal = profile.get("personal", {})
-    lines: list[str] = []
+    lines: list[str] = [] # each element is a seperate line in the generated PDF
 
     # Header -- always code-injected from profile
     lines.append(personal.get("full_name", ""))
@@ -294,7 +290,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
 
 
-    return "\n".join(lines)
+    return "\n".join(lines) # This is what creates the tailored resume as a TXT file
 
 
 # ── LLM Judge ────────────────────────────────────────────────────────────

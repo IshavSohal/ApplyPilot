@@ -1,4 +1,4 @@
-"""Greenhouse Boards API discovery: fetches jobs from companies hosted on Greenhouse.
+"""Direct-employer discovery for Greenhouse and proprietary career sites.
 
 Greenhouse exposes a free, unauthenticated JSON board API per company:
 
@@ -8,17 +8,19 @@ When `content=true`, every posting is returned with its full HTML description,
 location, departments, offices, and an `absolute_url` that doubles as the apply
 URL -- so no enrichment call (and no LLM tokens) are required.
 
-Companies are loaded from `config/greenhouse_companies.yaml`. Title and location
-filters use the same `searches.yaml` keys as the other discovery scrapers, so a
-single user config drives the whole pipeline.
+Greenhouse companies are loaded from `config/greenhouse_companies.yaml`.
+Employers with proprietary career systems are loaded from
+`config/bigtech_companies.yaml`. Both use the filters in `searches.yaml`.
 """
 
 import html as html_module
 import json
 import logging
+import re
 import sqlite3
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -48,6 +50,16 @@ def load_companies() -> dict:
     return data.get("companies", {})
 
 
+def load_bigtech_companies() -> dict:
+    """Load companies backed by proprietary career-site adapters."""
+    path = CONFIG_DIR / "bigtech_companies.yaml"
+    if not path.exists():
+        log.warning("bigtech_companies.yaml not found at %s", path)
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("companies", {})
+
+
 # -- Filtering helpers -------------------------------------------------------
 
 def _load_location_filter(search_cfg: dict | None = None) -> tuple[list[str], list[str]]:
@@ -59,20 +71,17 @@ def _load_location_filter(search_cfg: dict | None = None) -> tuple[list[str], li
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    # for r in reject:
-    #     if r.lower() in loc:
-    #         return False
-    return False
+    policy = dict(search_cfg or {})
+    policy.setdefault("location_accept", accept)
+    policy.setdefault("location_reject_non_remote", reject)
+    return config.location_is_allowed(location, policy)
 
 
 def _load_query_terms(search_cfg: dict | None = None) -> list[str]:
@@ -161,6 +170,47 @@ def _http_get_json(url: str, max_retries: int = 3, backoff: float = 2.0) -> dict
     return {}
 
 
+def _http_request(
+    url: str,
+    data: bytes | None = None,
+    headers: dict | None = None,
+    max_retries: int = 3,
+    backoff: float = 2.0,
+) -> bytes:
+    """Make a GET or POST request with retries and return its raw body."""
+    request_headers = {"User-Agent": UA}
+    request_headers.update(headers or {})
+    last_err: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            req = urllib.request.Request(url, data=data, headers=request_headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code not in (429, 500, 502, 503, 504) or attempt >= max_retries:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_err = e
+            if attempt >= max_retries:
+                raise
+
+        wait = backoff * (attempt + 1)
+        log.warning(
+            "Transient error from %s, retry %d/%d in %.0fs",
+            url,
+            attempt + 1,
+            max_retries,
+            wait,
+        )
+        time.sleep(wait)
+
+    if last_err:
+        raise last_err
+    return b""
+
+
 def fetch_company_jobs(board_token: str) -> list[dict]:
     """Fetch all jobs for a Greenhouse board, with descriptions inlined.
 
@@ -186,6 +236,218 @@ def _normalize_description(content: str | None) -> str:
     return strip_html(decoded)
 
 
+# -- Proprietary career-site adapters ----------------------------------------
+
+def _fetch_google_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from the Google Careers result payload."""
+    base = "https://www.google.com/about/careers/applications/jobs/results/"
+    jobs: dict[str, dict] = {}
+    for term in terms or [""]:
+        for page in range(1, int(company.get("max_pages", 5)) + 1):
+            params = {"q": term}
+            if page > 1:
+                params["page"] = str(page)
+            text = _http_request(f"{base}?{urllib.parse.urlencode(params)}").decode("utf-8")
+            match = re.search(
+                r"AF_initDataCallback\(\{key: 'ds:1'.*?data:(.*?), sideChannel:",
+                text,
+                re.DOTALL,
+            )
+            if not match:
+                raise ValueError("Google Careers result payload was not found")
+            payload = json.loads(match.group(1))
+            results = payload[0] if payload and isinstance(payload[0], list) else []
+            for item in results:
+                if not isinstance(item, list) or len(item) < 11:
+                    continue
+                job_id, title = str(item[0]), item[1]
+                locations = item[9] if isinstance(item[9], list) else []
+                location = "; ".join(
+                    str(loc[0])
+                    for loc in locations
+                    if isinstance(loc, list) and loc and loc[0]
+                )
+                content_parts = []
+                for index in (10, 4, 3):
+                    field = item[index] if len(item) > index else None
+                    if isinstance(field, list) and len(field) > 1 and field[1]:
+                        content_parts.append(str(field[1]))
+                jobs[job_id] = {
+                    "title": title,
+                    "location": location,
+                    "url": f"{base}{job_id}",
+                    "content": "\n".join(content_parts),
+                }
+            if len(results) < 20:
+                break
+    return list(jobs.values())
+
+
+def _fetch_amazon_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from Amazon Jobs' JSON search endpoint."""
+    base = "https://www.amazon.jobs/en/search.json"
+    jobs: dict[str, dict] = {}
+    page_size = int(company.get("page_size", 100))
+    for term in terms or [""]:
+        for page in range(int(company.get("max_pages", 5))):
+            params = {
+                "base_query": term,
+                "result_limit": page_size,
+                "offset": page * page_size,
+            }
+            data = json.loads(
+                _http_request(
+                    f"{base}?{urllib.parse.urlencode(params)}",
+                    headers={
+                        "Accept": "application/json",
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                )
+            )
+            results = data.get("jobs", []) or []
+            for item in results:
+                job_id = str(item.get("id_icims") or item.get("id") or "")
+                path = item.get("job_path") or ""
+                if not job_id or not path:
+                    continue
+                jobs[job_id] = {
+                    "title": item.get("title"),
+                    "location": item.get("normalized_location") or item.get("location"),
+                    "url": urllib.parse.urljoin("https://www.amazon.jobs", path),
+                    "content": item.get("description") or item.get("description_short"),
+                    "posted_at": item.get("posted_date"),
+                }
+            if len(results) < page_size:
+                break
+    return list(jobs.values())
+
+
+def _fetch_apple_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from Apple Careers' server-rendered hydration data."""
+    base = "https://jobs.apple.com/en-us/search"
+    jobs: dict[str, dict] = {}
+    for term in terms or [""]:
+        for page in range(1, int(company.get("max_pages", 5)) + 1):
+            params: dict[str, str | int] = {
+                "search": re.sub(r"\s+", "-", term.strip()),
+                "page": page,
+            }
+            if company.get("location"):
+                params["location"] = company["location"]
+            text = _http_request(
+                f"{base}?{urllib.parse.urlencode(params)}",
+                headers={"Accept": "text/html"},
+            ).decode("utf-8")
+            match = re.search(
+                r'window\.__staticRouterHydrationData = JSON\.parse\("(.*?)"\);',
+                text,
+                re.DOTALL,
+            )
+            if not match:
+                raise ValueError("Apple Careers hydration payload was not found")
+            payload = json.loads(json.loads(f'"{match.group(1)}"'))
+            search = payload.get("loaderData", {}).get("search", {})
+            results = search.get("searchResults", []) or []
+            for item in results:
+                job_id = str(item.get("positionId") or item.get("reqId") or "")
+                if not job_id:
+                    continue
+                locations = item.get("locations", []) or []
+                location = "; ".join(
+                    ", ".join(
+                        part
+                        for part in (loc.get("name"), loc.get("countryName"))
+                        if part
+                    )
+                    for loc in locations
+                    if isinstance(loc, dict)
+                )
+                slug = item.get("transformedPostingTitle") or "job"
+                jobs[job_id] = {
+                    "title": item.get("postingTitle"),
+                    "location": location,
+                    "url": f"https://jobs.apple.com/en-us/details/{job_id}/{slug}",
+                    "content": item.get("jobSummary"),
+                    "posted_at": item.get("postDateInGMT") or item.get("postingDate"),
+                }
+            if len(results) < 20:
+                break
+    return list(jobs.values())
+
+
+def _fetch_meta_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from Meta Careers' persisted GraphQL query."""
+    endpoint = "https://www.metacareers.com/graphql"
+    doc_id = str(company.get("doc_id", "29615178951461218"))
+    lsd = str(company.get("lsd", "AdFL9XlD5sA"))
+    jobs: dict[str, dict] = {}
+    for term in terms or [""]:
+        variables = {
+            "search_input": {
+                "q": term or None,
+                "divisions": [],
+                "offices": [],
+                "roles": [],
+                "leadership_levels": [],
+                "saved_jobs": [],
+                "saved_searches": [],
+                "sub_teams": [],
+                "teams": [],
+                "is_leadership": False,
+                "is_remote_only": False,
+                "sort_by_new": False,
+                "results_per_page": None,
+            }
+        }
+        body = urllib.parse.urlencode(
+            {
+                "lsd": lsd,
+                "fb_api_caller_class": "RelayModern",
+                "fb_api_req_friendly_name": "CareersJobSearchResultsDataQuery",
+                "variables": json.dumps(variables),
+                "doc_id": doc_id,
+            }
+        ).encode("utf-8")
+        payload = json.loads(
+            _http_request(
+                endpoint,
+                data=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "x-fb-friendly-name": "CareersJobSearchResultsDataQuery",
+                    "x-fb-lsd": lsd,
+                },
+            )
+        )
+        results = (
+            payload.get("data", {})
+            .get("job_search_with_featured_jobs", {})
+            .get("all_jobs", [])
+            or []
+        )
+        for item in results:
+            job_id = str(item.get("id") or "")
+            if not job_id:
+                continue
+            locations = item.get("locations", []) or []
+            jobs[job_id] = {
+                "title": item.get("title"),
+                "location": "; ".join(str(loc) for loc in locations),
+                "url": f"https://www.metacareers.com/jobs/{job_id}",
+                "content": "",
+            }
+    return list(jobs.values())
+
+
+BIGTECH_FETCHERS = {
+    "google": _fetch_google_jobs,
+    "amazon": _fetch_amazon_jobs,
+    "apple": _fetch_apple_jobs,
+    "meta": _fetch_meta_jobs,
+}
+
+
 # -- Per-company processing --------------------------------------------------
 
 def _process_company(
@@ -195,6 +457,7 @@ def _process_company(
     excludes: list[str],
     accept_locs: list[str],
     reject_locs: list[str],
+    search_cfg: dict,
     location_filter: bool,
 ) -> dict:
     """Fetch + filter + store jobs for one Greenhouse company."""
@@ -225,7 +488,7 @@ def _process_company(
 
         if not _title_matches(title, terms, excludes):
             continue
-        if location_filter and not _location_ok(location, accept_locs, reject_locs):
+        if location_filter and not _location_ok(location, accept_locs, reject_locs, search_cfg):
             continue
 
         url = job.get("absolute_url") or ""
@@ -273,6 +536,102 @@ def _process_company(
     result["new"] = new
     result["existing"] = existing
     log.info("%s: %d kept after filter -> %d new, %d dupes", name, len(rows), new, existing)
+    return result
+
+
+def _process_bigtech_company(
+    key: str,
+    company: dict,
+    terms: list[str],
+    excludes: list[str],
+    accept_locs: list[str],
+    reject_locs: list[str],
+    search_cfg: dict,
+    location_filter: bool,
+) -> dict:
+    """Fetch, normalize, filter, and store one proprietary career site."""
+    name = company.get("name", key)
+    provider = company.get("provider", key)
+    result = {
+        "company": name,
+        "found": 0,
+        "kept": 0,
+        "new": 0,
+        "existing": 0,
+        "error": None,
+    }
+    fetcher = BIGTECH_FETCHERS.get(provider)
+    if not fetcher:
+        result["error"] = f"unsupported provider: {provider}"
+        return result
+
+    try:
+        raw_jobs = fetcher(company, terms)
+    except Exception as e:
+        log.error("%s: careers adapter error: %s", name, e)
+        result["error"] = str(e)
+        return result
+
+    result["found"] = len(raw_jobs)
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[tuple] = []
+    for job in raw_jobs:
+        title = job.get("title") or ""
+        location = job.get("location") or None
+        if not _title_matches(title, terms, excludes):
+            continue
+        if location_filter and not _location_ok(location, accept_locs, reject_locs, search_cfg):
+            continue
+        url = job.get("url") or ""
+        if not url:
+            continue
+
+        full_description = _normalize_description(job.get("content"))
+        detail_scraped_at = now if len(full_description) > 200 else None
+        rows.append(
+            (
+                url,
+                title or None,
+                None,
+                full_description[:500] if full_description else None,
+                location,
+                name,
+                f"{provider}_careers",
+                now,
+                job.get("posted_at"),
+                full_description if detail_scraped_at else None,
+                url,
+                detail_scraped_at,
+            )
+        )
+
+    result["kept"] = len(rows)
+    conn = get_connection()
+    for row in rows:
+        try:
+            conn.execute(
+                "INSERT INTO jobs (url, title, salary, description, location, site, "
+                "strategy, discovered_at, posted_at, full_description, application_url, "
+                "detail_scraped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            result["new"] += 1
+        except sqlite3.IntegrityError:
+            conn.execute(
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "
+                "location = COALESCE(?, location) WHERE url = ?",
+                (row[8], row[4], row[0]),
+            )
+            result["existing"] += 1
+    conn.commit()
+    log.info(
+        "%s: %d found, %d kept -> %d new, %d dupes",
+        name,
+        result["found"],
+        result["kept"],
+        result["new"],
+        result["existing"],
+    )
     return result
 
 
@@ -325,7 +684,7 @@ def run_greenhouse_discovery(
             futures = {
                 pool.submit(
                     _process_company, key, companies[key],
-                    terms, excludes, accept_locs, reject_locs, location_filter,
+                    terms, excludes, accept_locs, reject_locs, search_cfg, location_filter,
                 ): key
                 for key in keys
             }
@@ -347,7 +706,7 @@ def run_greenhouse_discovery(
         for i, key in enumerate(keys, 1):
             r = _process_company(
                 key, companies[key],
-                terms, excludes, accept_locs, reject_locs, location_filter,
+                terms, excludes, accept_locs, reject_locs, search_cfg, location_filter,
             )
             grand["found"] += r["found"]
             grand["kept"] += r["kept"]
@@ -365,4 +724,97 @@ def run_greenhouse_discovery(
     log.info("Greenhouse crawl done in %.0fs: %d found, %d kept, %d new, %d dupes, %d errors",
              elapsed, grand["found"], grand["kept"], grand["new"], grand["existing"],
              grand["errors"])
+    return grand
+
+
+def run_bigtech_discovery(
+    companies: dict | None = None,
+    workers: int = 1,
+) -> dict:
+    """Discover jobs from configured proprietary big-tech career sites."""
+    if companies is None:
+        companies = load_bigtech_companies()
+    if not companies:
+        return {
+            "found": 0,
+            "kept": 0,
+            "new": 0,
+            "existing": 0,
+            "errors": 0,
+            "companies": 0,
+        }
+
+    init_db()
+    search_cfg = config.load_search_config()
+    terms = _load_query_terms(search_cfg)
+    excludes = _load_excluded_titles(search_cfg)
+    accept_locs, reject_locs = _load_location_filter(search_cfg)
+    location_filter = search_cfg.get(
+        "bigtech_location_filter",
+        search_cfg.get("greenhouse_location_filter", True),
+    )
+    keys = list(companies)
+    grand = {
+        "found": 0,
+        "kept": 0,
+        "new": 0,
+        "existing": 0,
+        "errors": 0,
+        "companies": len(keys),
+    }
+
+    def add_result(result: dict) -> None:
+        for field in ("found", "kept", "new", "existing"):
+            grand[field] += result[field]
+        if result["error"]:
+            grand["errors"] += 1
+
+    log.info(
+        "Big-tech crawl: %d companies | %d query terms | %d excludes | workers=%d",
+        len(keys),
+        len(terms),
+        len(excludes),
+        workers,
+    )
+    if workers > 1 and len(keys) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(keys))) as pool:
+            futures = [
+                pool.submit(
+                    _process_bigtech_company,
+                    key,
+                    companies[key],
+                    terms,
+                    excludes,
+                    accept_locs,
+                    reject_locs,
+                    search_cfg,
+                    location_filter,
+                )
+                for key in keys
+            ]
+            for future in as_completed(futures):
+                add_result(future.result())
+    else:
+        for key in keys:
+            add_result(
+                _process_bigtech_company(
+                    key,
+                    companies[key],
+                    terms,
+                    excludes,
+                    accept_locs,
+                    reject_locs,
+                    search_cfg,
+                    location_filter,
+                )
+            )
+
+    log.info(
+        "Big-tech crawl done: %d found, %d kept, %d new, %d dupes, %d errors",
+        grand["found"],
+        grand["kept"],
+        grand["new"],
+        grand["existing"],
+        grand["errors"],
+    )
     return grand

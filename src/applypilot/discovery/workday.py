@@ -50,25 +50,17 @@ def _load_location_filter(search_cfg: dict | None = None):
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
+    policy = dict(search_cfg or {})
+    policy.setdefault("location_accept", accept)
+    policy.setdefault("location_reject_non_remote", reject)
+    return config.location_is_allowed(location, policy)
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -197,6 +189,7 @@ def search_employer(
 ) -> list[dict]:
     """Search an employer, paginate through all results, optionally filter by location."""
     log.info("%s: searching \"%s\"...", employer["name"], search_text)
+    search_cfg = config.load_search_config()
 
     all_jobs: list[dict] = []
     offset = 0
@@ -222,7 +215,7 @@ def search_employer(
         for j in postings:
             loc = j.get("locationsText", "")
             if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs):
+                if not _location_ok(loc, accept_locs, reject_locs, search_cfg):
                     continue
 
             all_jobs.append({
@@ -327,13 +320,19 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "discovered_at, posted_at, full_description, application_url, detail_scraped_at, detail_error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
+                 site, strategy, now, job.get("posted"), full_description, url,
+                 detail_scraped_at, detail_error),
             )
             new += 1
         except sqlite3.IntegrityError:
+            if job.get("posted"):
+                conn.execute(
+                    "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
+                    (job["posted"], url),
+                )
             existing += 1
 
     conn.commit()

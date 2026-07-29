@@ -323,13 +323,20 @@ def status() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def dashboard(
+    port: int = typer.Option(8765, "--port", help="Local dashboard server port."),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not open the browser automatically."),
+) -> None:
+    """Run the interactive dashboard on localhost."""
     _bootstrap()
 
-    from applypilot.view import open_dashboard
+    from applypilot.dashboard_server import serve_dashboard
 
-    open_dashboard()
+    try:
+        serve_dashboard(port=port, open_browser=not no_open)
+    except OSError as exc:
+        console.print(f"[red]Could not start dashboard:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()

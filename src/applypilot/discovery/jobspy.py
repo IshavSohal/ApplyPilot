@@ -86,33 +86,17 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter.
-
-    Remote jobs are always accepted. Non-remote jobs must match an accept
-    pattern and not match a reject pattern.
-    """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
+    """Check whether a job matches the configured location policy."""
+    policy = dict(search_cfg or {})
+    policy.setdefault("location_accept", accept)
+    policy.setdefault("location_reject_non_remote", reject)
+    return config.location_is_allowed(location, policy)
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
@@ -165,17 +149,23 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        posted_at = str(row.get("date_posted", "")) if str(row.get("date_posted", "")) != "nan" else None
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "posted_at, full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                 posted_at, full_description, apply_url, detail_scraped_at),
             )
             new += 1
         except sqlite3.IntegrityError:
+            if posted_at:
+                conn.execute(
+                    "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
+                    (posted_at, url),
+                )
             existing += 1
 
     conn.commit()
@@ -270,9 +260,10 @@ def _run_one_search(
 
     # Filter by location before storing
     before = len(df)
+    location_policy = config.load_search_config()
     df = df[df.apply(lambda row: _location_ok(
         str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
+        accept_locs, reject_locs, location_policy,
     ), axis=1)]
     filtered = before - len(df)
 

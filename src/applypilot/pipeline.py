@@ -60,26 +60,60 @@ _UPSTREAM: dict[str, str | None] = {
 # ---------------------------------------------------------------------------
 
 def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — Greenhouse boards only.
-
-    JobSpy / Workday / SmartExtract scrapers still live in `discovery/` but are
-    intentionally not invoked: the Greenhouse Boards API ships full descriptions
-    inline, so it covers discovery + enrichment in one zero-token HTTP call per
-    company.
-    """
-    stats: dict = {"greenhouse": None}
+    """Stage: direct-employer job discovery."""
+    stats: dict = {"greenhouse": None, "bigtech": None}
+    totals = {
+        key: 0
+        for key in ("found", "kept", "new", "existing", "errors", "companies")
+    }
 
     console.print("  [cyan]Greenhouse boards crawl...[/cyan]")
     try:
         from applypilot.discovery.greenhouse import run_greenhouse_discovery
         result = run_greenhouse_discovery(workers=workers)
         stats["greenhouse"] = "ok"
-        stats.update({k: result[k] for k in ("found", "kept", "new", "existing",
-                                              "errors", "companies") if k in result})
+        for key in totals:
+            totals[key] += result.get(key, 0)
     except Exception as e:
         log.error("Greenhouse crawl failed: %s", e)
         console.print(f"  [red]Greenhouse error:[/red] {e}")
         stats["greenhouse"] = f"error: {e}"
+
+    console.print("  [cyan]Big-tech career sites crawl...[/cyan]")
+    try:
+        from applypilot.discovery.greenhouse import run_bigtech_discovery
+        result = run_bigtech_discovery(workers=workers)
+        stats["bigtech"] = "ok"
+        for key in totals:
+            totals[key] += result.get(key, 0)
+    except Exception as e:
+        log.error("Big-tech crawl failed: %s", e)
+        console.print(f"  [red]Big-tech error:[/red] {e}")
+        stats["bigtech"] = f"error: {e}"
+
+    stats.update(totals)
+
+    # Workday corporate scraper
+    console.print("  [cyan]Workday corporate scraper...[/cyan]")
+    try:
+        from applypilot.discovery.workday import run_workday_discovery
+        run_workday_discovery(workers=workers)
+        stats["workday"] = "ok"
+    except Exception as e:
+        log.error("Workday scraper failed: %s", e)
+        console.print(f"  [red]Workday error:[/red] {e}")
+        stats["workday"] = f"error: {e}"
+
+    # Smart extract
+    # console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
+    # try:
+    #     from applypilot.discovery.smartextract import run_smart_extract
+    #     run_smart_extract(workers=workers)
+    #     stats["smartextract"] = "ok"
+    # except Exception as e:
+    #     log.error("Smart extract failed: %s", e)
+    #     console.print(f"  [red]Smart extract error:[/red] {e}")
+    #     stats["smartextract"] = f"error: {e}"
 
     return stats
 

@@ -1,0 +1,28 @@
+# Large employers whose career sites do not use Greenhouse.
+#
+# These providers use public, unauthenticated career-site data. They are
+# undocumented interfaces and may occasionally require adapter updates.
+
+companies:
+  google:
+    name: "Google"
+    provider: "google"
+    max_pages: 5
+
+  amazon:
+    name: "Amazon"
+    provider: "amazon"
+    max_pages: 5
+    page_size: 100
+
+  meta:
+    name: "Meta"
+    provider: "meta"
+    # Meta's persisted GraphQL query ID can change when its careers site ships.
+    doc_id: "29615178951461218"
+    lsd: "AdFL9XlD5sA"
+
+  apple:
+    name: "Apple"
+    provider: "apple"
+    max_pages: 5
