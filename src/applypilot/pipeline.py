@@ -93,16 +93,8 @@ def _run_discover(workers: int = 1) -> dict:
 
     stats.update(totals)
 
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
+    # Workday discovery is intentionally disabled.
+    stats["workday"] = "disabled"
 
     # Smart extract
     # console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")

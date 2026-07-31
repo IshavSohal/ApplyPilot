@@ -187,6 +187,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <div class="bar-fill" style="width:{s['mid_fit']/max(s['total'],1)*100}%;background:{color}66"></div>
           </div>
         </div>"""
+    source_options = "".join(
+        f'<option value="{escape(s["site"] or "__unknown__")}">'
+        f'{escape(s["site"] or "Unknown")}</option>'
+        for s in site_stats
+    )
 
     # Job cards grouped by score
     job_sections = ""
@@ -216,7 +221,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
         url = escape(j["url"] or "")
         salary = escape(j["salary"] or "")
         location = escape(j["location"] or "")
-        site = escape(j["site"] or "")
+        site = escape(j["site"] or "Unknown")
+        site_value = escape(j["site"] or "__unknown__")
         site_color = colors.get(j["site"] or "", "#6b7280")
         apply_url = escape(j["application_url"] or "")
 
@@ -262,7 +268,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
         job_sections += f"""
         <div class="job-card" data-score="{score}" data-applied="{str(is_applied).lower()}"
-             data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
+             data-site="{site_value}" data-location="{location.lower()}">
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{"&mdash;" if score == 0 else score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
@@ -303,6 +309,14 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .import-status {{ min-height: 1.25rem; margin-top: 0.65rem; font-size: 0.82rem; color: #93c5fd; }}
   .import-status.error {{ color: #fca5a5; }}
   .import-error {{ color: #fca5a5; background: #450a0a55; border-radius: 5px; padding: 0.45rem; margin-bottom: 0.5rem; font-size: 0.75rem; }}
+  .discovery-panel {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }}
+  .discovery-panel h2 {{ font-size: 1rem; margin-bottom: 0.35rem; }}
+  .discovery-panel p {{ color: #94a3b8; font-size: 0.82rem; }}
+  .discovery-actions {{ display: flex; flex-direction: column; align-items: flex-end; min-width: 180px; }}
+  .discovery-button {{ border: 0; border-radius: 7px; padding: 0.65rem 1rem; background: #10b981; color: #052e16; font-weight: 700; cursor: pointer; }}
+  .discovery-button:disabled {{ opacity: 0.55; cursor: wait; }}
+  .discovery-status {{ min-height: 1.25rem; margin-top: 0.5rem; font-size: 0.78rem; color: #6ee7b7; text-align: right; }}
+  .discovery-status.error {{ color: #fca5a5; }}
 
   /* Summary cards */
   .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
@@ -322,6 +336,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .filter-btn.active {{ background: #60a5fa; color: #0f172a; font-weight: 600; }}
   .search-input {{ background: #334155; border: 1px solid #475569; color: #e2e8f0; padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.8rem; width: 200px; }}
   .search-input::placeholder {{ color: #64748b; }}
+  .source-select {{ background: #334155; border: 1px solid #475569; color: #e2e8f0; padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.8rem; max-width: 220px; }}
 
   /* Score distribution */
   .score-section {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; }}
@@ -404,6 +419,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
     .score-section {{ grid-template-columns: 1fr; }}
     .job-grid {{ grid-template-columns: 1fr; }}
     .import-form {{ flex-direction: column; }}
+    .discovery-panel {{ align-items: stretch; flex-direction: column; }}
+    .discovery-actions {{ align-items: stretch; }}
+    .discovery-status {{ text-align: left; }}
     body {{ padding: 1rem; }}
   }}
 </style>
@@ -422,6 +440,19 @@ def generate_dashboard(output_path: str | None = None) -> str:
     <button id="job-import-button" class="import-button" type="submit">Add Job</button>
   </form>
   <div id="import-status" class="import-status" role="status"></div>
+</section>
+
+<section class="discovery-panel">
+  <div>
+    <h2>Discover new jobs</h2>
+    <p>Crawl the configured Greenhouse and big-tech career sites.</p>
+  </div>
+  <div class="discovery-actions">
+    <button id="discovery-button" class="discovery-button" type="button">
+      Run Discovery
+    </button>
+    <div id="discovery-status" class="discovery-status" role="status"></div>
+  </div>
 </section>
 
 <nav class="tabs" aria-label="Job status">
@@ -446,6 +477,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <button class="filter-btn" onclick="filterScore(7, this)">7+ Strong</button>
   <button class="filter-btn" onclick="filterScore(8, this)">8+ Excellent</button>
   <button class="filter-btn" onclick="filterScore(9, this)">9+ Perfect</button>
+  <span class="filter-label" style="margin-left:1rem">Source:</span>
+  <select class="source-select" onchange="filterSource(this.value)">
+    <option value="">All Sources</option>
+    {source_options}
+  </select>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
   <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
 </div>
@@ -468,11 +504,14 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <script>
 let minScore = 0;
 let searchText = '';
+let selectedSource = '';
 let currentTab = window.location.hash === '#applied' ? 'applied' : 'active';
 const importForm = document.getElementById('job-import-form');
 const importInput = document.getElementById('job-url');
 const importButton = document.getElementById('job-import-button');
 const importStatus = document.getElementById('import-status');
+const discoveryButton = document.getElementById('discovery-button');
+const discoveryStatus = document.getElementById('discovery-status');
 
 function setImportStatus(message, isError = false) {{
   importStatus.textContent = message;
@@ -535,6 +574,69 @@ async function pollPendingImport() {{
 
 pollPendingImport();
 
+function renderDiscoveryStatus(state) {{
+  discoveryStatus.classList.toggle('error', state.status === 'error');
+  if (state.status === 'running') {{
+    discoveryButton.disabled = true;
+    discoveryButton.textContent = 'Discovery running...';
+    discoveryStatus.textContent = 'Searching configured career sites. You can keep using the dashboard.';
+    window.setTimeout(refreshDiscoveryStatus, 2000);
+    return;
+  }}
+
+  discoveryButton.disabled = false;
+  discoveryButton.textContent = 'Run Discovery';
+  if (state.status === 'complete') {{
+    const result = state.result || {{}};
+    discoveryStatus.textContent =
+      `Finished: ${{result.new || 0}} new, ${{result.existing || 0}} existing jobs.`;
+    if (sessionStorage.getItem('applypilotDiscoveryRunning')) {{
+      sessionStorage.removeItem('applypilotDiscoveryRunning');
+      window.setTimeout(() => window.location.reload(), 1000);
+    }}
+  }} else if (state.status === 'error') {{
+    sessionStorage.removeItem('applypilotDiscoveryRunning');
+    discoveryStatus.textContent = 'Discovery failed: ' + (state.error || 'unknown error');
+  }} else {{
+    discoveryStatus.textContent = '';
+  }}
+}}
+
+async function refreshDiscoveryStatus() {{
+  try {{
+    const response = await fetch('/api/discovery/status');
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.error || 'Could not check discovery');
+    renderDiscoveryStatus(state);
+  }} catch (error) {{
+    discoveryButton.disabled = false;
+    discoveryStatus.classList.add('error');
+    discoveryStatus.textContent = error.message;
+  }}
+}}
+
+discoveryButton.addEventListener('click', async () => {{
+  discoveryButton.disabled = true;
+  discoveryStatus.textContent = 'Starting discovery...';
+  try {{
+    const response = await fetch('/api/discovery', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{workers: 4}})
+    }});
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.error || 'Could not start discovery');
+    sessionStorage.setItem('applypilotDiscoveryRunning', 'true');
+    renderDiscoveryStatus(state);
+  }} catch (error) {{
+    discoveryButton.disabled = false;
+    discoveryStatus.classList.add('error');
+    discoveryStatus.textContent = error.message;
+  }}
+}});
+
+refreshDiscoveryStatus();
+
 function switchTab(tab) {{
   currentTab = tab;
   document.querySelectorAll('.tab-btn').forEach(button => {{
@@ -556,6 +658,11 @@ function filterText(text) {{
   applyFilters();
 }}
 
+function filterSource(source) {{
+  selectedSource = source.toLowerCase();
+  applyFilters();
+}}
+
 function applyFilters() {{
   let shown = 0;
   let total = 0;
@@ -565,8 +672,9 @@ function applyFilters() {{
     const text = card.textContent.toLowerCase();
     const scoreMatch = score >= minScore;
     const textMatch = !searchText || text.includes(searchText);
+    const sourceMatch = !selectedSource || card.dataset.site.toLowerCase() === selectedSource;
     const tabMatch = card.dataset.applied === String(currentTab === 'applied');
-    if (scoreMatch && textMatch && tabMatch) {{
+    if (scoreMatch && textMatch && sourceMatch && tabMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{

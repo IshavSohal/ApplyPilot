@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -187,6 +188,21 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
     )
     monkeypatch.setattr(dashboard_server, "enrich_external_job", lambda _url: None)
 
+    def complete_discovery(server, workers):
+        with server.discovery_lock:
+            server.discovery_state = {
+                **server.discovery_state,
+                "status": "complete",
+                "result": {"new": 3, "existing": 7},
+                "finished_at": "2026-07-29T15:00:00+00:00",
+            }
+
+    monkeypatch.setattr(
+        dashboard_server,
+        "_execute_discovery",
+        complete_discovery,
+    )
+
     server = DashboardHTTPServer(
         ("127.0.0.1", 0),
         DashboardRequestHandler,
@@ -228,6 +244,27 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
             (result["url"],),
         ).fetchone()
         assert row["applied_at"] is not None
+
+        discovery_request = urllib.request.Request(
+            f"{base_url}/api/discovery",
+            data=json.dumps({"workers": 2}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(discovery_request) as response:
+            discovery = json.load(response)
+            assert response.status == 202
+            assert discovery["status"] == "running"
+
+        for _ in range(20):
+            with urllib.request.urlopen(
+                f"{base_url}/api/discovery/status"
+            ) as response:
+                discovery = json.load(response)
+            if discovery["status"] == "complete":
+                break
+            time.sleep(0.01)
+        assert discovery["result"] == {"new": 3, "existing": 7}
     finally:
         server.shutdown()
         server.server_close()
@@ -252,3 +289,8 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert 'data-applied="false"' in html
     assert 'data-applied="true"' in html
     assert "Mark as applied" in html
+    assert "All Sources" in html
+    assert 'data-site="example.com"' in html
+    assert "filterSource(this.value)" in html
+    assert "Run Discovery" in html
+    assert "/api/discovery/status" in html

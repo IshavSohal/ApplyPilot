@@ -161,6 +161,54 @@ def enrich_external_job(url: str) -> None:
         conn.commit()
 
 
+def _execute_discovery(server: DashboardHTTPServer, workers: int) -> None:
+    """Run discovery and publish its result to the dashboard server."""
+    from applypilot.pipeline import _run_discover
+
+    try:
+        result = _run_discover(workers=workers)
+    except Exception as exc:
+        log.exception("Dashboard discovery failed")
+        with server.discovery_lock:
+            server.discovery_state = {
+                **server.discovery_state,
+                "status": "error",
+                "error": str(exc)[:500],
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        return
+
+    with server.discovery_lock:
+        server.discovery_state = {
+            **server.discovery_state,
+            "status": "complete",
+            "result": result,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def start_discovery(server: DashboardHTTPServer, workers: int = 4) -> dict:
+    """Start one background discovery run, rejecting overlapping runs."""
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 8:
+        raise ValueError("Workers must be an integer between 1 and 8")
+
+    with server.discovery_lock:
+        if server.discovery_state["status"] == "running":
+            return dict(server.discovery_state)
+        server.discovery_state = {
+            "status": "running",
+            "workers": workers,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+        state = dict(server.discovery_state)
+
+    server.discovery_pool.submit(_execute_discovery, server, workers)
+    return state
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     """Threaded localhost server with a bounded enrichment pool."""
 
@@ -172,10 +220,24 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             max_workers=2,
             thread_name_prefix="applypilot-enrich",
         )
+        self.discovery_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="applypilot-discovery",
+        )
+        self.discovery_lock = threading.Lock()
+        self.discovery_state = {
+            "status": "idle",
+            "workers": None,
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
         self.render_lock = threading.Lock()
 
     def server_close(self) -> None:
         self.enrichment_pool.shutdown(wait=False, cancel_futures=True)
+        self.discovery_pool.shutdown(wait=False, cancel_futures=True)
         super().server_close()
 
 
@@ -213,11 +275,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(exc)})
             return
 
+        if parsed.path == "/api/discovery/status":
+            with self.server.discovery_lock:
+                state = dict(self.server.discovery_state)
+            self._send_json(200, state)
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path not in {"/api/jobs", "/api/jobs/applied"}:
+        if path not in {"/api/jobs", "/api/jobs/applied", "/api/discovery"}:
             self._send_json(404, {"error": "Not found"})
             return
 
@@ -230,7 +298,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
             if not isinstance(payload, dict):
                 raise ValueError("Request body must be a JSON object")
-            if path == "/api/jobs/applied":
+            if path == "/api/discovery":
+                result = start_discovery(self.server, payload.get("workers", 4))
+            elif path == "/api/jobs/applied":
                 result = mark_job_applied(payload.get("url", ""))
             else:
                 result = import_external_job(payload.get("url", ""))
@@ -240,6 +310,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         except sqlite3.Error as exc:
             log.exception("Could not import external job")
             self._send_json(500, {"error": f"Database error: {exc}"})
+            return
+
+        if path == "/api/discovery":
+            self._send_json(202, result)
             return
 
         if path == "/api/jobs/applied":
