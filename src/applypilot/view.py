@@ -272,6 +272,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{"&mdash;" if score == 0 else score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
+            <button class="delete-job-btn" data-job-url="{url}" type="button"
+                    title="Delete job" aria-label="Delete job">
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9zm-1 12h12a1 1 0 0 0 1-1V8H5v12a1 1 0 0 0 1 1z"/>
+              </svg>
+            </button>
           </div>
           <div class="meta-row">{meta_html}</div>
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
@@ -293,7 +299,17 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <title>ApplyPilot Dashboard</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }}
+  .app-shell {{ min-height: 100vh; display: flex; }}
+  .sidebar {{ position: sticky; top: 0; width: 220px; height: 100vh; flex-shrink: 0; background: #111827; border-right: 1px solid #334155; padding: 1.5rem 1rem; }}
+  .sidebar-brand {{ font-size: 1.2rem; font-weight: 750; margin: 0 0.5rem 1.5rem; color: #f8fafc; }}
+  .sidebar-nav {{ display: flex; flex-direction: column; gap: 0.4rem; }}
+  .nav-btn {{ width: 100%; border: 0; border-radius: 8px; background: transparent; color: #94a3b8; padding: 0.7rem 0.8rem; text-align: left; font-size: 0.9rem; font-weight: 600; cursor: pointer; }}
+  .nav-btn:hover {{ color: #e2e8f0; background: #1e293b; }}
+  .nav-btn.active {{ color: #bfdbfe; background: #1e3a5f; }}
+  .main-content {{ width: calc(100% - 220px); padding: 2rem; }}
+  .app-view {{ display: none; }}
+  .app-view.active {{ display: block; }}
 
   h1 {{ font-size: 1.8rem; font-weight: 700; margin-bottom: 0.5rem; }}
   .subtitle {{ color: #94a3b8; margin-bottom: 2rem; }}
@@ -317,6 +333,61 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .discovery-button:disabled {{ opacity: 0.55; cursor: wait; }}
   .discovery-status {{ min-height: 1.25rem; margin-top: 0.5rem; font-size: 0.78rem; color: #6ee7b7; text-align: right; }}
   .discovery-status.error {{ color: #fca5a5; }}
+
+  /* Profile and search settings */
+  .settings-header {{ margin-bottom: 1.5rem; }}
+  .settings-header p {{ color: #94a3b8; margin-top: 0.4rem; }}
+  .settings-tabs {{ display: flex; gap: 0.5rem; margin-bottom: 1.25rem; border-bottom: 1px solid #334155; }}
+  .settings-tab {{ border: 0; border-bottom: 3px solid transparent; background: transparent; color: #94a3b8; padding: 0.7rem 0.9rem; font-weight: 600; cursor: pointer; }}
+  .settings-tab.active {{ color: #60a5fa; border-bottom-color: #60a5fa; }}
+  .settings-form {{ display: none; }}
+  .settings-form.active {{ display: block; }}
+  .settings-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }}
+  .settings-card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem; }}
+  .settings-card.wide {{ grid-column: 1 / -1; }}
+  .settings-card h2 {{ font-size: 1rem; margin-bottom: 1rem; }}
+  .field-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85rem; }}
+  .field {{ display: flex; flex-direction: column; gap: 0.3rem; }}
+  .field.wide {{ grid-column: 1 / -1; }}
+  .field label {{ color: #cbd5e1; font-size: 0.78rem; font-weight: 600; }}
+  .field input, .field textarea, .field select {{ width: 100%; background: #0f172a; border: 1px solid #475569; color: #e2e8f0; padding: 0.55rem 0.65rem; border-radius: 6px; font: inherit; font-size: 0.85rem; }}
+  .field textarea {{ min-height: 90px; resize: vertical; }}
+  .field small {{ color: #64748b; font-size: 0.72rem; }}
+  .check-field {{ display: flex; align-items: center; gap: 0.55rem; color: #cbd5e1; font-size: 0.82rem; margin-bottom: 0.65rem; }}
+  .check-field input {{ accent-color: #3b82f6; }}
+  .settings-actions {{ position: sticky; bottom: 0; display: flex; align-items: center; justify-content: flex-end; gap: 1rem; background: #0f172ae6; padding: 1rem 0; margin-top: 1rem; backdrop-filter: blur(6px); }}
+  .save-settings-btn, .add-row-btn {{ border: 0; border-radius: 7px; background: #3b82f6; color: white; padding: 0.6rem 1rem; font-weight: 650; cursor: pointer; }}
+  .save-settings-btn:disabled {{ opacity: 0.55; cursor: wait; }}
+  .add-row-btn {{ background: #334155; color: #cbd5e1; font-size: 0.78rem; padding: 0.4rem 0.65rem; }}
+  .settings-status {{ color: #6ee7b7; font-size: 0.82rem; }}
+  .settings-status.error {{ color: #fca5a5; }}
+  .editable-list {{ display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.75rem; }}
+  .editable-row {{ display: grid; grid-template-columns: 1fr 110px auto; gap: 0.55rem; align-items: center; }}
+  .editable-row.location-row {{ grid-template-columns: 1fr 100px auto; }}
+  .editable-row input, .editable-row select {{ background: #0f172a; border: 1px solid #475569; color: #e2e8f0; padding: 0.5rem 0.6rem; border-radius: 6px; }}
+  .remove-row-btn {{ border: 0; background: transparent; color: #fca5a5; padding: 0.4rem; cursor: pointer; }}
+  .tag-editor {{ display: flex; flex-direction: column; gap: 0.55rem; }}
+  .tag-list {{ display: flex; flex-wrap: wrap; gap: 0.4rem; min-height: 1.8rem; }}
+  .tag-pill {{ display: inline-flex; align-items: center; gap: 0.4rem; max-width: 100%; background: #1e3a5f; color: #bfdbfe; border: 1px solid #3b82f655; border-radius: 999px; padding: 0.25rem 0.35rem 0.25rem 0.6rem; font-size: 0.78rem; }}
+  .tag-pill-text {{ overflow-wrap: anywhere; }}
+  .tag-remove-btn {{ display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; height: 1.25rem; flex: 0 0 auto; border: 0; border-radius: 50%; background: transparent; color: #bfdbfe; cursor: pointer; font: inherit; font-size: 1rem; line-height: 1; }}
+  .tag-remove-btn:hover, .tag-remove-btn:focus-visible {{ background: #3b82f633; color: white; }}
+  .tag-editor-controls {{ display: flex; gap: 0.5rem; }}
+  .tag-editor-controls input {{ min-width: 0; flex: 1; }}
+  .tag-add-btn {{ border: 0; border-radius: 6px; background: #334155; color: #e2e8f0; padding: 0.5rem 0.8rem; font-weight: 600; cursor: pointer; }}
+  .tag-add-btn:hover {{ background: #475569; }}
+  .resume-preview {{ min-height: 320px; max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; color: #cbd5e1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem; line-height: 1.55; }}
+  .resume-upload-row {{ display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }}
+  .resume-file-input {{ flex: 1; min-width: 220px; background: #0f172a; border: 1px solid #475569; color: #cbd5e1; padding: 0.55rem; border-radius: 7px; }}
+  .resume-file-input::file-selector-button {{ border: 0; border-radius: 5px; background: #334155; color: #e2e8f0; padding: 0.4rem 0.65rem; margin-right: 0.7rem; cursor: pointer; }}
+  .resume-meta {{ color: #94a3b8; font-size: 0.78rem; margin-bottom: 0.75rem; }}
+  .resume-render-frame {{ width: 100%; min-height: 720px; border: 1px solid #334155; border-radius: 8px; background: #525659; }}
+  .resume-pdf-viewer {{ width: 100%; min-height: 720px; max-height: 80vh; overflow: auto; border: 1px solid #334155; border-radius: 8px; background: #525659; padding: 1rem; display: flex; flex-direction: column; align-items: center; gap: 1rem; }}
+  .resume-pdf-page {{ max-width: 100%; background: white; box-shadow: 0 2px 10px #00000066; }}
+  .resume-render-error {{ color: #fca5a5; background: #450a0a55; border-radius: 7px; padding: 0.75rem; margin-bottom: 0.75rem; white-space: pre-wrap; }}
+  .resume-source-details {{ margin-top: 0.8rem; }}
+  .resume-source-details summary {{ color: #93c5fd; cursor: pointer; font-size: 0.82rem; }}
+  .settings-loading {{ color: #94a3b8; padding: 2rem 0; }}
 
   /* Summary cards */
   .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
@@ -375,8 +446,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .card-header {{ display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }}
   .score-pill {{ display: inline-flex; align-items: center; justify-content: center; min-width: 1.6rem; height: 1.6rem; border-radius: 6px; color: #0f172a; font-weight: 700; font-size: 0.8rem; flex-shrink: 0; }}
 
-  .job-title {{ color: #e2e8f0; text-decoration: none; font-weight: 600; font-size: 0.95rem; }}
+  .job-title {{ color: #e2e8f0; text-decoration: none; font-weight: 600; font-size: 0.95rem; min-width: 0; }}
   .job-title:hover {{ color: #60a5fa; }}
+  .delete-job-btn {{ margin-left: auto; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; width: 1.75rem; height: 1.75rem; border: 0; border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; }}
+  .delete-job-btn:hover {{ color: #fca5a5; background: #450a0a55; }}
+  .delete-job-btn:disabled {{ opacity: 0.55; cursor: wait; }}
 
   .meta-row {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }}
   .meta-tag {{ font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; background: #334155; color: #94a3b8; }}
@@ -415,6 +489,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .job-count {{ color: #94a3b8; font-size: 0.85rem; margin-bottom: 1rem; }}
 
   @media (max-width: 768px) {{
+    .app-shell {{ display: block; }}
+    .sidebar {{ position: sticky; z-index: 10; width: 100%; height: auto; padding: 0.75rem 1rem; border-right: 0; border-bottom: 1px solid #334155; }}
+    .sidebar-brand {{ margin: 0 0 0.65rem; }}
+    .sidebar-nav {{ flex-direction: row; }}
+    .nav-btn {{ width: auto; }}
+    .main-content {{ width: 100%; padding: 1rem; }}
     .summary {{ grid-template-columns: repeat(2, 1fr); }}
     .score-section {{ grid-template-columns: 1fr; }}
     .job-grid {{ grid-template-columns: 1fr; }}
@@ -422,11 +502,25 @@ def generate_dashboard(output_path: str | None = None) -> str:
     .discovery-panel {{ align-items: stretch; flex-direction: column; }}
     .discovery-actions {{ align-items: stretch; }}
     .discovery-status {{ text-align: left; }}
-    body {{ padding: 1rem; }}
+    .settings-grid, .field-grid {{ grid-template-columns: 1fr; }}
+    .settings-card.wide, .field.wide {{ grid-column: auto; }}
+    .editable-row, .editable-row.location-row {{ grid-template-columns: 1fr; }}
+    .tag-editor-controls {{ align-items: stretch; }}
   }}
 </style>
 </head>
 <body>
+
+<div class="app-shell">
+<aside class="sidebar">
+  <div class="sidebar-brand">ApplyPilot</div>
+  <nav class="sidebar-nav" aria-label="Application">
+    <button class="nav-btn active" data-view="dashboard" onclick="switchView('dashboard')">Dashboard</button>
+    <button class="nav-btn" data-view="profile" onclick="switchView('profile')">Profile</button>
+  </nav>
+</aside>
+<main class="main-content">
+<section id="dashboard-view" class="app-view active">
 
 <h1>ApplyPilot Dashboard</h1>
 <p class="subtitle">{active_count} active jobs &middot; {applied_count} applied &middot; {priority_count} early-career priorities &middot; {high_fit} strong matches (7+)</p>
@@ -454,15 +548,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
     <div id="discovery-status" class="discovery-status" role="status"></div>
   </div>
 </section>
-
-<nav class="tabs" aria-label="Job status">
-  <button class="tab-btn active" data-tab="active" onclick="switchTab('active')">
-    Active postings ({active_count})
-  </button>
-  <button class="tab-btn" data-tab="applied" onclick="switchTab('applied')">
-    Applied ({applied_count})
-  </button>
-</nav>
 
 <div class="summary">
   <div class="stat-card stat-total"><div class="stat-num">{total}</div><div class="stat-label">Total Jobs</div></div>
@@ -497,9 +582,386 @@ def generate_dashboard(output_path: str | None = None) -> str:
   </div>
 </div>
 
+<nav class="tabs" aria-label="Job status">
+  <button class="tab-btn active" data-tab="active" onclick="switchTab('active')">
+    Active postings ({active_count})
+  </button>
+  <button class="tab-btn" data-tab="applied" onclick="switchTab('applied')">
+    Applied ({applied_count})
+  </button>
+</nav>
+
 <div id="job-count" class="job-count"></div>
 
 {job_sections}
+
+</section>
+
+<section id="profile-view" class="app-view">
+  <div class="settings-header">
+    <h1>Profile and Preferences</h1>
+    <p>Manage the information ApplyPilot uses for matching, tailoring, and discovery.</p>
+  </div>
+  <div class="settings-tabs">
+    <button class="settings-tab active" data-settings-tab="profile"
+            onclick="switchSettingsTab('profile')">Personal Profile</button>
+    <button class="settings-tab" data-settings-tab="searches"
+            onclick="switchSettingsTab('searches')">Job Preferences</button>
+    <button class="settings-tab" data-settings-tab="resume"
+            onclick="switchSettingsTab('resume')">Resume</button>
+  </div>
+  <div id="settings-loading" class="settings-loading">Loading settings...</div>
+
+  <form id="profile-settings-form" class="settings-form">
+    <div class="settings-grid">
+      <section class="settings-card wide">
+        <h2>Personal Information</h2>
+        <div class="field-grid">
+          <div class="field"><label>Full name</label><input data-profile-path="personal.full_name"></div>
+          <div class="field"><label>Preferred name</label><input data-profile-path="personal.preferred_name"></div>
+          <div class="field"><label>Email</label><input type="email" data-profile-path="personal.email"></div>
+          <div class="field"><label>Phone</label><input data-profile-path="personal.phone"></div>
+          <div class="field"><label>City</label><input data-profile-path="personal.city"></div>
+          <div class="field"><label>Province or state</label><input data-profile-path="personal.province_state"></div>
+          <div class="field"><label>Country</label><input data-profile-path="personal.country"></div>
+          <div class="field"><label>Postal or ZIP code</label><input data-profile-path="personal.postal_code"></div>
+          <div class="field wide"><label>Street address</label><input data-profile-path="personal.address"></div>
+          <div class="field"><label>LinkedIn URL</label><input type="url" data-profile-path="personal.linkedin_url"></div>
+          <div class="field"><label>GitHub URL</label><input type="url" data-profile-path="personal.github_url"></div>
+          <div class="field"><label>Portfolio URL</label><input type="url" data-profile-path="personal.portfolio_url"></div>
+          <div class="field"><label>Website URL</label><input type="url" data-profile-path="personal.website_url"></div>
+          <div class="field wide">
+            <label>Job-site password</label>
+            <input type="password" autocomplete="new-password" data-profile-password>
+            <small id="password-help">Leave blank to keep the existing password.</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Work Authorization</h2>
+        <label class="check-field"><input type="checkbox" data-profile-path="work_authorization.legally_authorized_to_work"> Legally authorized to work</label>
+        <label class="check-field"><input type="checkbox" data-profile-path="work_authorization.require_sponsorship"> Requires sponsorship</label>
+        <div class="field"><label>Work permit type</label>
+          <select data-profile-path="work_authorization.work_permit_type">
+            <option value="">Not applicable</option>
+            <option>Citizen</option>
+            <option>Permanent Resident</option>
+            <option>Open Work Permit</option>
+            <option>Employer-Specific Work Permit</option>
+            <option>Other</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Compensation</h2>
+        <div class="field-grid">
+          <div class="field"><label>Salary expectation</label><input type="number" min="0" step="any" data-profile-number="compensation.salary_expectation"></div>
+          <div class="field"><label>Currency</label>
+            <select data-profile-path="compensation.salary_currency">
+              <option>CAD</option>
+              <option>USD</option>
+              <option>EUR</option>
+              <option>GBP</option>
+              <option>AUD</option>
+            </select>
+          </div>
+          <div class="field"><label>Range minimum</label><input type="number" min="0" step="any" data-profile-number="compensation.salary_range_min"></div>
+          <div class="field"><label>Range maximum</label><input type="number" min="0" step="any" data-profile-number="compensation.salary_range_max"></div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Experience</h2>
+        <div class="field-grid">
+          <div class="field"><label>Years of experience</label><input type="number" min="0" step="any" data-profile-number="experience.years_of_experience_total"></div>
+          <div class="field"><label>Education level</label>
+            <select data-profile-path="experience.education_level">
+              <option value="">Not specified</option>
+              <option>High School</option>
+              <option>Associate Degree</option>
+              <option>Bachelor's</option>
+              <option>Master's</option>
+              <option>PhD</option>
+              <option>Self-taught</option>
+              <option>Other</option>
+            </select>
+          </div>
+          <div class="field"><label>Current title</label><input data-profile-path="experience.current_title"></div>
+          <div class="field"><label>Target role</label><input data-profile-path="experience.target_role"></div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Availability</h2>
+        <div class="field"><label>Earliest start date</label><input data-profile-path="availability.earliest_start_date"></div>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>Skills</h2>
+        <div class="field-grid">
+          <div class="field">
+            <label for="programming-languages-input">Programming languages</label>
+            <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="skills_boundary.programming_languages">
+              <div class="tag-list" data-tag-list aria-live="polite"></div>
+              <div class="tag-editor-controls">
+                <input id="programming-languages-input" data-tag-input autocomplete="off">
+                <button class="tag-add-btn" data-tag-add type="button" aria-label="Add programming language">Add</button>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="frameworks-input">Frameworks and libraries</label>
+            <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="skills_boundary.frameworks">
+              <div class="tag-list" data-tag-list aria-live="polite"></div>
+              <div class="tag-editor-controls">
+                <input id="frameworks-input" data-tag-input autocomplete="off">
+                <button class="tag-add-btn" data-tag-add type="button" aria-label="Add framework or library">Add</button>
+              </div>
+            </div>
+          </div>
+          <div class="field wide">
+            <label for="tools-input">Tools and platforms</label>
+            <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="skills_boundary.tools">
+              <div class="tag-list" data-tag-list aria-live="polite"></div>
+              <div class="tag-editor-controls">
+                <input id="tools-input" data-tag-input autocomplete="off">
+                <button class="tag-add-btn" data-tag-add type="button" aria-label="Add tool or platform">Add</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Resume Facts</h2>
+        <div class="field">
+          <label for="preserved-companies-input">Companies to preserve</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="resume_facts.preserved_companies">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="preserved-companies-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add company to preserve">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="preserved-projects-input">Projects to preserve</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="resume_facts.preserved_projects">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="preserved-projects-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add project to preserve">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="field"><label>School to preserve</label><input data-profile-path="resume_facts.preserved_school"></div>
+        <div class="field">
+          <label for="real-metrics-input">Real metrics</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="profile" data-tag-path="resume_facts.real_metrics">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="real-metrics-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add real metric">Add</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Voluntary EEO Information</h2>
+        <div class="field"><label>Gender</label>
+          <select data-profile-path="eeo_voluntary.gender">
+            <option>Decline to self-identify</option>
+            <option>Woman</option>
+            <option>Man</option>
+            <option>Non-binary</option>
+            <option>Other</option>
+          </select>
+        </div>
+        <div class="field"><label>Race or ethnicity</label>
+          <select data-profile-path="eeo_voluntary.race_ethnicity">
+            <option>Decline to self-identify</option>
+            <option>American Indian or Alaska Native</option>
+            <option>Asian</option>
+            <option>Black or African American</option>
+            <option>Hispanic or Latino</option>
+            <option>Native Hawaiian or Other Pacific Islander</option>
+            <option>White</option>
+            <option>Two or More Races</option>
+          </select>
+        </div>
+        <div class="field"><label>Veteran status</label>
+          <select data-profile-path="eeo_voluntary.veteran_status">
+            <option>Decline to self-identify</option>
+            <option>I am a protected veteran</option>
+            <option>I am not a protected veteran</option>
+          </select>
+        </div>
+        <div class="field"><label>Disability status</label>
+          <select data-profile-path="eeo_voluntary.disability_status">
+            <option>Decline to self-identify</option>
+            <option>Yes, I have a disability</option>
+            <option>No, I do not have a disability</option>
+          </select>
+        </div>
+      </section>
+    </div>
+    <div class="settings-actions">
+      <span id="profile-settings-status" class="settings-status" role="status"></span>
+      <button class="save-settings-btn" type="submit">Save Profile</button>
+    </div>
+  </form>
+
+  <form id="search-settings-form" class="settings-form">
+    <div class="settings-grid">
+      <section class="settings-card wide">
+        <h2>Search Defaults</h2>
+        <div class="field-grid">
+          <div class="field"><label>Default location</label><input data-search-path="defaults.location"></div>
+          <div class="field"><label>Distance</label><input type="number" min="0" step="any" data-search-number="defaults.distance"></div>
+          <div class="field"><label>Maximum posting age (hours)</label><input type="number" min="0" step="any" data-search-number="defaults.hours_old"></div>
+          <div class="field"><label>Results per site</label><input type="number" min="0" step="any" data-search-number="defaults.results_per_site"></div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Discovery Filters</h2>
+        <label class="check-field"><input type="checkbox" data-search-check="greenhouse_location_filter"> Filter Greenhouse locations</label>
+        <label class="check-field"><input type="checkbox" data-search-check="bigtech_location_filter"> Filter big-tech locations</label>
+        <label class="check-field"><input type="checkbox" data-search-check="accept_remote_anywhere"> Accept remote jobs anywhere</label>
+        <label class="check-field"><input type="checkbox" data-search-check="accept_unknown_locations"> Accept unknown locations</label>
+      </section>
+
+      <section class="settings-card">
+        <h2>Allowed Countries</h2>
+        <div class="field">
+          <label for="allowed-countries-input">Countries</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="allowed_countries">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="allowed-countries-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add allowed country">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="accepted-locations-input">Accepted location terms</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="location_accept">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="accepted-locations-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add accepted location term">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="rejected-locations-input">Rejected location terms</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="location_reject_non_remote">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="rejected-locations-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add rejected location term">Add</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>Search Queries</h2>
+        <div id="query-list" class="editable-list"></div>
+        <button id="add-query-button" class="add-row-btn" type="button">Add Query</button>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>Search Locations</h2>
+        <div id="location-list" class="editable-list"></div>
+        <button id="add-location-button" class="add-row-btn" type="button">Add Location</button>
+      </section>
+
+      <section class="settings-card">
+        <h2>Title Preferences</h2>
+        <div class="field">
+          <label for="priority-titles-input">Priority titles</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="priority_titles">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="priority-titles-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add priority title">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="exclude-titles-input">Excluded titles</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="exclude_titles">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="exclude-titles-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add excluded title">Add</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h2>Job Boards</h2>
+        <div class="field"><label>Boards</label><textarea data-search-list="boards"></textarea><small>One item per line; leave blank when using direct-employer discovery only.</small></div>
+        <div class="field"><label>Country code or name</label><input data-search-path="country"></div>
+      </section>
+    </div>
+    <div class="settings-actions">
+      <span id="search-settings-status" class="settings-status" role="status"></span>
+      <button class="save-settings-btn" type="submit">Save Preferences</button>
+    </div>
+  </form>
+
+  <div id="resume-settings-form" class="settings-form">
+    <div class="settings-grid">
+      <section class="settings-card wide">
+        <h2>Plain-Text Resume</h2>
+        <div id="resume-meta" class="resume-meta">Loading resume...</div>
+        <pre id="resume-preview" class="resume-preview">Loading resume...</pre>
+      </section>
+      <section class="settings-card wide">
+        <h2>Upload a New Resume</h2>
+        <p class="resume-meta">Choose a UTF-8 plain-text file. The new file replaces the current resume.txt.</p>
+        <form id="text-resume-upload-form" class="resume-upload-row">
+          <input id="resume-file" class="resume-file-input" type="file"
+                 accept=".txt,text/plain" required>
+          <button class="save-settings-btn" type="submit">Upload Text Resume</button>
+        </form>
+        <div id="resume-settings-status" class="settings-status" role="status"></div>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>LaTeX Resume</h2>
+        <div id="latex-resume-meta" class="resume-meta">Loading LaTeX resume...</div>
+        <div id="latex-render-error" class="resume-render-error hidden"></div>
+        <div id="latex-resume-preview" class="resume-pdf-viewer"
+             aria-label="Compiled LaTeX resume preview"></div>
+        <details class="resume-source-details">
+          <summary>View LaTeX source</summary>
+          <pre id="latex-resume-source" class="resume-preview"></pre>
+        </details>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>Upload a New LaTeX Resume</h2>
+        <p class="resume-meta">Choose a UTF-8 .tex file. ApplyPilot compiles it with Tectonic and previews the PDF with PDF.js. Failed compiles keep your previous PDF.</p>
+        <form id="latex-resume-upload-form" class="resume-upload-row">
+          <input id="latex-resume-file" class="resume-file-input" type="file"
+                 accept=".tex,text/x-tex,application/x-tex" required>
+          <button class="save-settings-btn" type="submit">Upload LaTeX Resume</button>
+        </form>
+        <div id="latex-resume-status" class="settings-status" role="status"></div>
+      </section>
+    </div>
+  </div>
+</section>
+
+</main>
+</div>
 
 <script>
 let minScore = 0;
@@ -697,6 +1159,29 @@ function applyFilters() {{
 }}
 
 document.addEventListener('click', async event => {{
+  const deleteButton = event.target.closest('.delete-job-btn');
+  if (deleteButton) {{
+    const card = deleteButton.closest('.job-card');
+    const title = card?.querySelector('.job-title')?.textContent?.trim() || 'this job';
+    if (!window.confirm(`Delete "${{title}}" from the dashboard?`)) return;
+    deleteButton.disabled = true;
+    try {{
+      const response = await fetch('/api/jobs/delete', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{url: deleteButton.dataset.jobUrl}})
+      }});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not delete job');
+      card?.remove();
+      applyFilters();
+    }} catch (error) {{
+      deleteButton.disabled = false;
+      window.alert(error.message);
+    }}
+    return;
+  }}
+
   const button = event.target.closest('.mark-applied-btn');
   if (!button) return;
   button.disabled = true;
@@ -718,7 +1203,597 @@ document.addEventListener('click', async event => {{
   }}
 }});
 
-switchTab(currentTab);
+let currentView = window.location.hash === '#profile' ? 'profile' : 'dashboard';
+let settingsState = null;
+let resumeLoaded = false;
+let currentSettingsTab = 'profile';
+let resumeRequestGeneration = 0;
+let resumeUploadInProgress = false;
+
+function switchView(view, updateHash = true) {{
+  currentView = view;
+  document.querySelectorAll('.app-view').forEach(element => {{
+    element.classList.toggle('active', element.id === view + '-view');
+  }});
+  document.querySelectorAll('.nav-btn').forEach(button => {{
+    button.classList.toggle('active', button.dataset.view === view);
+  }});
+  if (updateHash) {{
+    const target = view === 'profile'
+      ? '#profile'
+      : (currentTab === 'applied' ? '#applied' : window.location.pathname);
+    history.replaceState(null, '', target);
+  }}
+}}
+
+function switchSettingsTab(tab) {{
+  currentSettingsTab = tab;
+  document.querySelectorAll('.settings-tab').forEach(button => {{
+    button.classList.toggle('active', button.dataset.settingsTab === tab);
+  }});
+  const formIds = {{
+    profile: 'profile-settings-form',
+    searches: 'search-settings-form',
+    resume: 'resume-settings-form'
+  }};
+  document.querySelectorAll('.settings-form').forEach(form => {{
+    form.classList.toggle('active', form.id === formIds[tab]);
+  }});
+  if (tab === 'resume' && !resumeLoaded) loadResume();
+}}
+
+function getPath(object, path) {{
+  return path.split('.').reduce((value, key) => value == null ? undefined : value[key], object);
+}}
+
+function setPath(object, path, value) {{
+  const keys = path.split('.');
+  let target = object;
+  keys.slice(0, -1).forEach(key => {{
+    if (!target[key] || typeof target[key] !== 'object') target[key] = {{}};
+    target = target[key];
+  }});
+  target[keys[keys.length - 1]] = value;
+}}
+
+function listFromText(value) {{
+  return value.split('\\n').map(item => item.trim()).filter(Boolean);
+}}
+
+function asBoolean(value) {{
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+  return ['true', 'yes', 'y', '1'].includes(value.trim().toLowerCase());
+}}
+
+function setConstrainedValue(input, value) {{
+  const text = value == null ? '' : String(value);
+  if (input.tagName === 'SELECT') {{
+    input.querySelectorAll('[data-custom-option]').forEach(option => option.remove());
+    const exists = Array.from(input.options).some(option => option.value === text);
+    if (text && !exists) {{
+      const option = document.createElement('option');
+      option.value = text;
+      option.textContent = text + ' (custom)';
+      option.dataset.customOption = 'true';
+      input.appendChild(option);
+    }}
+  }}
+  input.value = text;
+}}
+
+function tagEditorValues(editor) {{
+  const root = settingsState[editor.dataset.tagScope] || {{}};
+  settingsState[editor.dataset.tagScope] = root;
+  let values = getPath(root, editor.dataset.tagPath);
+  if (!Array.isArray(values)) {{
+    values = [];
+    setPath(root, editor.dataset.tagPath, values);
+  }}
+  return values;
+}}
+
+function renderTagEditor(editor) {{
+  const list = editor.querySelector('[data-tag-list]');
+  list.replaceChildren();
+  tagEditorValues(editor).forEach((value, index) => {{
+    const pill = document.createElement('span');
+    pill.className = 'tag-pill';
+
+    const text = document.createElement('span');
+    text.className = 'tag-pill-text';
+    text.textContent = value;
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'tag-remove-btn';
+    remove.textContent = '\u00d7';
+    remove.setAttribute('aria-label', 'Remove ' + value);
+    remove.addEventListener('click', () => {{
+      tagEditorValues(editor).splice(index, 1);
+      renderTagEditor(editor);
+    }});
+
+    pill.append(text, remove);
+    list.appendChild(pill);
+  }});
+}}
+
+function renderTagEditors() {{
+  document.querySelectorAll('[data-tag-editor]').forEach(renderTagEditor);
+}}
+
+function addTagEditorValue(editor) {{
+  const input = editor.querySelector('[data-tag-input]');
+  const value = input.value.trim();
+  const values = tagEditorValues(editor);
+  if (!value || values.includes(value)) return;
+  values.push(value);
+  input.value = '';
+  renderTagEditor(editor);
+  input.focus();
+}}
+
+document.querySelectorAll('[data-tag-editor]').forEach(editor => {{
+  editor.querySelector('[data-tag-add]').addEventListener('click', () => {{
+    addTagEditorValue(editor);
+  }});
+  editor.querySelector('[data-tag-input]').addEventListener('keydown', event => {{
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    addTagEditorValue(editor);
+  }});
+}});
+
+function populateProfileForm() {{
+  const profile = settingsState.profile || {{}};
+  document.querySelectorAll('[data-profile-path]').forEach(input => {{
+    const value = getPath(profile, input.dataset.profilePath);
+    if (input.type === 'checkbox') input.checked = asBoolean(value);
+    else setConstrainedValue(input, value);
+  }});
+  document.querySelectorAll('[data-profile-number]').forEach(input => {{
+    const value = getPath(profile, input.dataset.profileNumber);
+    input.value = value == null ? '' : value;
+  }});
+  document.querySelectorAll('[data-profile-list]').forEach(input => {{
+    const value = getPath(profile, input.dataset.profileList);
+    input.value = Array.isArray(value) ? value.join('\\n') : '';
+  }});
+  renderTagEditors();
+  const passwordInput = document.querySelector('[data-profile-password]');
+  passwordInput.value = '';
+  document.getElementById('password-help').textContent = settingsState.password_configured
+    ? 'A password is configured. Leave blank to keep it unchanged.'
+    : 'No password is configured. Leave blank if one is not needed.';
+}}
+
+function collectProfileForm() {{
+  const profile = JSON.parse(JSON.stringify(settingsState.profile || {{}}));
+  document.querySelectorAll('[data-profile-path]').forEach(input => {{
+    setPath(
+      profile,
+      input.dataset.profilePath,
+      input.type === 'checkbox' ? input.checked : input.value.trim()
+    );
+  }});
+  document.querySelectorAll('[data-profile-list]').forEach(input => {{
+    setPath(profile, input.dataset.profileList, listFromText(input.value));
+  }});
+  document.querySelectorAll('[data-profile-number]').forEach(input => {{
+    const value = input.value === '' ? '' : Number(input.value);
+    setPath(profile, input.dataset.profileNumber, value);
+  }});
+  const password = document.querySelector('[data-profile-password]').value;
+  if (password) setPath(profile, 'personal.password', password);
+  return profile;
+}}
+
+function readQueryRows() {{
+  return Array.from(document.querySelectorAll('[data-query-index]')).map(input => {{
+    const index = input.dataset.queryIndex;
+    const tier = document.querySelector(`[data-query-tier-index="${{index}}"]`);
+    return {{query: input.value.trim(), tier: Number(tier.value)}};
+  }});
+}}
+
+function readLocationRows() {{
+  return Array.from(document.querySelectorAll('[data-location-index]')).map(input => {{
+    const index = input.dataset.locationIndex;
+    const remote = document.querySelector(`[data-location-remote-index="${{index}}"]`);
+    return {{location: input.value.trim(), remote: remote.checked}};
+  }});
+}}
+
+function syncEditableRows() {{
+  settingsState.searches.queries = readQueryRows();
+  settingsState.searches.locations = readLocationRows();
+}}
+
+function renderQueries() {{
+  const container = document.getElementById('query-list');
+  container.replaceChildren();
+  const queries = settingsState.searches.queries || [];
+  queries.forEach((query, index) => {{
+    const row = document.createElement('div');
+    row.className = 'editable-row';
+    const input = document.createElement('input');
+    input.value = query.query || '';
+    input.placeholder = 'Job title';
+    input.dataset.queryIndex = index;
+    const tier = document.createElement('select');
+    tier.dataset.queryTierIndex = index;
+    [1, 2, 3].forEach(number => {{
+      const option = document.createElement('option');
+      option.value = number;
+      option.textContent = 'Tier ' + number;
+      option.selected = Number(query.tier || 1) === number;
+      tier.appendChild(option);
+    }});
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'remove-row-btn';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {{
+      syncEditableRows();
+      settingsState.searches.queries.splice(index, 1);
+      renderQueries();
+    }});
+    row.append(input, tier, remove);
+    container.appendChild(row);
+  }});
+}}
+
+function renderLocations() {{
+  const container = document.getElementById('location-list');
+  container.replaceChildren();
+  const locations = settingsState.searches.locations || [];
+  locations.forEach((location, index) => {{
+    const row = document.createElement('div');
+    row.className = 'editable-row location-row';
+    const input = document.createElement('input');
+    input.value = location.location || '';
+    input.placeholder = 'City, region, or country';
+    input.dataset.locationIndex = index;
+    const remoteLabel = document.createElement('label');
+    remoteLabel.className = 'check-field';
+    const remote = document.createElement('input');
+    remote.type = 'checkbox';
+    remote.checked = Boolean(location.remote);
+    remote.dataset.locationRemoteIndex = index;
+    remoteLabel.append(remote, document.createTextNode(' Remote'));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'remove-row-btn';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {{
+      syncEditableRows();
+      settingsState.searches.locations.splice(index, 1);
+      renderLocations();
+    }});
+    row.append(input, remoteLabel, remove);
+    container.appendChild(row);
+  }});
+}}
+
+function populateSearchForm() {{
+  const searches = settingsState.searches || {{}};
+  document.querySelectorAll('[data-search-path]').forEach(input => {{
+    const value = getPath(searches, input.dataset.searchPath);
+    input.value = value == null ? '' : value;
+  }});
+  document.querySelectorAll('[data-search-number]').forEach(input => {{
+    const value = getPath(searches, input.dataset.searchNumber);
+    input.value = value == null ? '' : value;
+  }});
+  document.querySelectorAll('[data-search-check]').forEach(input => {{
+    let value = getPath(searches, input.dataset.searchCheck);
+    if (value === undefined && input.dataset.searchCheck === 'bigtech_location_filter') {{
+      value = searches.greenhouse_location_filter;
+    }}
+    input.checked = Boolean(value);
+  }});
+  document.querySelectorAll('[data-search-list]').forEach(input => {{
+    const value = getPath(searches, input.dataset.searchList);
+    input.value = Array.isArray(value) ? value.join('\\n') : '';
+  }});
+  renderTagEditors();
+  if (!Array.isArray(searches.queries)) searches.queries = [];
+  if (!Array.isArray(searches.locations)) searches.locations = [];
+  renderQueries();
+  renderLocations();
+}}
+
+function collectSearchForm() {{
+  const searches = JSON.parse(JSON.stringify(settingsState.searches || {{}}));
+  document.querySelectorAll('[data-search-path]').forEach(input => {{
+    setPath(searches, input.dataset.searchPath, input.value.trim());
+  }});
+  document.querySelectorAll('[data-search-number]').forEach(input => {{
+    if (input.value === '') {{
+      setPath(searches, input.dataset.searchNumber, {{__applypilot_delete__: true}});
+    }}
+    else setPath(searches, input.dataset.searchNumber, Number(input.value));
+  }});
+  document.querySelectorAll('[data-search-check]').forEach(input => {{
+    setPath(searches, input.dataset.searchCheck, input.checked);
+  }});
+  document.querySelectorAll('[data-search-list]').forEach(input => {{
+    setPath(searches, input.dataset.searchList, listFromText(input.value));
+  }});
+  searches.queries = readQueryRows();
+  searches.locations = readLocationRows();
+  return searches;
+}}
+
+function setSettingsStatus(type, message, isError = false) {{
+  const prefix = type === 'searches' ? 'search' : type;
+  const status = document.getElementById(prefix + '-settings-status');
+  status.textContent = message;
+  status.classList.toggle('error', isError);
+}}
+
+async function loadSettings() {{
+  try {{
+    const response = await fetch('/api/settings');
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not load settings');
+    settingsState = result;
+    populateProfileForm();
+    populateSearchForm();
+    document.getElementById('settings-loading').classList.add('hidden');
+    switchSettingsTab(currentSettingsTab);
+  }} catch (error) {{
+    const loading = document.getElementById('settings-loading');
+    loading.textContent = error.message;
+    loading.classList.add('settings-status', 'error');
+  }}
+}}
+
+function displayResume(result) {{
+  const content = result.content || '';
+  document.getElementById('resume-preview').textContent =
+    content || 'No plain-text resume has been uploaded yet.';
+  document.getElementById('resume-meta').textContent = result.exists
+    ? `${{result.filename}} · ${{content.length.toLocaleString()}} characters`
+    : 'No resume.txt found';
+}}
+
+async function displayLatexResume(result) {{
+  const content = result.content || '';
+  const source = document.getElementById('latex-resume-source');
+  const viewer = document.getElementById('latex-resume-preview');
+  const errorBox = document.getElementById('latex-render-error');
+  const meta = document.getElementById('latex-resume-meta');
+  source.textContent = content || 'No LaTeX resume has been uploaded yet.';
+  errorBox.classList.add('hidden');
+  errorBox.textContent = '';
+  viewer.replaceChildren();
+
+  if (!result.exists) {{
+    meta.textContent = 'No resume.tex found';
+    return;
+  }}
+  if (!result.pdf_available) {{
+    meta.textContent = `${{result.filename}} · PDF not compiled`;
+    errorBox.textContent =
+      'No compiled PDF is available. Upload the .tex file again to compile it with Tectonic.';
+    errorBox.classList.remove('hidden');
+    return;
+  }}
+
+  meta.textContent = `${{result.filename}} · compiled with Tectonic`;
+  try {{
+    const pdfjs = await import(
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs'
+    );
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
+    const pdf = await pdfjs.getDocument({{
+      url: '/api/resume/pdf?t=' + Date.now(),
+      withCredentials: false
+    }}).promise;
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {{
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({{scale: 1.35}});
+      const canvas = document.createElement('canvas');
+      canvas.className = 'resume-pdf-page';
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      canvas.setAttribute('aria-label', 'Resume page ' + pageNumber);
+      viewer.appendChild(canvas);
+      await page.render({{
+        canvasContext: canvas.getContext('2d'),
+        viewport
+      }}).promise;
+    }}
+  }} catch (error) {{
+    const frame = document.createElement('iframe');
+    frame.className = 'resume-render-frame';
+    frame.title = 'Compiled LaTeX resume PDF';
+    frame.src = '/api/resume/pdf?t=' + Date.now();
+    viewer.appendChild(frame);
+    errorBox.textContent =
+      'PDF.js preview failed (' + error.message + '). Showing the browser PDF viewer instead.';
+    errorBox.classList.remove('hidden');
+  }}
+}}
+
+async function loadResume(preserveStatus = false) {{
+  if (resumeUploadInProgress) return;
+  const textStatus = document.getElementById('resume-settings-status');
+  const latexStatus = document.getElementById('latex-resume-status');
+  const generation = ++resumeRequestGeneration;
+  async function fetchResume(url, fallbackError) {{
+    const response = await fetch(url);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || fallbackError);
+    return result;
+  }}
+  const [textOutcome, latexOutcome] = await Promise.allSettled([
+    fetchResume('/api/resume', 'Could not load text resume'),
+    fetchResume('/api/resume?format=tex', 'Could not load LaTeX resume')
+  ]);
+  if (generation !== resumeRequestGeneration) return;
+
+  if (textOutcome.status === 'fulfilled') {{
+    displayResume(textOutcome.value);
+    if (!preserveStatus) {{
+      textStatus.textContent = '';
+      textStatus.classList.remove('error');
+    }}
+  }} else {{
+    textStatus.textContent = textOutcome.reason.message;
+    textStatus.classList.add('error');
+    document.getElementById('resume-meta').textContent = 'Text resume unavailable';
+  }}
+  if (latexOutcome.status === 'fulfilled') {{
+    displayLatexResume(latexOutcome.value);
+    if (!preserveStatus) {{
+      latexStatus.textContent = '';
+      latexStatus.classList.remove('error');
+    }}
+  }} else {{
+    latexStatus.textContent = latexOutcome.reason.message;
+    latexStatus.classList.add('error');
+    document.getElementById('latex-resume-meta').textContent =
+      'LaTeX resume unavailable';
+  }}
+  resumeLoaded = true;
+}}
+
+async function saveSettings(type, value, button) {{
+  button.disabled = true;
+  setSettingsStatus(type, 'Saving...');
+  try {{
+    const response = await fetch('/api/settings/' + type, {{
+      method: 'PUT',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{[type]: value}})
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save settings');
+    if (type === 'profile') {{
+      settingsState.profile = result.profile;
+      settingsState.password_configured = result.password_configured;
+      populateProfileForm();
+    }} else {{
+      settingsState.searches = result.searches;
+      populateSearchForm();
+    }}
+    setSettingsStatus(type, type === 'profile' ? 'Profile saved.' : 'Preferences saved.');
+  }} catch (error) {{
+    setSettingsStatus(type, error.message, true);
+  }} finally {{
+    button.disabled = false;
+  }}
+}}
+
+document.getElementById('profile-settings-form').addEventListener('submit', event => {{
+  event.preventDefault();
+  saveSettings('profile', collectProfileForm(), event.submitter);
+}});
+
+document.getElementById('search-settings-form').addEventListener('submit', event => {{
+  event.preventDefault();
+  saveSettings('searches', collectSearchForm(), event.submitter);
+}});
+
+async function uploadResume(event, options) {{
+  event.preventDefault();
+  const fileInput = document.getElementById(options.inputId);
+  const file = fileInput.files[0];
+  const button = event.submitter;
+  const status = document.getElementById(options.statusId);
+  if (!file || !file.name.toLowerCase().endsWith(options.extension)) {{
+    status.textContent = `Choose a ${{options.extension}} resume file.`;
+    status.classList.add('error');
+    return;
+  }}
+  if (file.size > 1000000) {{
+    status.textContent = 'Resume must be 1 MB or smaller.';
+    status.classList.add('error');
+    return;
+  }}
+  if (resumeUploadInProgress) {{
+    status.textContent = 'Another resume upload is already in progress.';
+    status.classList.add('error');
+    return;
+  }}
+
+  resumeRequestGeneration += 1;
+  resumeUploadInProgress = true;
+  button.disabled = true;
+  status.textContent = options.extension === '.tex'
+    ? 'Uploading and compiling with Tectonic...'
+    : 'Uploading...';
+  status.classList.remove('error');
+  try {{
+    let content;
+    try {{
+      const bytes = await file.arrayBuffer();
+      content = new TextDecoder('utf-8', {{fatal: true}}).decode(bytes);
+    }} catch (error) {{
+      throw new Error('Resume must be a valid UTF-8 text file.');
+    }}
+    if (!content.trim()) throw new Error('Resume cannot be empty.');
+    const response = await fetch('/api/resume', {{
+      method: 'PUT',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{filename: file.name, content}})
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not upload resume');
+    if (result.format === 'tex') await displayLatexResume(result);
+    else displayResume(result);
+    fileInput.value = '';
+    status.textContent = options.successMessage;
+  }} catch (error) {{
+    status.textContent = error.message;
+    status.classList.add('error');
+  }} finally {{
+    resumeUploadInProgress = false;
+    resumeLoaded = false;
+    await loadResume(true);
+    button.disabled = false;
+  }}
+}}
+
+document.getElementById('text-resume-upload-form').addEventListener(
+  'submit',
+  event => uploadResume(event, {{
+    inputId: 'resume-file',
+    statusId: 'resume-settings-status',
+    extension: '.txt',
+    successMessage: 'Text resume uploaded.'
+  }})
+);
+
+document.getElementById('latex-resume-upload-form').addEventListener(
+  'submit',
+  event => uploadResume(event, {{
+    inputId: 'latex-resume-file',
+    statusId: 'latex-resume-status',
+    extension: '.tex',
+    successMessage: 'LaTeX resume compiled and saved.'
+  }})
+);
+
+document.getElementById('add-query-button').addEventListener('click', () => {{
+  syncEditableRows();
+  settingsState.searches.queries.push({{query: '', tier: 1}});
+  renderQueries();
+}});
+
+document.getElementById('add-location-button').addEventListener('click', () => {{
+  syncEditableRows();
+  settingsState.searches.locations.push({{location: '', remote: false}});
+  renderLocations();
+}});
+
+loadSettings();
+switchView(currentView, false);
+if (currentView === 'dashboard') switchTab(currentTab);
 </script>
 
 </body>

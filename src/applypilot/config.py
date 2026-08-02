@@ -13,6 +13,7 @@ APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
 DB_PATH = APP_DIR / "applypilot.db"
 PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
+RESUME_TEX_PATH = APP_DIR / "resume.tex"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"

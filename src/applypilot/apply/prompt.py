@@ -146,12 +146,17 @@ def _build_salary_section(profile: dict) -> str:
     currency = comp.get("salary_currency", "USD")
     floor = comp["salary_expectation"]
     range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    try:
+        floor_number = int(float(floor))
+        default_range_max = floor_number + 20000
+    except (ValueError, TypeError):
+        default_range_max = floor
+    range_max = comp.get("salary_range_max", default_range_max)
     conversion_note = comp.get("currency_conversion_note", "")
 
     # Compute example hourly rates at 3 salary levels
     try:
-        floor_int = int(floor)
+        floor_int = int(float(floor))
         examples = [
             (f"${floor_int // 1000}K", floor_int // 2080),
             (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
