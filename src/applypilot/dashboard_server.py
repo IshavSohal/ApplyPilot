@@ -606,11 +606,26 @@ def enrich_external_job(url: str) -> None:
 
 
 def _execute_discovery(server: DashboardHTTPServer, workers: int) -> None:
-    """Run discovery and publish its result to the dashboard server."""
-    from applypilot.pipeline import _run_discover
+    """Run discovery (then enrich + score when LLM is configured)."""
+    from applypilot.config import get_tier
+    from applypilot.pipeline import _run_discover, _run_enrich, _run_score
 
     try:
         result = _run_discover(workers=workers)
+        if get_tier() >= 2:
+            enrich_result = _run_enrich(workers=workers)
+            if isinstance(enrich_result, dict) and str(
+                enrich_result.get("status", "")
+            ).startswith("error"):
+                raise RuntimeError(enrich_result["status"])
+            score_result = _run_score()
+            if isinstance(score_result, dict) and str(
+                score_result.get("status", "")
+            ).startswith("error"):
+                raise RuntimeError(score_result["status"])
+            result = {**result, "scored": True}
+        else:
+            result = {**result, "scored": False}
     except Exception as exc:
         log.exception("Dashboard discovery failed")
         with server.discovery_lock:

@@ -250,12 +250,16 @@ def location_is_allowed(location: str | None, search_cfg: dict | None = None) ->
 
 
 def load_env():
-    """Load environment variables from ~/.applypilot/.env if it exists."""
+    """Load environment variables from ~/.applypilot/.env and CWD .env.
+
+    CWD values override ~/.applypilot/.env so a project-local .env can
+    update LLM_MODEL / API keys without editing the home config.
+    """
     from dotenv import load_dotenv
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
-    # Also try CWD .env as fallback
-    load_dotenv()
+    # Project-local .env wins over home config when both define a key.
+    load_dotenv(override=True)
 
 
 # ---------------------------------------------------------------------------

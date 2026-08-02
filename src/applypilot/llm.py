@@ -26,37 +26,60 @@ def _detect_provider() -> tuple[str, str, str]:
 
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
-    """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    local_url = os.environ.get("LLM_URL", "")
-    model_override = os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
+    Priority:
+      1. LLM_URL (local OpenAI-compatible server)
+      2. Model-hinted provider when LLM_MODEL looks like gpt-*/o* and
+         OPENAI_API_KEY is set (avoids sending OpenAI model IDs to Gemini)
+      3. GEMINI_API_KEY
+      4. OPENAI_API_KEY
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    local_url = os.environ.get("LLM_URL", "").strip()
+    model_override = os.environ.get("LLM_MODEL", "").strip()
+    model_l = model_override.lower()
+
+    if local_url:
         return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
-            gemini_key,
+            local_url.rstrip("/"),
+            model_override or "local-model",
+            os.environ.get("LLM_API_KEY", "").strip(),
         )
 
-    if openai_key and not local_url:
+    # If the user explicitly set an OpenAI-looking model, prefer OpenAI.
+    openai_model_hint = model_l.startswith(("gpt-", "o1", "o3", "o4"))
+    if openai_key and openai_model_hint:
         return (
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
             openai_key,
         )
 
-    if local_url:
+    if gemini_key:
         return (
-            local_url.rstrip("/"),
-            model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            model_override or "gemini-2.0-flash",
+            gemini_key,
+        )
+
+    if openai_key:
+        return (
+            "https://api.openai.com/v1",
+            model_override or "gpt-4o-mini",
+            openai_key,
         )
 
     raise RuntimeError(
         "No LLM provider configured. "
         "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
+
+
+def _openai_allows_custom_temperature(model: str) -> bool:
+    """Return False for OpenAI models that only accept the default temperature."""
+    m = model.lower()
+    return not m.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 # ---------------------------------------------------------------------------
@@ -161,17 +184,22 @@ class LLMClient:
         # `max_completion_tokens` for newer models (e.g. gpt-5*, o-series).
         # Gemini's OpenAI-compat layer and local OpenAI-compat servers still
         # expect the legacy `max_tokens`, so keep the rename scoped to OpenAI.
-        token_param = (
-            "max_completion_tokens"
-            if self.base_url.startswith("https://api.openai.com")
-            else "max_tokens"
-        )
-        payload = {
+        is_openai = self.base_url.startswith("https://api.openai.com")
+        token_param = "max_completion_tokens" if is_openai else "max_tokens"
+        payload: dict = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
             token_param: max_tokens,
         }
+        # gpt-5* / o-series reject non-default temperature values.
+        if not is_openai or _openai_allows_custom_temperature(self.model):
+            payload["temperature"] = temperature
+        elif temperature != 1:
+            log.debug(
+                "Omitting temperature=%.2f for model '%s' (only default supported)",
+                temperature,
+                self.model,
+            )
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",

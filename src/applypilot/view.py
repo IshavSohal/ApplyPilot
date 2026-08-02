@@ -539,7 +539,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <section class="discovery-panel">
   <div>
     <h2>Discover new jobs</h2>
-    <p>Crawl the configured Greenhouse and big-tech career sites.</p>
+    <p>Crawl configured career sites, then enrich and score new jobs with your LLM.</p>
   </div>
   <div class="discovery-actions">
     <button id="discovery-button" class="discovery-button" type="button">
@@ -1041,7 +1041,7 @@ function renderDiscoveryStatus(state) {{
   if (state.status === 'running') {{
     discoveryButton.disabled = true;
     discoveryButton.textContent = 'Discovery running...';
-    discoveryStatus.textContent = 'Searching configured career sites. You can keep using the dashboard.';
+    discoveryStatus.textContent = 'Searching career sites, then enriching and scoring. You can keep using the dashboard.';
     window.setTimeout(refreshDiscoveryStatus, 2000);
     return;
   }}
@@ -1050,8 +1050,9 @@ function renderDiscoveryStatus(state) {{
   discoveryButton.textContent = 'Run Discovery';
   if (state.status === 'complete') {{
     const result = state.result || {{}};
+    const scoredNote = result.scored ? ' Jobs were scored.' : '';
     discoveryStatus.textContent =
-      `Finished: ${{result.new || 0}} new, ${{result.existing || 0}} existing jobs.`;
+      `Finished: ${{result.new || 0}} new, ${{result.existing || 0}} existing jobs.${{scoredNote}}`;
     if (sessionStorage.getItem('applypilotDiscoveryRunning')) {{
       sessionStorage.removeItem('applypilotDiscoveryRunning');
       window.setTimeout(() => window.location.reload(), 1000);
@@ -1184,6 +1185,7 @@ document.addEventListener('click', async event => {{
 
   const button = event.target.closest('.mark-applied-btn');
   if (!button) return;
+  const card = button.closest('.job-card');
   button.disabled = true;
   button.textContent = 'Saving...';
   try {{
@@ -1194,8 +1196,9 @@ document.addEventListener('click', async event => {{
     }});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not update job');
-    window.location.hash = 'applied';
-    window.location.reload();
+    if (card) card.dataset.applied = 'true';
+    button.remove();
+    applyFilters();
   }} catch (error) {{
     button.disabled = false;
     button.textContent = 'Mark as applied';

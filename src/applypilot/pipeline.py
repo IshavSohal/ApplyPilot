@@ -181,7 +181,11 @@ _STAGE_RUNNERS: dict[str, callable] = {
 # ---------------------------------------------------------------------------
 
 def _resolve_stages(stage_names: list[str]) -> list[str]:
-    """Resolve 'all' and validate/order stage names."""
+    """Resolve 'all' and validate/order stage names.
+
+    When discovery is requested and an LLM is configured (tier 2+), also
+    include enrich and score so newly found jobs are fit-scored in the same run.
+    """
     if "all" in stage_names:
         return list(STAGE_ORDER)
 
@@ -195,6 +199,14 @@ def _resolve_stages(stage_names: list[str]) -> list[str]:
             raise SystemExit(1)
         if name not in resolved:
             resolved.append(name)
+
+    # Discovery should also score (and enrich first) when AI is available.
+    if "discover" in resolved and "score" not in resolved:
+        from applypilot.config import get_tier
+        if get_tier() >= 2:
+            for stage in ("enrich", "score"):
+                if stage not in resolved:
+                    resolved.append(stage)
 
     # Maintain canonical order
     return [s for s in STAGE_ORDER if s in resolved]
