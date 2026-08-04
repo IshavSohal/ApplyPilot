@@ -9,27 +9,181 @@ is always code-injected, never LLM-generated. Each retry starts a fresh conversa
 to avoid apologetic spirals.
 """
 
+import hashlib
 import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import RESUME_PATH, RESUME_TEX_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
-    BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+
+
+def _latex_to_plain_text(value: str) -> str:
+    """Convert the small amount of inline LaTeX used in resume bullets to text."""
+    text = value
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"\\(?:textbf|textit|emph|underline)\{([^{}]*)\}", r"\1", text)
+    replacements = {
+        r"\&": "&", r"\%": "%", r"\$": "$", r"\#": "#",
+        r"\_": "_", r"\{": "{", r"\}": "}", r"\textasciitilde{}": "~",
+    }
+    for latex, plain in replacements.items():
+        text = text.replace(latex, plain)
+    text = re.sub(r"\\[A-Za-z]+", "", text)
+    return re.sub(r"\s+", " ", text.replace("~", " ")).strip()
+
+
+def _latex_command_arguments(text: str, command: str) -> list[str]:
+    """Extract balanced arguments for a one-argument LaTeX command."""
+    marker = f"\\{command}{{"
+    arguments: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find(marker, cursor)
+        if start < 0:
+            break
+        content_start = start + len(marker)
+        depth = 1
+        index = content_start
+        while index < len(text) and depth:
+            if text[index] == "{" and (index == 0 or text[index - 1] != "\\"):
+                depth += 1
+            elif text[index] == "}" and (index == 0 or text[index - 1] != "\\"):
+                depth -= 1
+            index += 1
+        if depth == 0:
+            arguments.append(text[content_start:index - 1])
+        cursor = max(index, content_start + 1)
+    return arguments
+
+
+def _source_bullet(raw_latex: str) -> dict:
+    """Return plain bullet text plus source-authored bold character spans."""
+    text = _latex_to_plain_text(raw_latex)
+    spans: list[list[int]] = []
+    search_from = 0
+    for raw_bold in _latex_command_arguments(raw_latex, "textbf"):
+        bold_text = _latex_to_plain_text(raw_bold)
+        if not bold_text:
+            continue
+        start = text.find(bold_text, search_from)
+        if start < 0:
+            start = text.find(bold_text)
+        if start < 0:
+            continue
+        end = start + len(bold_text)
+        spans.append([start, end])
+        search_from = end
+    return {"text": text, "bold_spans": spans}
+
+
+def _latex_resume_items(resume_text: str) -> list[dict]:
+    """Extract text and trusted formatting from LaTeX resume bullets."""
+    document = resume_text.split(r"\begin{document}", 1)[-1]
+    bullets = [_source_bullet(raw) for raw in _latex_command_arguments(document, "resumeItem")]
+    return [bullet for bullet in bullets if bullet["text"] and "#1" not in bullet["text"]]
+
+
+def _plain_resume_items(resume_text: str) -> list[str]:
+    """Extract bullets from a text/PDF resume, joining obvious wrapped lines."""
+    bullets: list[str] = []
+    current = ""
+    for raw_line in resume_text.splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^[\u2022*-]\s+(.+)$", line)
+        if match:
+            if current:
+                bullets.append(re.sub(r"\s+", " ", current).strip())
+            current = match.group(1)
+            continue
+        if current and line and (
+            line[:1].islower()
+            or line[:1].isdigit()
+            or re.search(
+                r"(?:,|\b(?:and|or|to|with|using|from|through|remote))$",
+                current,
+                re.IGNORECASE,
+            )
+        ):
+            current += " " + line
+        elif current:
+            bullets.append(re.sub(r"\s+", " ", current).strip())
+            current = ""
+    if current:
+        bullets.append(re.sub(r"\s+", " ", current).strip())
+    return bullets
+
+
+def build_source_bullet_catalog(resume_text: str) -> dict[str, dict]:
+    """Return stable IDs mapped to source bullet text and trusted formatting."""
+    if r"\resumeItem{" in resume_text:
+        bullets = _latex_resume_items(resume_text)
+    else:
+        bullets = [
+            {"text": bullet, "bold_spans": []}
+            for bullet in _plain_resume_items(resume_text)
+        ]
+    return {f"bullet_{index:03d}": bullet for index, bullet in enumerate(bullets, 1)}
+
+
+def resolve_source_bullets(data: dict, catalog: dict[str, object]) -> list[str]:
+    """Replace model-selected bullet IDs with source text, rejecting free-form prose."""
+    errors: list[str] = []
+    selected_ids: set[str] = set()
+    for section in ("experience", "projects"):
+        entries = data.get(section, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            selected = entry.pop("bullet_ids", None)
+            if selected is None:
+                selected = entry.get("bullets")
+            if not isinstance(selected, list):
+                errors.append(f"Entity '{entry.get('entity_id', '?')}' must provide bullet_ids")
+                continue
+            unknown = [str(value) for value in selected if str(value) not in catalog]
+            if unknown:
+                errors.append(
+                    f"Entity '{entry.get('entity_id', '?')}' selected unknown source bullet IDs: "
+                    + ", ".join(unknown)
+                )
+                continue
+            ids = [str(value) for value in selected]
+            duplicates = [bullet_id for bullet_id in ids if bullet_id in selected_ids]
+            if len(ids) != len(set(ids)) or duplicates:
+                errors.append(
+                    f"Entity '{entry.get('entity_id', '?')}' selected a source bullet more than once"
+                )
+                continue
+            selected_ids.update(ids)
+            resolved: list[dict] = []
+            for bullet_id in ids:
+                source = catalog[bullet_id]
+                if isinstance(source, dict):
+                    resolved.append({
+                        "text": str(source.get("text", "")),
+                        "bold_spans": [list(span) for span in source.get("bold_spans", [])],
+                    })
+                else:
+                    # Backward compatibility for callers with a plain-text catalog.
+                    resolved.append({"text": str(source), "bold_spans": []})
+            entry["bullets"] = resolved
+    return errors
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
@@ -53,64 +207,75 @@ def _build_tailor_prompt(profile: dict) -> str:
 
     # Preserved entities
     companies = resume_facts.get("preserved_companies", [])
-    projects = resume_facts.get("preserved_projects", [])
     school = resume_facts.get("preserved_school", "")
     real_metrics = resume_facts.get("real_metrics", []) # Are these also preserved for all tailored resumes?
 
     companies_str = ", ".join(companies) if companies else "N/A"
-    projects_str = ", ".join(projects) if projects else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
-    # Include ALL banned words from the validator so the LLM knows exactly
-    # what will be rejected — the validator checks for these automatically.
-    banned_str = ", ".join(BANNED_WORDS)
+    return f"""You are a senior technical recruiter tailoring a resume to a job description.
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
+Return a structured JSON decision document. The application, not you, renders and compiles LaTeX.
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+## SELECTION
+- Select exactly 5 unique entities total. An entity is one professional experience or one project.
+- Select at least one professional experience unless none is relevant.
+- Prefer relevant professional experience over projects with similar evidence.
+- Choose 3-4 source bullet IDs per selected entity where possible.
+- Keep experiences in experience and projects in projects, ordered by relevance within each section.
+- Do not include an unselected entity or duplicate project variant.
+- Bullets are selection-only: copy bullet IDs from the supplied SOURCE BULLET CATALOG.
+- Never write, rewrite, shorten, combine, split, correct, or paraphrase a bullet.
+- Keep every selected bullet with the professional experience or project where it originally appears.
 
-Take the master resume and job description. Return a tailored resume as a JSON object.
-
-## RECRUITER SCAN (6 seconds):
-1. Education and contact info are easy to find
-2. First 3-4 bullets of most recent role -- verbs and outcomes match?
+## KEYWORDS
+Extract must-have technical, preferred technical, responsibility/action, and domain/product keywords.
+Use supported keywords to decide which existing entities and bullets are most relevant. Do not edit bullets to add keywords.
 
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+Do not add a skill or technology absent from the master resume.
 
 ## TAILORING RULES:
 
-EDUCATION: Keep education near the top of the resume immediately after the header/contact block.
+EDUCATION: Return the source education as structured entries. Keep it immediately after the header.
 
-SKILLS: Reorder each category so the job's must-haves appear first.
+SKILLS: Select and reorder source-supported skills so the job's must-haves appear first.
 
-Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
-
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely. Ensure that 3-4 projects are chosen.
-
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
-
-## VOICE:
-- Write like a real engineer. Short, direct.
-- GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
-- BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
-- BANNED WORDS (using ANY of these = validation failure — do not use them even once):
-  {banned_str}
-- No em dashes. Use commas, periods, or hyphens.
+BULLETS: Return only source bullet IDs. Maximum 4 bullet IDs per entity. Bullet length, wording, punctuation, and line wrapping are not your concern.
 
 ## HARD RULES:
 - Do NOT invent work, companies, degrees, or certifications
 - Do NOT change real numbers ({metrics_str})
 - Preserved companies: {companies_str} -- names stay as-is
 - Preserved school: {school}
-- Must fit 1 page.
+- Do not output LaTeX, markdown, commentary, or contact information.
 
-## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
+## OUTPUT
+Return ONLY valid JSON. Each rationale must be one concise sentence.
 
-{{"title":"Role Title","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{
+  "keywords": {{
+    "must_have_technical": ["..."],
+    "preferred_technical": ["..."],
+    "responsibility_action": ["..."],
+    "domain_product": ["..."]
+  }},
+  "education": [
+    {{"institution":"...","location":"...","degree":"...","dates":"..."}}
+  ],
+  "experience": [
+    {{"entity_id":"experience_1","role":"...","company":"...","location":"...","dates":"...","rationale":"...","bullet_ids":["bullet_001","bullet_002","bullet_003"]}}
+  ],
+  "projects": [
+    {{"entity_id":"project_1","name":"...","technologies":["..."],"dates":"...","rationale":"...","bullet_ids":["bullet_010","bullet_011","bullet_012"]}}
+  ],
+  "skills": {{"Languages":["..."],"Frameworks":["..."],"Developer Tools":["..."],"Libraries":["..."]}},
+  "courses": [],
+  "awards": [],
+  "keyword_usage": {{"incorporated":["..."],"skipped":[{{"keyword":"...","reason":"unsupported"}}]}}
+}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -128,7 +293,7 @@ def _build_judge_prompt(profile: dict) -> str:
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
-    return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
+    return f"""You are a resume quality judge. A tailoring engine selected source content to target a specific job. Your job is to catch unsupported or misplaced content.
 
 You must answer with EXACTLY this format:
 VERDICT: PASS or FAIL
@@ -136,35 +301,22 @@ ISSUES: (list any problems, or "none")
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
 - Reorder bullets and projects to put the most relevant first
-- Reframe bullets to use the job's language
-- Drop low-relevance bullets and replace with more relevant ones from other sections
+- Select or omit existing bullets without changing their text
 - Reorder the skills section to put job-relevant skills first
-- Change tone and wording extensively
 
 ## WHAT IS FABRICATION (FAIL for these):
-1. Adding tools, languages, or frameworks to TECHNICAL SKILLS that aren't in the original. The allowed skills are ONLY: {skills_str}
+1. Adding tools, languages, or frameworks that appear in neither the original resume nor this confirmed profile boundary: {skills_str}
 2. Inventing NEW metrics or numbers not in the original. The real metrics are: {metrics_str}
 3. Inventing work that has no basis in any original bullet (completely new achievements).
 4. Adding companies, roles, or degrees that don't exist.
 5. Changing real numbers (inflating 80% to 95%, 500 nodes to 1000 nodes).
 
 ## WHAT IS NOT FABRICATION (do NOT fail for these):
-- Rewording any bullet, even heavily, as long as the underlying work is real
-- Combining two original bullets into one
-- Splitting one original bullet into two
-- Describing the same work with different emphasis
 - Dropping bullets entirely
 - Reordering anything
-- Changing the title or summary completely
 
 ## TOLERANCE RULE:
-The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
-- Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
-- Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
-
-Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+Bullet wording changes are not allowed. Fail invented, altered, or moved bullets, as well as invented projects, companies, degrees, metrics, responsibilities, or technologies. Do not fail for style alone."""
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -254,7 +406,13 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education = data.get("education", [])
+    if isinstance(education, list):
+        for entry in education:
+            if isinstance(entry, dict):
+                lines.append(" | ".join(sanitize_text(str(entry.get(key, ""))) for key in ("institution", "degree", "dates") if entry.get(key)))
+    else:
+        lines.append(sanitize_text(str(education)))
 
     # Summary
     # lines.append("SUMMARY")
@@ -264,33 +422,80 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     # Experience
     lines.append("EXPERIENCE")
     for entry in data.get("experience", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
+        lines.append(sanitize_text(entry.get("role") or entry.get("header", "")))
+        subtitle = " | ".join(str(entry.get(key, "")) for key in ("company", "location", "dates") if entry.get(key))
+        if subtitle or entry.get("subtitle"):
+            lines.append(sanitize_text(subtitle or entry["subtitle"]))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet = b.get("text", "") if isinstance(b, dict) else b
+            lines.append(f"- {str(bullet).strip()}")
         lines.append("")
 
     # Projects
     lines.append("PROJECTS")
     for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
+        lines.append(sanitize_text(entry.get("name") or entry.get("header", "")))
+        technologies = entry.get("technologies") or entry.get("subtitle")
+        if isinstance(technologies, list):
+            technologies = ", ".join(str(v) for v in technologies)
+        subtitle = " | ".join(str(v) for v in (technologies, entry.get("dates")) if v)
+        if subtitle:
+            lines.append(sanitize_text(subtitle))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet = b.get("text", "") if isinstance(b, dict) else b
+            lines.append(f"- {str(bullet).strip()}")
         lines.append("")
 
     # Technical Skills
     lines.append("TECHNICAL SKILLS")
     if isinstance(data["skills"], dict):
         for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
+            value = ", ".join(str(v) for v in val) if isinstance(val, list) else str(val)
+            lines.append(f"{cat}: {sanitize_text(value)}")
     lines.append("")
 
 
 
     return "\n".join(lines) # This is what creates the tailored resume as a TXT file
+
+
+def build_decision_summary(data: dict, fit_changes: list[str], visual_audit: dict) -> dict:
+    """Build the concise, user-facing explanation required for each artifact."""
+    entities: list[dict] = []
+    bullets: dict[str, list[str]] = {}
+    for entity_type, section in (("Professional Experience", "experience"), ("Project", "projects")):
+        for entry in data.get(section, []):
+            name = (
+                f"{entry.get('role', '')} at {entry.get('company', '')}".strip()
+                if section == "experience"
+                else str(entry.get("name", ""))
+            )
+            entities.append({
+                "entity_id": entry.get("entity_id", ""),
+                "name": name,
+                "type": entity_type,
+                "rationale": entry.get("rationale", ""),
+            })
+            bullets[name] = [
+                str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                for b in entry.get("bullets", [])
+            ]
+    return {
+        "Selected Resume Entities": entities,
+        "Selected Bullets": bullets,
+        "Job Keywords": data.get("keywords", {}),
+        "Keyword Usage": data.get("keyword_usage", {}),
+        "Skills Strategy": {
+            "categories": data.get("skills", {}),
+            "unsupported_skills_added": [],
+            "policy": "source-only",
+        },
+        "Fit-to-One-Page Changes": {
+            "changes": fit_changes,
+            "meaningful_content_deleted": any(change.startswith("Removed the lowest-priority bullet") for change in fit_changes),
+            "visual_line_audit": visual_audit,
+        },
+    }
 
 
 # ── LLM Judge ────────────────────────────────────────────────────────────
@@ -322,7 +527,21 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    # Reasoning models count internal reasoning against the completion budget.
+    # A 512-token budget can therefore produce a successful HTTP response with
+    # no visible answer even though the requested verdict is short.
+    response = client.chat(messages, max_tokens=2048, temperature=0.1)
+
+    if not response or not response.strip():
+        return {
+            "passed": False,
+            "verdict": "FAIL",
+            "issues": (
+                "Judge returned an empty response "
+                "(completion token budget may have been exhausted)"
+            ),
+            "raw": response or "",
+        }
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -367,7 +586,8 @@ def tailor_resume(
     """
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {job.get('company') or 'N/A'}\n"
+        f"JOB SOURCE: {job.get('site') or 'N/A'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
@@ -375,11 +595,19 @@ def tailor_resume(
     report: dict = {
         "attempts": 0, "validator": None, "judge": None,
         "status": "pending", "validation_mode": validation_mode,
+        "attempt_history": [],
     }
     avoid_notes: list[str] = []
     tailored = ""
     client = get_client()
     tailor_prompt_base = _build_tailor_prompt(profile)
+    bullet_catalog = build_source_bullet_catalog(resume_text)
+    if not bullet_catalog:
+        raise ValueError("No source resume bullets could be extracted for selection")
+    catalog_text = "\n".join(
+        f"{bullet_id}: {bullet['text']}"
+        for bullet_id, bullet in bullet_catalog.items()
+    )
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
@@ -393,25 +621,69 @@ def tailor_resume(
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {"role": "user", "content": (
+                f"ORIGINAL RESUME:\n{resume_text}\n\n"
+                f"SOURCE BULLET CATALOG (select IDs only):\n{catalog_text}\n\n---\n\n"
+                f"TARGET JOB:\n{job_text}\n\nReturn the JSON:"
+            )},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_tokens=4096, temperature=0.2)
 
         # Parse JSON from response
         try:
             data = extract_json(raw)
         except ValueError:
-            avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
+            error = "Output was not valid JSON. Return ONLY a JSON object, nothing else."
+            avoid_notes.append(error)
+            report["attempt_history"].append({
+                "attempt": attempt + 1, "stage": "json", "errors": [error], "warnings": [],
+            })
+            log.warning(
+                "Tailoring attempt %d/%d failed JSON parsing for %s: %s",
+                attempt + 1, max_retries + 1, job.get("title", "untitled job"), error,
+            )
             continue
 
+        bullet_errors = resolve_source_bullets(data, bullet_catalog)
+        if bullet_errors:
+            avoid_notes.extend(bullet_errors)
+            report["attempt_history"].append({
+                "attempt": attempt + 1, "stage": "source_bullets",
+                "errors": bullet_errors, "warnings": [],
+            })
+            log.warning(
+                "Tailoring attempt %d/%d failed source-bullet validation for %s: %s",
+                attempt + 1, max_retries + 1, job.get("title", "untitled job"),
+                "; ".join(bullet_errors),
+            )
+            if attempt < max_retries:
+                continue
+            report["validator"] = {"passed": False, "errors": bullet_errors, "warnings": []}
+            report["status"] = "failed_validation"
+            return "", report
+
         # Layer 1: Validate JSON fields
-        validation = validate_json_fields(data, profile, mode=validation_mode)
+        validation = validate_json_fields(
+            data,
+            profile,
+            mode=validation_mode,
+            original_text=resume_text,
+        )
         report["validator"] = validation
 
         if not validation["passed"]:
             # Only retry if there are hard errors (warnings never block)
             avoid_notes.extend(validation["errors"])
+            report["attempt_history"].append({
+                "attempt": attempt + 1, "stage": "validation",
+                "errors": validation["errors"], "warnings": validation["warnings"],
+            })
+            log.warning(
+                "Tailoring attempt %d/%d failed validation for %s: %s",
+                attempt + 1, max_retries + 1, job.get("title", "untitled job"),
+                "; ".join(validation["errors"]),
+            )
             if attempt < max_retries:
                 continue
             # Last attempt — assemble whatever we got
@@ -425,6 +697,11 @@ def tailor_resume(
         # Layer 2: LLM judge (catches subtle fabrication) — skipped in lenient mode
         if validation_mode == "lenient":
             report["judge"] = {"verdict": "SKIPPED", "passed": True, "issues": "none"}
+            report["attempt_history"].append({
+                "attempt": attempt + 1, "stage": "approved", "errors": [],
+                "warnings": validation["warnings"],
+            })
+            report["structured_data"] = data
             report["status"] = "approved"
             return tailored, report
 
@@ -433,15 +710,30 @@ def tailor_resume(
 
         if not judge["passed"]:
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
+            report["attempt_history"].append({
+                "attempt": attempt + 1, "stage": "judge",
+                "errors": [judge["issues"]], "warnings": validation["warnings"],
+            })
+            log.warning(
+                "Tailoring attempt %d/%d failed judge review for %s: %s",
+                attempt + 1, max_retries + 1, job.get("title", "untitled job"),
+                judge["issues"],
+            )
             if attempt < max_retries:
                 # In normal mode, only retry on judge failure if there are retries left
                 if validation_mode != "lenient":
                     continue
             # Accept best attempt on last retry (all modes) or if lenient
+            report["structured_data"] = data
             report["status"] = "approved_with_judge_warning"
             return tailored, report
 
         # Both passed
+        report["attempt_history"].append({
+            "attempt": attempt + 1, "stage": "approved", "errors": [],
+            "warnings": validation["warnings"],
+        })
+        report["structured_data"] = data
         report["status"] = "approved"
         return tailored, report
 
@@ -451,8 +743,12 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+def run_tailoring(
+    min_score: int = 7,
+    limit: int = 20,
+    validation_mode: str = "normal",
+    target_url: str | None = None,
+) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
@@ -464,13 +760,32 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
-    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    master_path = RESUME_TEX_PATH if RESUME_TEX_PATH.exists() else RESUME_PATH
+    resume_text = master_path.read_text(encoding="utf-8")
     conn = get_connection()
 
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    if target_url:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE url = ? "
+            "AND full_description IS NOT NULL AND applied_at IS NULL "
+            "AND tailored_resume_path IS NULL "
+            "AND COALESCE(tailor_attempts, 0) < 5",
+            (target_url,),
+        ).fetchone()
+        jobs = [dict(row)] if row else []
+    else:
+        jobs = get_jobs_by_stage(
+            conn=conn,
+            stage="pending_tailor",
+            min_score=min_score,
+            limit=limit,
+        )
 
     if not jobs:
-        log.info("No untailored jobs with score >= %d.", min_score)
+        if target_url:
+            log.info("Target job is not eligible for tailoring: %s", target_url)
+        else:
+            log.info("No untailored jobs with score >= %d.", min_score)
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
@@ -481,15 +796,33 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
     for job in jobs:
+        current_job = conn.execute(
+            "SELECT applied_at FROM jobs WHERE url = ?", (job["url"],)
+        ).fetchone()
+        if not current_job or current_job[0]:
+            log.info("Skipping already-applied job: %s", job["title"])
+            continue
         completed += 1
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
+            current_job = conn.execute(
+                "SELECT applied_at FROM jobs WHERE url = ?", (job["url"],)
+            ).fetchone()
+            if not current_job or current_job[0]:
+                log.info("Discarding tailored output because job was marked applied: %s", job["title"])
+                continue
 
             # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            safe_title = re.sub(r"[^\w\s-]", "", job["title"] or "")[:50].strip().replace(" ", "_")
+            company = (job.get("company") or "").strip()
+            safe_company = re.sub(r"[^\w\s-]", "", company)[:40].strip().replace(" ", "_")
+            prefix_parts = [part for part in (safe_company, safe_title) if part]
+            prefix = "_".join(prefix_parts) or "Resume"
+            prefix += "_Tailored_Resume"
+            if (TAILORED_DIR / f"{prefix}.tex").exists() or (TAILORED_DIR / f"{prefix}_REPORT.json").exists():
+                url_suffix = hashlib.sha256(job["url"].encode("utf-8")).hexdigest()[:8]
+                prefix = f"{prefix}_{url_suffix}"
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
@@ -499,7 +832,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
             job_desc = (
                 f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
+                f"Company: {company or 'N/A'}\n"
+                f"Source: {job['site']}\n"
                 f"Location: {job.get('location', 'N/A')}\n"
                 f"Score: {job.get('fit_score', 'N/A')}\n"
                 f"URL: {job['url']}\n\n"
@@ -507,26 +841,49 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
+            # Render the trusted LaTeX template and compile it. A resume is not
+            # approved unless a valid, one-page PDF is produced.
+            tex_path = TAILORED_DIR / f"{prefix}.tex"
             pdf_path = None
             if report["status"] in ("approved", "approved_with_judge_warning"):
                 try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                    from applypilot.scoring.latex import fit_one_page
+
+                    fitted, tex_source, pdf_bytes, fit_changes, visual_audit = fit_one_page(
+                        report["structured_data"],
+                        profile,
+                        master_resume_text=resume_text,
+                    )
+                    report["structured_data"] = fitted
+                    report["fit_to_one_page"] = {
+                        "page_count": 1,
+                        "changes": fit_changes,
+                        "visual_line_audit": visual_audit,
+                    }
+                    report["decision_summary"] = build_decision_summary(
+                        fitted, fit_changes, visual_audit
+                    )
+                    tex_path.write_text(tex_source, encoding="utf-8")
+                    output_pdf = tex_path.with_suffix(".pdf")
+                    output_pdf.write_bytes(pdf_bytes)
+                    pdf_path = str(output_pdf)
+                except Exception as exc:
+                    report["status"] = "failed_compilation"
+                    report["compile_error"] = str(exc)
+                    log.warning("LaTeX/PDF generation failed for %s: %s", tex_path, exc)
+
+            # Save validation and decision report after compilation/auditing.
+            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
             result = {
                 "url": job["url"],
-                "path": str(txt_path),
+                "path": str(tex_path) if pdf_path else None,
+                "text_path": str(txt_path),
                 "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
+                "company": company,
                 "status": report["status"],
                 "attempts": report["attempts"],
             }
@@ -569,18 +926,23 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     conn.commit()
 
     elapsed = time.time() - t0
+    approved = stats.get("approved", 0) + stats.get("approved_with_judge_warning", 0)
+    failed = sum(
+        count
+        for status, count in stats.items()
+        if status not in _success_statuses and status != "error"
+    )
     log.info(
-        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
+        "Tailoring done in %.1fs: %d approved, %d failed, %d errors",
         elapsed,
-        stats.get("approved", 0),
-        stats.get("failed_validation", 0),
-        stats.get("failed_judge", 0),
+        approved,
+        failed,
         stats.get("error", 0),
     )
 
     return {
-        "approved": stats.get("approved", 0),
-        "failed": stats.get("failed_validation", 0) + stats.get("failed_judge", 0),
+        "approved": approved,
+        "failed": failed,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
     }

@@ -205,7 +205,12 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
 
 def collect_detail_intelligence(page) -> dict:
     """Collect signals from a detail page. Lighter than discovery -- no API interception."""
-    intel: dict = {"json_ld": [], "page_title": "", "final_url": ""}
+    intel: dict = {
+        "json_ld": [],
+        "apple_hydration": None,
+        "page_title": "",
+        "final_url": "",
+    }
 
     intel["page_title"] = page.title()
     intel["final_url"] = page.url
@@ -217,7 +222,78 @@ def collect_detail_intelligence(page) -> dict:
         except Exception:
             pass
 
+    if "jobs.apple.com" in intel["final_url"]:
+        try:
+            intel["apple_hydration"] = page.evaluate(
+                "() => window.__staticRouterHydrationData || null"
+            )
+        except Exception:
+            pass
+
     return intel
+
+
+def _apple_jobs_data(payload: object) -> dict | None:
+    """Locate Apple's job-detail object in its router hydration payload."""
+    if not isinstance(payload, dict):
+        return None
+    jobs_data = (
+        payload.get("loaderData", {})
+        .get("jobDetails", {})
+        .get("jobsData")
+    )
+    return jobs_data if isinstance(jobs_data, dict) else None
+
+
+def extract_from_apple_hydration(intel: dict) -> dict | None:
+    """Assemble every Apple job-description section from page hydration data."""
+    jobs_data = _apple_jobs_data(intel.get("apple_hydration"))
+    if not jobs_data:
+        return None
+
+    # Prefer the selected localization when present. Some postings put fields
+    # only in the localized `posting` object, so merge both representations.
+    posting: dict = {}
+    localizations = jobs_data.get("localizations")
+    if isinstance(localizations, dict):
+        locale = jobs_data.get("selectedLocale")
+        localized = localizations.get(locale) if locale else None
+        if not isinstance(localized, dict) and localizations:
+            localized = next(
+                (value for value in localizations.values() if isinstance(value, dict)),
+                None,
+            )
+        if isinstance(localized, dict) and isinstance(localized.get("posting"), dict):
+            posting.update(localized["posting"])
+    posting.update(jobs_data)
+
+    section_fields = (
+        ("Summary", ("jobSummary", "summary")),
+        ("Description", ("jobDescription", "description")),
+        ("Responsibilities", ("responsibilities", "responsibility")),
+        ("Minimum Qualifications", ("minimumQualifications",)),
+        ("Preferred Qualifications", ("preferredQualifications",)),
+    )
+    sections: list[str] = []
+    seen: set[str] = set()
+    for heading, fields in section_fields:
+        value = next((posting.get(field) for field in fields if posting.get(field)), None)
+        cleaned = clean_description(value) if isinstance(value, str) else ""
+        if cleaned and cleaned not in seen:
+            sections.append(f"{heading}\n{cleaned}")
+            seen.add(cleaned)
+
+    description = "\n\n".join(sections)
+    if len(description) < 50:
+        return None
+    return {
+        "full_description": description,
+        "application_url": intel.get("final_url") or None,
+        "title": posting.get("postingTitle"),
+        "company": "Apple",
+        "location": None,
+        "posted_at": posting.get("postDateInGMT") or posting.get("postingDateMeta"),
+    }
 
 
 # -- Tier 1: JSON-LD extraction -----------------------------------------------
@@ -567,6 +643,19 @@ def clean_description(text: str) -> str:
     return text.strip()
 
 
+def reset_incomplete_apple_descriptions(conn: sqlite3.Connection) -> int:
+    """Requeue Apple rows previously enriched from search summaries only."""
+    cursor = conn.execute(
+        "UPDATE jobs SET full_description = NULL, detail_scraped_at = NULL "
+        "WHERE (site = 'Apple' OR strategy = 'apple_careers') "
+        "AND full_description IS NOT NULL "
+        "AND full_description NOT LIKE '%Minimum Qualifications%' "
+        "AND full_description NOT LIKE '%Preferred Qualifications%'"
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 # -- Orchestration -----------------------------------------------------------
 
 SITE_DELAYS = {
@@ -619,6 +708,16 @@ def scrape_detail_page(page, url: str) -> dict:
 
     intel = collect_detail_intelligence(page)
     result.update(extract_job_metadata(intel))
+
+    # Apple exposes each description section separately in its router payload.
+    # Run this before JSON-LD, which may contain only the Summary section.
+    apple_result = extract_from_apple_hydration(intel)
+    if apple_result and apple_result.get("full_description"):
+        result.update(apple_result)
+        result["tier_used"] = 1
+        result["status"] = "ok"
+        result["elapsed"] = time.time() - t0
+        return result
 
     # Tier 1: JSON-LD
     json_ld_result = extract_from_json_ld(intel)
@@ -727,8 +826,7 @@ def scrape_site_batch(
                         "detail_scraped_at = ?, detail_error = NULL, "
                         "title = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, title) ELSE title END, "
-                        "site = CASE WHEN strategy = 'external_upload' "
-                        "THEN COALESCE(?, site) ELSE site END, "
+                        "company = COALESCE(company, ?), "
                         "location = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, location) ELSE location END, "
                         "posted_at = CASE WHEN strategy = 'external_upload' "
@@ -881,6 +979,10 @@ def stream_detail(
 
     conn = init_db()
 
+    reset_count = reset_incomplete_apple_descriptions(conn)
+    if reset_count:
+        log.info("Apple: requeued %d incomplete descriptions", reset_count)
+
     url_stats = resolve_all_urls(conn)
     log.info("URL resolution: %d resolved, %d absolute",
              url_stats['resolved'], url_stats['already_absolute'])
@@ -947,6 +1049,10 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
         Dict with stats: processed, ok, partial, error, tiers.
     """
     conn = init_db()
+
+    reset_count = reset_incomplete_apple_descriptions(conn)
+    if reset_count:
+        log.info("Apple: requeued %d incomplete descriptions", reset_count)
 
     # URL resolution first
     url_stats = resolve_all_urls(conn)

@@ -15,6 +15,7 @@ import webbrowser
 from datetime import datetime
 from html import escape
 from pathlib import Path
+from urllib.parse import quote
 
 from rich.console import Console
 
@@ -83,6 +84,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
     high_fit = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
     ).fetchone()[0]
+    pending_tailoring = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 "
+        "AND full_description IS NOT NULL AND applied_at IS NULL "
+        "AND tailored_resume_path IS NULL "
+        "AND COALESCE(tailor_attempts, 0) < 5"
+    ).fetchone()[0]
     applied_count = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
     ).fetchone()[0]
@@ -116,7 +123,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
         """
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error, posted_at,
-               fit_score, score_reasoning, applied_at
+               fit_score, score_reasoning, applied_at, tailored_resume_path,
+               COALESCE(tailor_attempts, 0) AS tailor_attempts
         FROM jobs
         """
     ).fetchall()
@@ -265,6 +273,36 @@ def generate_dashboard(output_path: str | None = None) -> str:
                 f'<button class="mark-applied-btn" data-job-url="{url}" '
                 'type="button">Mark as applied</button>'
             )
+        tailor_html = ""
+        if (
+            not is_applied
+            and j["full_description"]
+            and not j["tailored_resume_path"]
+            and j["tailor_attempts"] < 5
+        ):
+            tailor_html = (
+                f'<button class="tailor-job-btn" data-job-url="{url}" '
+                'type="button">Tailor</button>'
+            )
+        artifact_html = ""
+        if j["tailored_resume_path"]:
+            encoded_url = quote(j["url"] or "", safe="")
+            artifact_kinds = [("pdf", "Resume PDF")]
+            if Path(j["tailored_resume_path"]).suffix.lower() == ".tex":
+                artifact_kinds.append(("tex", "LaTeX"))
+            artifact_kinds.append(("report", "Report"))
+            artifact_links = "".join(
+                f'<a href="/api/jobs/artifact?url={encoded_url}&kind={kind}" '
+                f'class="artifact-download" download>{label}</a>'
+                for kind, label in artifact_kinds
+            )
+            artifact_html = (
+                '<div class="tailored-artifacts">'
+                '<div><div class="tailored-artifacts-title">Tailored resume</div>'
+                '<div class="tailored-artifacts-copy">Generated specifically for this job posting.</div></div>'
+                f'<div class="tailored-artifact-actions">{artifact_links}</div>'
+                '</div>'
+            )
 
         job_sections += f"""
         <div class="job-card" data-score="{score}" data-applied="{str(is_applied).lower()}"
@@ -285,7 +323,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
           {f'<div class="import-error">Enrichment failed: {detail_error}</div>' if detail_error else ''}
           <p class="desc-preview">{desc_preview}...</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
-          <div class="card-footer">{apply_html}{mark_applied_html}</div>
+          {artifact_html}
+          <div class="card-footer">{tailor_html}{apply_html}{mark_applied_html}</div>
         </div>"""
 
     if current_score is not None:
@@ -331,6 +370,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .discovery-actions {{ display: flex; flex-direction: column; align-items: flex-end; min-width: 180px; }}
   .discovery-button {{ border: 0; border-radius: 7px; padding: 0.65rem 1rem; background: #10b981; color: #052e16; font-weight: 700; cursor: pointer; }}
   .discovery-button:disabled {{ opacity: 0.55; cursor: wait; }}
+  .tailoring-button {{ border: 0; border-radius: 7px; padding: 0.65rem 1rem; background: #60a5fa; color: #172554; font-weight: 700; cursor: pointer; }}
+  .tailoring-button:disabled {{ opacity: 0.55; cursor: wait; }}
   .discovery-status {{ min-height: 1.25rem; margin-top: 0.5rem; font-size: 0.78rem; color: #6ee7b7; text-align: right; }}
   .discovery-status.error {{ color: #fca5a5; }}
 
@@ -466,11 +507,20 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .desc-preview {{ font-size: 0.8rem; color: #64748b; line-height: 1.5; margin-bottom: 0.75rem; max-height: 3.6em; overflow: hidden; }}
 
   .card-footer {{ display: flex; justify-content: flex-end; gap: 0.5rem; }}
+  .tailored-artifacts {{ display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; margin: 0.8rem 0; padding: 0.75rem; border: 1px solid #2563eb55; border-radius: 8px; background: #17255466; }}
+  .tailored-artifacts-title {{ color: #bfdbfe; font-size: 0.82rem; font-weight: 700; }}
+  .tailored-artifacts-copy {{ color: #94a3b8; font-size: 0.72rem; margin-top: 0.15rem; }}
+  .tailored-artifact-actions {{ display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }}
+  .artifact-download {{ color: #bfdbfe; font-size: 0.76rem; font-weight: 600; text-decoration: none; padding: 0.35rem 0.6rem; border: 1px solid #60a5fa66; border-radius: 6px; background: #1e3a8a44; }}
+  .artifact-download:hover {{ background: #1d4ed866; }}
   .apply-link {{ font-size: 0.8rem; color: #60a5fa; text-decoration: none; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa33; border-radius: 6px; font-weight: 500; }}
   .apply-link:hover {{ background: #60a5fa22; }}
   .mark-applied-btn {{ font-size: 0.8rem; color: #6ee7b7; background: transparent; padding: 0.3rem 0.8rem; border: 1px solid #10b98155; border-radius: 6px; font-weight: 500; cursor: pointer; }}
   .mark-applied-btn:hover {{ background: #10b98122; }}
   .mark-applied-btn:disabled {{ opacity: 0.55; cursor: wait; }}
+  .tailor-job-btn {{ font-size: 0.8rem; color: #bfdbfe; background: #1d4ed833; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa66; border-radius: 6px; font-weight: 650; cursor: pointer; }}
+  .tailor-job-btn:hover {{ background: #1d4ed866; }}
+  .tailor-job-btn:disabled {{ opacity: 0.55; cursor: wait; }}
 
   /* Active/applied tabs */
   .tabs {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid #334155; }}
@@ -546,6 +596,19 @@ def generate_dashboard(output_path: str | None = None) -> str:
       Run Discovery
     </button>
     <div id="discovery-status" class="discovery-status" role="status"></div>
+  </div>
+</section>
+
+<section class="discovery-panel">
+  <div>
+    <h2>Tailor resumes</h2>
+    <p>Generate a job-specific LaTeX resume and PDF for up to 20 eligible jobs. {pending_tailoring} currently eligible.</p>
+  </div>
+  <div class="discovery-actions">
+    <button id="tailoring-button" class="tailoring-button" type="button">
+      Run Tailoring
+    </button>
+    <div id="tailoring-status" class="discovery-status" role="status"></div>
   </div>
 </section>
 
@@ -974,6 +1037,8 @@ const importButton = document.getElementById('job-import-button');
 const importStatus = document.getElementById('import-status');
 const discoveryButton = document.getElementById('discovery-button');
 const discoveryStatus = document.getElementById('discovery-status');
+const tailoringButton = document.getElementById('tailoring-button');
+const tailoringStatus = document.getElementById('tailoring-status');
 
 function setImportStatus(message, isError = false) {{
   importStatus.textContent = message;
@@ -1099,6 +1164,106 @@ discoveryButton.addEventListener('click', async () => {{
 }});
 
 refreshDiscoveryStatus();
+
+function renderTailoringStatus(state) {{
+  tailoringStatus.classList.toggle('error', state.status === 'error');
+  const jobButtons = document.querySelectorAll('.tailor-job-btn');
+  if (state.status === 'running') {{
+    tailoringButton.disabled = true;
+    tailoringButton.textContent = 'Tailoring running...';
+    jobButtons.forEach(button => {{
+      button.disabled = true;
+      if (state.target_url && button.dataset.jobUrl === state.target_url) {{
+        button.textContent = 'Tailoring...';
+      }}
+    }});
+    tailoringStatus.textContent = state.target_url
+      ? 'Tailoring the selected job, compiling its PDF, and auditing layout.'
+      : 'Selecting content, compiling PDFs, and auditing layout. You can keep using the dashboard.';
+    window.setTimeout(refreshTailoringStatus, 2000);
+    return;
+  }}
+
+  tailoringButton.disabled = false;
+  tailoringButton.textContent = 'Run Tailoring';
+  jobButtons.forEach(button => {{
+    button.disabled = false;
+    button.textContent = 'Tailor';
+  }});
+  if (state.status === 'complete') {{
+    const result = state.result || {{}};
+    tailoringStatus.textContent =
+      `Finished: ${{result.approved || 0}} tailored, ${{result.failed || 0}} failed, ${{result.errors || 0}} errors.`;
+    if (sessionStorage.getItem('applypilotTailoringRunning')) {{
+      sessionStorage.removeItem('applypilotTailoringRunning');
+      window.setTimeout(() => window.location.reload(), 1000);
+    }}
+  }} else if (state.status === 'error') {{
+    sessionStorage.removeItem('applypilotTailoringRunning');
+    tailoringStatus.textContent = 'Tailoring failed: ' + (state.error || 'unknown error');
+  }} else {{
+    tailoringStatus.textContent = '';
+  }}
+}}
+
+async function refreshTailoringStatus() {{
+  try {{
+    const response = await fetch('/api/tailoring/status');
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.error || 'Could not check tailoring');
+    renderTailoringStatus(state);
+  }} catch (error) {{
+    tailoringButton.disabled = false;
+    tailoringStatus.classList.add('error');
+    tailoringStatus.textContent = error.message;
+  }}
+}}
+
+tailoringButton.addEventListener('click', async () => {{
+  tailoringButton.disabled = true;
+  tailoringStatus.textContent = 'Starting tailoring...';
+  try {{
+    const response = await fetch('/api/tailoring', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{min_score: 7, limit: 20, validation_mode: 'normal'}})
+    }});
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.error || 'Could not start tailoring');
+    sessionStorage.setItem('applypilotTailoringRunning', 'true');
+    renderTailoringStatus(state);
+  }} catch (error) {{
+    tailoringButton.disabled = false;
+    tailoringStatus.classList.add('error');
+    tailoringStatus.textContent = error.message;
+  }}
+}});
+
+document.querySelectorAll('.tailor-job-btn').forEach(button => {{
+  button.addEventListener('click', async () => {{
+    button.disabled = true;
+    button.textContent = 'Starting...';
+    tailoringStatus.textContent = 'Starting tailoring for the selected job...';
+    try {{
+      const response = await fetch('/api/tailoring/job', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{url: button.dataset.jobUrl, validation_mode: 'normal'}})
+      }});
+      const state = await response.json();
+      if (!response.ok) throw new Error(state.error || 'Could not tailor this job');
+      sessionStorage.setItem('applypilotTailoringRunning', 'true');
+      renderTailoringStatus(state);
+    }} catch (error) {{
+      button.disabled = false;
+      button.textContent = 'Tailor';
+      tailoringStatus.classList.add('error');
+      tailoringStatus.textContent = error.message;
+    }}
+  }});
+}});
+
+refreshTailoringStatus();
 
 function switchTab(tab) {{
   currentTab = tab;

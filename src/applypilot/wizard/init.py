@@ -1,7 +1,7 @@
 """ApplyPilot first-time setup wizard.
 
 Interactive flow that creates ~/.applypilot/ with:
-  - resume.txt (and optionally resume.pdf)
+  - resume.txt or resume.tex (and optionally resume.pdf)
   - profile.json
   - searches.yaml
   - .env (LLM API key)
@@ -24,6 +24,7 @@ from applypilot.config import (
     PROFILE_PATH,
     RESUME_PATH,
     RESUME_PDF_PATH,
+    RESUME_TEX_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
 )
@@ -37,7 +38,7 @@ console = Console()
 
 def _setup_resume() -> None:
     """Prompt for resume file and copy into APP_DIR."""
-    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt or .pdf)."))
+    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.tex, .txt, or .pdf)."))
 
     while True:
         path_str = Prompt.ask("Resume file path")
@@ -48,13 +49,25 @@ def _setup_resume() -> None:
             continue
 
         suffix = src.suffix.lower()
-        if suffix not in (".txt", ".pdf"):
-            console.print("[red]Unsupported format.[/red] Provide a .txt or .pdf file.")
+        if suffix not in (".tex", ".txt", ".pdf"):
+            console.print("[red]Unsupported format.[/red] Provide a .tex, .txt, or .pdf file.")
             continue
 
         if suffix == ".txt":
             shutil.copy2(src, RESUME_PATH)
             console.print(f"[green]Copied to {RESUME_PATH}[/green]")
+        elif suffix == ".tex":
+            from applypilot.scoring.latex import compile_latex
+
+            content = src.read_text(encoding="utf-8")
+            try:
+                pdf = compile_latex(content)
+            except ValueError as exc:
+                console.print(f"[red]LaTeX compilation failed:[/red] {exc}")
+                continue
+            RESUME_TEX_PATH.write_text(content, encoding="utf-8")
+            RESUME_PDF_PATH.write_bytes(pdf)
+            console.print(f"[green]Copied to {RESUME_TEX_PATH} and compiled {RESUME_PDF_PATH}[/green]")
         elif suffix == ".pdf":
             shutil.copy2(src, RESUME_PDF_PATH)
             console.print(f"[green]Copied to {RESUME_PDF_PATH}[/green]")

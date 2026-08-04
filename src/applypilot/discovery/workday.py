@@ -319,10 +319,10 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
                 "discovered_at, posted_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), site, None, short_desc, job.get("location"),
                  site, strategy, now, job.get("posted"), full_description, url,
                  detail_scraped_at, detail_error),
             )

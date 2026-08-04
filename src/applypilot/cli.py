@@ -344,7 +344,7 @@ def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
+        load_env, PROFILE_PATH, RESUME_PATH, RESUME_TEX_PATH, RESUME_PDF_PATH,
         SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
     )
 
@@ -364,7 +364,9 @@ def doctor() -> None:
         results.append(("profile.json", fail_mark, "Run 'applypilot init' to create"))
 
     # Resume
-    if RESUME_PATH.exists():
+    if RESUME_TEX_PATH.exists():
+        results.append(("resume.tex", ok_mark, str(RESUME_TEX_PATH)))
+    elif RESUME_PATH.exists():
         results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
     elif RESUME_PDF_PATH.exists():
         results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
@@ -401,6 +403,18 @@ def doctor() -> None:
     else:
         results.append(("LLM API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+
+    # LaTeX tailoring and informational visual audit
+    tectonic_bin = shutil.which("tectonic")
+    if tectonic_bin:
+        results.append(("Tectonic", ok_mark, tectonic_bin))
+    else:
+        results.append(("Tectonic", fail_mark, "Required to compile tailored LaTeX resumes"))
+    pdftotext_bin = shutil.which("pdftotext")
+    if pdftotext_bin:
+        results.append(("pdftotext", ok_mark, pdftotext_bin))
+    else:
+        results.append(("pdftotext", warn_mark, "Optional: install Poppler for visual line diagnostics"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI

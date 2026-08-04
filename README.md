@@ -63,7 +63,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **4. Tailor** | AI selects and reorganizes your existing resume entities and bullets per job. Bullet wording stays unchanged |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
@@ -77,7 +77,7 @@ Each stage is independent. Run them all or pick what you need.
 |---------|-----------|--------|--------|
 | Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
+| Resume tailoring | Per-job source selection | Template-based | Hours per application |
 | Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
 | Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
@@ -91,6 +91,8 @@ Each stage is independent. Run them all or pick what you need.
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| Tectonic | LaTeX resume tailoring | Compiles the supported resume template to PDF |
+| Poppler (`pdftotext`) | LaTeX resume tailoring | Performs the mandatory rendered-line audit |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
 

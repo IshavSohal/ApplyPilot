@@ -490,8 +490,8 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
     title = f"Imported job from {hostname}"
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO jobs (url, title, site, strategy, discovered_at, application_url) "
-        "VALUES (?, ?, ?, 'external_upload', ?, ?)",
+        "INSERT INTO jobs (url, title, company, site, strategy, discovered_at, application_url) "
+        "VALUES (?, ?, NULL, ?, 'external_upload', ?, ?)",
         (url, title, hostname, now, url),
     )
     conn.commit()
@@ -556,6 +556,41 @@ def mark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> di
         "status": "applied",
         "applied_at": applied_at,
     }
+
+
+def load_tailored_artifact(
+    raw_url: str,
+    kind: str,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[Path, bytes, str]:
+    """Load a generated artifact for a job without accepting filesystem paths."""
+    if kind not in {"tex", "pdf", "report"}:
+        raise ValueError("Artifact kind must be tex, pdf, or report")
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT tailored_resume_path FROM jobs WHERE url = ?",
+        (raw_url,),
+    ).fetchone()
+    if not row or not row["tailored_resume_path"]:
+        raise FileNotFoundError("Tailored resume not found")
+    tex_path = Path(row["tailored_resume_path"]).resolve()
+    tailored_root = config.TAILORED_DIR.resolve()
+    if tex_path.parent != tailored_root:
+        raise PermissionError("Stored artifact path is outside the tailored resume directory")
+    paths = {
+        "tex": tex_path,
+        "pdf": tex_path.with_suffix(".pdf"),
+        "report": tex_path.with_name(f"{tex_path.stem}_REPORT.json"),
+    }
+    path = paths[kind]
+    if not path.is_file():
+        raise FileNotFoundError(f"Tailored {kind} artifact not found")
+    content_types = {
+        "tex": "application/x-tex; charset=utf-8",
+        "pdf": "application/pdf",
+        "report": "application/json; charset=utf-8",
+    }
+    return path, path.read_bytes(), content_types[kind]
 
 
 def delete_job(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
@@ -668,6 +703,105 @@ def start_discovery(server: DashboardHTTPServer, workers: int = 4) -> dict:
     return state
 
 
+def _execute_tailoring(
+    server: DashboardHTTPServer,
+    min_score: int,
+    limit: int,
+    validation_mode: str,
+    target_url: str | None,
+) -> None:
+    """Run resume tailoring in the dashboard's bounded background worker."""
+    try:
+        from applypilot.scoring.tailor import run_tailoring
+
+        result = run_tailoring(
+            min_score=min_score,
+            limit=limit,
+            validation_mode=validation_mode,
+            target_url=target_url,
+        )
+    except Exception as exc:
+        log.exception("Dashboard tailoring failed")
+        with server.tailoring_lock:
+            server.tailoring_state = {
+                **server.tailoring_state,
+                "status": "error",
+                "error": str(exc)[:500],
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        return
+
+    with server.tailoring_lock:
+        server.tailoring_state = {
+            **server.tailoring_state,
+            "status": "complete",
+            "result": result,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def start_tailoring(
+    server: DashboardHTTPServer,
+    min_score: int = 7,
+    limit: int = 20,
+    validation_mode: str = "normal",
+    target_url: str | None = None,
+) -> dict:
+    """Start one background tailoring batch, rejecting overlapping batches."""
+    if not isinstance(min_score, int) or isinstance(min_score, bool) or not 1 <= min_score <= 10:
+        raise ValueError("Minimum score must be an integer between 1 and 10")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("Tailoring limit must be an integer between 1 and 100")
+    if validation_mode not in {"strict", "normal", "lenient"}:
+        raise ValueError("Validation mode must be strict, normal, or lenient")
+    if target_url is not None:
+        if not isinstance(target_url, str) or not target_url.strip():
+            raise ValueError("Job URL is required")
+        target_url = target_url.strip()
+        row = get_connection().execute(
+            "SELECT applied_at, full_description, tailored_resume_path, "
+            "COALESCE(tailor_attempts, 0) AS tailor_attempts "
+            "FROM jobs WHERE url = ?",
+            (target_url,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Job not found")
+        if row["applied_at"]:
+            raise ValueError("This job is already marked as applied")
+        if not row["full_description"]:
+            raise ValueError("This job needs a full description before tailoring")
+        if row["tailored_resume_path"]:
+            raise ValueError("This job already has a tailored resume")
+        if row["tailor_attempts"] >= 5:
+            raise ValueError("This job has reached the tailoring attempt limit")
+
+    with server.tailoring_lock:
+        if server.tailoring_state["status"] == "running":
+            raise RuntimeError("Another tailoring run is already in progress")
+        server.tailoring_state = {
+            "status": "running",
+            "min_score": min_score,
+            "limit": limit,
+            "validation_mode": validation_mode,
+            "target_url": target_url,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+        state = dict(server.tailoring_state)
+
+    server.tailoring_pool.submit(
+        _execute_tailoring,
+        server,
+        min_score,
+        limit,
+        validation_mode,
+        target_url,
+    )
+    return state
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     """Threaded localhost server with a bounded enrichment pool."""
 
@@ -683,10 +817,26 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             max_workers=1,
             thread_name_prefix="applypilot-discovery",
         )
+        self.tailoring_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="applypilot-tailoring",
+        )
         self.discovery_lock = threading.Lock()
         self.discovery_state = {
             "status": "idle",
             "workers": None,
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+        self.tailoring_lock = threading.Lock()
+        self.tailoring_state = {
+            "status": "idle",
+            "min_score": 7,
+            "limit": 20,
+            "validation_mode": "normal",
+            "target_url": None,
             "started_at": None,
             "finished_at": None,
             "result": None,
@@ -697,6 +847,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         self.enrichment_pool.shutdown(wait=False, cancel_futures=True)
         self.discovery_pool.shutdown(wait=False, cancel_futures=True)
+        self.tailoring_pool.shutdown(wait=False, cancel_futures=True)
         super().server_close()
 
 
@@ -769,6 +920,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, state)
             return
 
+        if parsed.path == "/api/tailoring/status":
+            with self.server.tailoring_lock:
+                state = dict(self.server.tailoring_state)
+            self._send_json(200, state)
+            return
+
         if parsed.path == "/api/settings":
             try:
                 self._validate_local_host()
@@ -812,6 +969,29 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": f"Could not read resume: {exc}"})
             return
 
+        if parsed.path == "/api/jobs/artifact":
+            try:
+                self._validate_local_host()
+                query = parse_qs(parsed.query)
+                path, body, content_type = load_tailored_artifact(
+                    query.get("url", [""])[0],
+                    query.get("kind", [""])[0],
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except PermissionError as exc:
+                self._send_json(403, {"error": str(exc)})
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+            except (FileNotFoundError, OSError) as exc:
+                self._send_json(404, {"error": str(exc)})
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
@@ -821,6 +1001,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/jobs/applied",
             "/api/jobs/delete",
             "/api/discovery",
+            "/api/tailoring",
+            "/api/tailoring/job",
         }:
             self._send_json(404, {"error": "Not found"})
             return
@@ -829,6 +1011,21 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if path == "/api/discovery":
                 result = start_discovery(self.server, payload.get("workers", 4))
+            elif path == "/api/tailoring":
+                result = start_tailoring(
+                    self.server,
+                    payload.get("min_score", 7),
+                    payload.get("limit", 20),
+                    payload.get("validation_mode", "normal"),
+                )
+            elif path == "/api/tailoring/job":
+                result = start_tailoring(
+                    self.server,
+                    min_score=1,
+                    limit=1,
+                    validation_mode=payload.get("validation_mode", "normal"),
+                    target_url=payload.get("url"),
+                )
             elif path == "/api/jobs/applied":
                 result = mark_job_applied(payload.get("url", ""))
             elif path == "/api/jobs/delete":
@@ -838,12 +1035,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
         except sqlite3.Error as exc:
             log.exception("Could not import external job")
             self._send_json(500, {"error": f"Database error: {exc}"})
             return
 
-        if path == "/api/discovery":
+        if path in {"/api/discovery", "/api/tailoring", "/api/tailoring/job"}:
             self._send_json(202, result)
             return
 

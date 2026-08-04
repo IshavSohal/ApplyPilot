@@ -249,6 +249,7 @@ _PENDING_SQL: dict[str, str] = {
     "tailor": (
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
         "AND full_description IS NOT NULL "
+        "AND applied_at IS NULL "
         "AND tailored_resume_path IS NULL "
         "AND COALESCE(tailor_attempts, 0) < 5"
     ),

@@ -11,8 +11,8 @@ normal  -- banned words = warnings only; fabrication/structure = errors (default
 lenient -- banned words ignored; only fabrication and required structure checked
 """
 
-import re
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +96,28 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+def _canonical_source_text(value: object) -> str:
+    """Normalize LaTeX or plain text for conservative source membership checks."""
+    text = str(value or "").lower().replace("\\&", "and")
+    text = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^]]*\])?", " ", text)
+    text = text.replace("&", "and")
+    return re.sub(r"[^a-z0-9+#.]+", " ", text).strip()
+
+
+def _source_contains(source: str, claim: object) -> bool:
+    words = _canonical_source_text(claim).split()
+    if not words:
+        return True
+    normalized_source = _canonical_source_text(source)
+    return all(word in normalized_source.split() for word in words)
+
+
+def validate_json_fields(
+    data: dict,
+    profile: dict,
+    mode: str = "normal",
+    original_text: str = "",
+) -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -114,52 +135,124 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "skills", "experience", "projects", "education"):
-        if key not in data or not data[key]:
+    for key in ("keywords", "skills", "experience", "projects", "education"):
+        if key not in data or data[key] in (None, "", {}):
             errors.append(f"Missing required field: {key}")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
+    keyword_groups = data.get("keywords")
+    required_keyword_groups = {
+        "must_have_technical",
+        "preferred_technical",
+        "responsibility_action",
+        "domain_product",
+    }
+    if not isinstance(keyword_groups, dict) or not required_keyword_groups.issubset(keyword_groups):
+        errors.append("Keywords must include all four required groups")
+    education_entries = data.get("education")
+    if not isinstance(education_entries, list) or not education_entries or not all(
+        isinstance(entry, dict) and entry.get("institution") and entry.get("degree")
+        for entry in education_entries
+    ):
+        errors.append("Education must be a non-empty list of structured source entries")
+
     # Collect all text for bulk checks
     all_text_parts: list[str] = []
 
-    # Skills: check for fabrication (always enforced)
+    # Exactly five source entities, with stable unique IDs.
+    experience = data["experience"] if isinstance(data["experience"], list) else []
+    projects = data["projects"] if isinstance(data["projects"], list) else []
+    entities = experience + projects
+    if len(entities) != 5:
+        errors.append(f"Expected exactly 5 resume entities, received {len(entities)}")
+    entity_ids = [str(entry.get("entity_id", "")).strip() for entry in entities if isinstance(entry, dict)]
+    if any(not entity_id for entity_id in entity_ids):
+        errors.append("Every selected entity must have an entity_id")
+    if len(entity_ids) != len(set(entity_ids)):
+        errors.append("Selected entity IDs must be unique")
+    if not experience:
+        errors.append("At least one professional experience is required")
+
+    for entry in experience:
+        if not isinstance(entry, dict) or not entry.get("role") or not entry.get("company"):
+            errors.append("Every experience requires role and company fields")
+    for entry in projects:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            errors.append("Every project requires a name field")
+
+    for entry in entities:
+        bullets = entry.get("bullets", []) if isinstance(entry, dict) else []
+        if not isinstance(bullets, list) or not 1 <= len(bullets) <= 4:
+            errors.append(f"Entity '{entry.get('entity_id', '?')}' must contain 1-4 bullets")
+        elif len(bullets) < 3:
+            warnings.append(f"Entity '{entry.get('entity_id', '?')}' contains fewer than 3 bullets")
+
+    # Skills: source-only, using profile boundary plus the uploaded resume itself.
     if isinstance(data["skills"], dict):
-        skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
+        allowed_skills = _build_skills_set(profile)
+        skill_values: list[str] = []
+        for values in data["skills"].values():
+            if isinstance(values, list):
+                skill_values.extend(str(value).strip() for value in values)
+            else:
+                skill_values.extend(value.strip() for value in str(values).split(","))
+        skills_text = " ".join(skill_values).lower()
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
+        for skill in skill_values:
+            if not skill:
+                continue
+            if skill.lower() not in allowed_skills and original_text and not _source_contains(original_text, skill):
+                errors.append(f"Unsupported skill: '{skill}'")
 
-    # Experience: preserved companies must be present (always enforced)
+    # Experience/project identity must be grounded in the source resume.
     resume_facts = profile.get("resume_facts", {})
-    preserved_companies = resume_facts.get("preserved_companies", [])
-
-    if isinstance(data["experience"], list):
-        for company in preserved_companies:
-            has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
-            )
-            if not has_company:
-                errors.append(f"Company '{company}' missing from experience")
-        for entry in data["experience"]:
+    if experience:
+        for entry in experience:
+            company = entry.get("company") or entry.get("header", "")
+            if original_text and company and not _source_contains(original_text, company):
+                errors.append(f"Experience company is not supported by the master resume: '{company}'")
+            for field in ("role", "dates"):
+                value = entry.get(field)
+                if original_text and value and not _source_contains(original_text, value):
+                    errors.append(f"Experience {field} is not supported by the master resume: '{value}'")
             for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+                all_text_parts.append(str(b.get("text", "")) if isinstance(b, dict) else str(b))
 
     # Projects: collect bullets
-    if isinstance(data["projects"], list):
-        for entry in data["projects"]:
+    if projects:
+        for entry in projects:
+            name = entry.get("name") or entry.get("header", "")
+            if original_text and name and not _source_contains(original_text, name):
+                errors.append(f"Project is not supported by the master resume: '{name}'")
+            dates = entry.get("dates")
+            if original_text and dates and not _source_contains(original_text, dates):
+                errors.append(f"Project dates are not supported by the master resume: '{dates}'")
             for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+                all_text_parts.append(str(b.get("text", "")) if isinstance(b, dict) else str(b))
 
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
     if preserved_school:
         edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
+        if not _source_contains(edu, preserved_school):
             errors.append(f"Education '{preserved_school}' missing")
+
+    # All generated numbers must already occur somewhere in the source resume.
+    if original_text:
+        # LaTeX escapes percent signs (``44\%``), while selected source bullets
+        # are converted to plain text (``44%``) before reaching this validator.
+        # Normalize the source first so an unchanged metric is not mistaken for
+        # a fabricated one.
+        normalized_source = original_text.replace(r"\%", "%")
+        source_numbers = set(re.findall(r"\b\d[\d.,]*(?:%|[kKmMbB]\+?)?", normalized_source))
+        generated_numbers = set(re.findall(r"\b\d[\d.,]*(?:%|[kKmMbB]\+?)?", " ".join(all_text_parts)))
+        for number in sorted(generated_numbers - source_numbers):
+            errors.append(f"Unsupported metric or number: '{number}'")
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()

@@ -523,6 +523,22 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
         complete_discovery,
     )
 
+    def complete_tailoring(server, min_score, limit, validation_mode, target_url):
+        with server.tailoring_lock:
+            server.tailoring_state = {
+                **server.tailoring_state,
+                "status": "complete",
+                "result": {"approved": 2, "failed": 1, "errors": 0},
+                "target_url": target_url,
+                "finished_at": "2026-07-29T15:05:00+00:00",
+            }
+
+    monkeypatch.setattr(
+        dashboard_server,
+        "_execute_tailoring",
+        complete_tailoring,
+    )
+
     server = DashboardHTTPServer(
         ("127.0.0.1", 0),
         DashboardRequestHandler,
@@ -547,6 +563,32 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
         with urllib.request.urlopen(f"{base_url}/api/jobs/status?{query}") as response:
             status = json.load(response)
             assert status["status"] == "pending"
+
+        connection = get_connection(db_path)
+        connection.execute(
+            "UPDATE jobs SET full_description = ?, fit_score = 4 WHERE url = ?",
+            ("A complete job description suitable for tailoring", result["url"]),
+        )
+        connection.commit()
+
+        individual_tailoring_request = urllib.request.Request(
+            f"{base_url}/api/tailoring/job",
+            data=json.dumps({"url": result["url"], "validation_mode": "normal"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(individual_tailoring_request) as response:
+            individual = json.load(response)
+            assert response.status == 202
+            assert individual["target_url"] == result["url"]
+
+        for _ in range(20):
+            with urllib.request.urlopen(f"{base_url}/api/tailoring/status") as response:
+                individual = json.load(response)
+            if individual["status"] == "complete":
+                break
+            time.sleep(0.01)
+        assert individual["target_url"] == result["url"]
 
         applied_request = urllib.request.Request(
             f"{base_url}/api/jobs/applied",
@@ -604,6 +646,29 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
                 break
             time.sleep(0.01)
         assert discovery["result"] == {"new": 3, "existing": 7}
+
+        tailoring_request = urllib.request.Request(
+            f"{base_url}/api/tailoring",
+            data=json.dumps(
+                {"min_score": 7, "limit": 20, "validation_mode": "normal"}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(tailoring_request) as response:
+            tailoring = json.load(response)
+            assert response.status == 202
+            assert tailoring["status"] == "running"
+
+        for _ in range(20):
+            with urllib.request.urlopen(
+                f"{base_url}/api/tailoring/status"
+            ) as response:
+                tailoring = json.load(response)
+            if tailoring["status"] == "complete":
+                break
+            time.sleep(0.01)
+        assert tailoring["result"] == {"approved": 2, "failed": 1, "errors": 0}
     finally:
         server.shutdown()
         server.server_close()
@@ -723,8 +788,20 @@ def test_dashboard_settings_api(settings_files) -> None:
 def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "dashboard.db")
     import_external_job("https://example.com/jobs/active", connection)
+    connection.execute(
+        "UPDATE jobs SET full_description = ? WHERE url = ?",
+        ("Complete job description", "https://example.com/jobs/active"),
+    )
     applied = import_external_job("https://example.com/jobs/done", connection)
     mark_job_applied(applied["url"], connection)
+    connection.execute(
+        "UPDATE jobs SET tailored_resume_path = ? WHERE url = ?",
+        (
+            str(tmp_path / "Example_Engineer_Tailored_Resume.tex"),
+            applied["url"],
+        ),
+    )
+    connection.commit()
 
     import applypilot.view as view
 
@@ -745,6 +822,14 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "filterSource(this.value)" in html
     assert "Run Discovery" in html
     assert "/api/discovery/status" in html
+    assert "Run Tailoring" in html
+    assert "/api/tailoring/status" in html
+    assert "Tailored resume" in html
+    assert "Resume PDF" in html
+    assert "kind=tex" in html
+    assert "kind=report" in html
+    assert 'class="tailor-job-btn"' in html
+    assert "/api/tailoring/job" in html
     assert 'data-view="dashboard"' in html
     assert 'data-view="profile"' in html
     assert "Profile and Preferences" in html

@@ -92,6 +92,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Discovery stage (smart_extract / job_search)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
@@ -148,6 +149,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
@@ -289,13 +291,13 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
+        "AND applied_at IS NULL AND tailored_resume_path IS NULL"
     ).fetchone()[0]
 
     stats["tailor_exhausted"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(tailor_attempts, 0) >= 5 "
-        "AND tailored_resume_path IS NULL"
+        "AND applied_at IS NULL AND tailored_resume_path IS NULL"
     ).fetchone()[0]
 
     # Cover letter stage
@@ -390,7 +392,8 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            "AND applied_at IS NULL AND tailored_resume_path IS NULL "
+            "AND COALESCE(tailor_attempts, 0) < 5"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (

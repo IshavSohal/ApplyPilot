@@ -368,6 +368,9 @@ def _fetch_apple_jobs(company: dict, terms: list[str]) -> list[dict]:
                     "location": location,
                     "url": f"https://jobs.apple.com/en-us/details/{job_id}/{slug}",
                     "content": item.get("jobSummary"),
+                    # Search results expose only the Summary section.  The
+                    # remaining Apple sections live on the detail page.
+                    "content_is_full": False,
                     "posted_at": item.get("postDateInGMT") or item.get("postingDate"),
                 }
             if len(results) < 20:
@@ -504,6 +507,7 @@ def _process_company(
         rows.append((
             url,
             title or None,
+            name,
             None,  # salary -- Greenhouse doesn't expose this on the boards API
             short_desc,
             location,
@@ -523,9 +527,9 @@ def _process_company(
     for row in rows:
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, "
                 "strategy, discovered_at, full_description, application_url, "
-                "detail_scraped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "detail_scraped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
             new += 1
@@ -574,7 +578,7 @@ def _process_bigtech_company(
 
     result["found"] = len(raw_jobs)
     now = datetime.now(timezone.utc).isoformat()
-    rows: list[tuple] = []
+    rows: list[tuple[tuple, str, bool]] = []
     for job in raw_jobs:
         title = job.get("title") or ""
         location = job.get("location") or None
@@ -586,41 +590,52 @@ def _process_bigtech_company(
         if not url:
             continue
 
-        full_description = _normalize_description(job.get("content"))
+        description = _normalize_description(job.get("content"))
+        content_is_full = job.get("content_is_full", True)
+        full_description = description if content_is_full else ""
         detail_scraped_at = now if len(full_description) > 200 else None
-        rows.append(
-            (
-                url,
-                title or None,
-                None,
-                full_description[:500] if full_description else None,
-                location,
-                name,
-                f"{provider}_careers",
-                now,
-                job.get("posted_at"),
-                full_description if detail_scraped_at else None,
-                url,
-                detail_scraped_at,
-            )
+        row = (
+            url,
+            title or None,
+            name,
+            None,
+            description[:500] if description else None,
+            location,
+            name,
+            f"{provider}_careers",
+            now,
+            job.get("posted_at"),
+            full_description if detail_scraped_at else None,
+            url,
+            detail_scraped_at,
         )
+        rows.append((row, description, content_is_full))
 
     result["kept"] = len(rows)
     conn = get_connection()
-    for row in rows:
+    for row, description, content_is_full in rows:
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, "
                 "strategy, discovered_at, posted_at, full_description, application_url, "
-                "detail_scraped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "detail_scraped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
             result["new"] += 1
         except sqlite3.IntegrityError:
+            # Older versions stored Apple's search-result summary as the full
+            # description and marked the job enriched. Make those rows pending
+            # again, without overwriting a genuinely enriched description.
+            if not content_is_full:
+                conn.execute(
+                    "UPDATE jobs SET full_description = NULL, detail_scraped_at = NULL "
+                    "WHERE url = ? AND full_description = ?",
+                    (row[0], description),
+                )
             conn.execute(
                 "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "
                 "location = COALESCE(?, location) WHERE url = ?",
-                (row[8], row[4], row[0]),
+                (row[9], row[5], row[0]),
             )
             result["existing"] += 1
     conn.commit()
