@@ -12,7 +12,9 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import uuid
 import webbrowser
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,8 +35,14 @@ MAX_RESUME_BYTES = 1_000_000
 # JSON may expand control-heavy text to six bytes per source byte.
 MAX_RESUME_REQUEST_BYTES = 7_000_000
 MAX_URL_LENGTH = 2048
+MAX_TAILORING_QUEUE_SIZE = 100
+TAILORING_HISTORY_SIZE = 20
 _settings_write_lock = threading.Lock()
 _DELETE_SETTING = {"__applypilot_delete__": True}
+
+
+class TailoringQueueFullError(RuntimeError):
+    """Raised when the session-only tailoring queue reaches its bound."""
 
 
 def _is_nonnegative_finite_number(value: object) -> bool:
@@ -703,41 +711,106 @@ def start_discovery(server: DashboardHTTPServer, workers: int = 4) -> dict:
     return state
 
 
-def _execute_tailoring(
-    server: DashboardHTTPServer,
-    min_score: int,
-    limit: int,
-    validation_mode: str,
-    target_url: str | None,
-) -> None:
-    """Run resume tailoring in the dashboard's bounded background worker."""
+def _tailoring_target_error(target_url: str) -> str | None:
+    """Return why a queued job cannot be tailored, or None when eligible."""
+    row = get_connection().execute(
+        "SELECT applied_at, full_description, tailored_resume_path, "
+        "COALESCE(tailor_attempts, 0) AS tailor_attempts "
+        "FROM jobs WHERE url = ?",
+        (target_url,),
+    ).fetchone()
+    if not row:
+        return "Job not found"
+    if row["applied_at"]:
+        return "This job is already marked as applied"
+    if not row["full_description"]:
+        return "This job needs a full description before tailoring"
+    if row["tailored_resume_path"]:
+        return "This job already has a tailored resume"
+    if row["tailor_attempts"] >= 5:
+        return "This job has reached the tailoring attempt limit"
+    return None
+
+
+def _tailoring_status_locked(server: DashboardHTTPServer) -> dict:
+    """Build a JSON-safe queue snapshot while ``tailoring_lock`` is held."""
+    if server.tailoring_current is not None:
+        status = "running"
+    elif server.tailoring_queue:
+        status = "queued"
+    else:
+        status = "idle"
+
+    queued = []
+    for position, request in enumerate(server.tailoring_queue, start=1):
+        queued.append({**copy.deepcopy(request), "queue_position": position})
+
+    return {
+        "status": status,
+        "current": copy.deepcopy(server.tailoring_current),
+        "queued": queued,
+        "queue_length": len(queued),
+        "recent": copy.deepcopy(list(server.tailoring_recent)),
+    }
+
+
+def tailoring_status(server: DashboardHTTPServer) -> dict:
+    """Return the current session-only tailoring queue state."""
+    with server.tailoring_lock:
+        return _tailoring_status_locked(server)
+
+
+def _run_tailoring_request(request: dict) -> tuple[str, dict | None, str | None]:
+    """Execute one request and convert stale individual jobs into skips."""
+    target_url = request["target_url"]
+    if target_url:
+        reason = _tailoring_target_error(target_url)
+        if reason:
+            return "skipped", {"reason": reason}, None
+
     try:
         from applypilot.scoring.tailor import run_tailoring
 
         result = run_tailoring(
-            min_score=min_score,
-            limit=limit,
-            validation_mode=validation_mode,
+            min_score=request["min_score"],
+            limit=request["limit"],
+            validation_mode=request["validation_mode"],
             target_url=target_url,
         )
+        return "complete", result, None
     except Exception as exc:
-        log.exception("Dashboard tailoring failed")
-        with server.tailoring_lock:
-            server.tailoring_state = {
-                **server.tailoring_state,
-                "status": "error",
-                "error": str(exc)[:500],
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            }
-        return
+        log.exception("Dashboard tailoring request failed")
+        return "error", None, str(exc)[:500]
 
-    with server.tailoring_lock:
-        server.tailoring_state = {
-            **server.tailoring_state,
-            "status": "complete",
-            "result": result,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        }
+
+def _drain_tailoring_queue(server: DashboardHTTPServer) -> None:
+    """Process queued tailoring requests in FIFO order on one worker thread."""
+    while True:
+        with server.tailoring_lock:
+            if server.tailoring_stopping or not server.tailoring_queue:
+                server.tailoring_processor_running = False
+                server.tailoring_current = None
+                return
+
+            request = server.tailoring_queue.popleft()
+            request["status"] = "running"
+            request["started_at"] = datetime.now(timezone.utc).isoformat()
+            server.tailoring_current = request
+
+        try:
+            status, result, error = _run_tailoring_request(request)
+        except Exception as exc:
+            log.exception("Dashboard tailoring queue worker failed")
+            status, result, error = "error", None, str(exc)[:500]
+        finished_at = datetime.now(timezone.utc).isoformat()
+
+        with server.tailoring_lock:
+            request["status"] = status
+            request["result"] = result
+            request["error"] = error
+            request["finished_at"] = finished_at
+            server.tailoring_recent.appendleft(copy.deepcopy(request))
+            server.tailoring_current = None
 
 
 def start_tailoring(
@@ -747,7 +820,7 @@ def start_tailoring(
     validation_mode: str = "normal",
     target_url: str | None = None,
 ) -> dict:
-    """Start one background tailoring batch, rejecting overlapping batches."""
+    """Enqueue a tailoring request for the dashboard's single FIFO worker."""
     if not isinstance(min_score, int) or isinstance(min_score, bool) or not 1 <= min_score <= 10:
         raise ValueError("Minimum score must be an integer between 1 and 10")
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
@@ -758,48 +831,76 @@ def start_tailoring(
         if not isinstance(target_url, str) or not target_url.strip():
             raise ValueError("Job URL is required")
         target_url = target_url.strip()
-        row = get_connection().execute(
-            "SELECT applied_at, full_description, tailored_resume_path, "
-            "COALESCE(tailor_attempts, 0) AS tailor_attempts "
-            "FROM jobs WHERE url = ?",
-            (target_url,),
-        ).fetchone()
-        if not row:
-            raise ValueError("Job not found")
-        if row["applied_at"]:
-            raise ValueError("This job is already marked as applied")
-        if not row["full_description"]:
-            raise ValueError("This job needs a full description before tailoring")
-        if row["tailored_resume_path"]:
-            raise ValueError("This job already has a tailored resume")
-        if row["tailor_attempts"] >= 5:
-            raise ValueError("This job has reached the tailoring attempt limit")
+        reason = _tailoring_target_error(target_url)
+        if reason:
+            raise ValueError(reason)
 
     with server.tailoring_lock:
-        if server.tailoring_state["status"] == "running":
-            raise RuntimeError("Another tailoring run is already in progress")
-        server.tailoring_state = {
-            "status": "running",
+        if server.tailoring_stopping:
+            raise RuntimeError("The tailoring queue is shutting down")
+
+        outstanding = [
+            request
+            for request in ([server.tailoring_current] + list(server.tailoring_queue))
+            if request is not None
+        ]
+        if target_url:
+            duplicate = next(
+                (request for request in outstanding if request["target_url"] == target_url),
+                None,
+            )
+            if duplicate:
+                position = 0
+                if duplicate["status"] == "queued":
+                    position = list(server.tailoring_queue).index(duplicate) + 1
+                return {
+                    **copy.deepcopy(duplicate),
+                    "deduplicated": True,
+                    "queue_position": position,
+                }
+        elif any(request["kind"] == "batch" for request in outstanding):
+            raise RuntimeError("A bulk tailoring request is already active or queued")
+
+        if len(server.tailoring_queue) >= MAX_TAILORING_QUEUE_SIZE:
+            raise TailoringQueueFullError("The tailoring queue is full")
+
+        request = {
+            "id": uuid.uuid4().hex,
+            "kind": "job" if target_url else "batch",
+            "status": "queued",
             "min_score": min_score,
             "limit": limit,
             "validation_mode": validation_mode,
             "target_url": target_url,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": None,
             "finished_at": None,
             "result": None,
             "error": None,
         }
-        state = dict(server.tailoring_state)
+        server.tailoring_queue.append(request)
+        queue_position = len(server.tailoring_queue)
+        should_start_processor = not server.tailoring_processor_running
+        if should_start_processor:
+            server.tailoring_processor_running = True
+        response = {
+            **copy.deepcopy(request),
+            "deduplicated": False,
+            "queue_position": queue_position,
+        }
 
-    server.tailoring_pool.submit(
-        _execute_tailoring,
-        server,
-        min_score,
-        limit,
-        validation_mode,
-        target_url,
-    )
-    return state
+    if should_start_processor:
+        try:
+            server.tailoring_pool.submit(_drain_tailoring_queue, server)
+        except RuntimeError:
+            with server.tailoring_lock:
+                server.tailoring_processor_running = False
+                try:
+                    server.tailoring_queue.remove(request)
+                except ValueError:
+                    pass
+            raise
+    return response
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -831,22 +932,19 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             "error": None,
         }
         self.tailoring_lock = threading.Lock()
-        self.tailoring_state = {
-            "status": "idle",
-            "min_score": 7,
-            "limit": 20,
-            "validation_mode": "normal",
-            "target_url": None,
-            "started_at": None,
-            "finished_at": None,
-            "result": None,
-            "error": None,
-        }
+        self.tailoring_queue: deque[dict] = deque()
+        self.tailoring_current: dict | None = None
+        self.tailoring_recent: deque[dict] = deque(maxlen=TAILORING_HISTORY_SIZE)
+        self.tailoring_processor_running = False
+        self.tailoring_stopping = False
         self.render_lock = threading.Lock()
 
     def server_close(self) -> None:
         self.enrichment_pool.shutdown(wait=False, cancel_futures=True)
         self.discovery_pool.shutdown(wait=False, cancel_futures=True)
+        with self.tailoring_lock:
+            self.tailoring_stopping = True
+            self.tailoring_queue.clear()
         self.tailoring_pool.shutdown(wait=False, cancel_futures=True)
         super().server_close()
 
@@ -921,9 +1019,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/tailoring/status":
-            with self.server.tailoring_lock:
-                state = dict(self.server.tailoring_state)
-            self._send_json(200, state)
+            self._send_json(200, tailoring_status(self.server))
             return
 
         if parsed.path == "/api/settings":
@@ -1034,6 +1130,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 result = import_external_job(payload.get("url", ""))
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
+            return
+        except TailoringQueueFullError as exc:
+            self._send_json(429, {"error": str(exc)})
             return
         except RuntimeError as exc:
             self._send_json(409, {"error": str(exc)})

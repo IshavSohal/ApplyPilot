@@ -1039,6 +1039,7 @@ const discoveryButton = document.getElementById('discovery-button');
 const discoveryStatus = document.getElementById('discovery-status');
 const tailoringButton = document.getElementById('tailoring-button');
 const tailoringStatus = document.getElementById('tailoring-status');
+let tailoringPollTimer = null;
 
 function setImportStatus(message, isError = false) {{
   importStatus.textContent = message;
@@ -1165,44 +1166,78 @@ discoveryButton.addEventListener('click', async () => {{
 
 refreshDiscoveryStatus();
 
+function scheduleTailoringRefresh() {{
+  if (tailoringPollTimer !== null) window.clearTimeout(tailoringPollTimer);
+  tailoringPollTimer = window.setTimeout(() => {{
+    tailoringPollTimer = null;
+    refreshTailoringStatus();
+  }}, 2000);
+}}
+
 function renderTailoringStatus(state) {{
-  tailoringStatus.classList.toggle('error', state.status === 'error');
+  const current = state.current || null;
+  const queued = Array.isArray(state.queued) ? state.queued : [];
+  const recent = Array.isArray(state.recent) ? state.recent : [];
+  const bulkOutstanding =
+    (current && current.kind === 'batch') || queued.some(request => request.kind === 'batch');
   const jobButtons = document.querySelectorAll('.tailor-job-btn');
-  if (state.status === 'running') {{
-    tailoringButton.disabled = true;
-    tailoringButton.textContent = 'Tailoring running...';
-    jobButtons.forEach(button => {{
+  if (!current && !queued.length && tailoringPollTimer !== null) {{
+    window.clearTimeout(tailoringPollTimer);
+    tailoringPollTimer = null;
+  }}
+  tailoringStatus.classList.remove('error');
+
+  tailoringButton.disabled = Boolean(bulkOutstanding);
+  tailoringButton.textContent = bulkOutstanding ? 'Bulk tailoring queued...' : 'Run Tailoring';
+  jobButtons.forEach(button => {{
+    const active = current && current.target_url === button.dataset.jobUrl;
+    const pending = queued.find(request => request.target_url === button.dataset.jobUrl);
+    if (active) {{
       button.disabled = true;
-      if (state.target_url && button.dataset.jobUrl === state.target_url) {{
-        button.textContent = 'Tailoring...';
-      }}
-    }});
-    tailoringStatus.textContent = state.target_url
-      ? 'Tailoring the selected job, compiling its PDF, and auditing layout.'
-      : 'Selecting content, compiling PDFs, and auditing layout. You can keep using the dashboard.';
-    window.setTimeout(refreshTailoringStatus, 2000);
+      button.textContent = 'Tailoring...';
+    }} else if (pending) {{
+      button.disabled = true;
+      button.textContent = `Queued (#${{pending.queue_position}})`;
+    }} else {{
+      button.disabled = false;
+      button.textContent = 'Tailor';
+    }}
+  }});
+
+  if (current || queued.length) {{
+    const waiting = queued.length;
+    if (current && current.kind === 'job') {{
+      tailoringStatus.textContent =
+        `Tailoring the selected job; ${{waiting}} request${{waiting === 1 ? '' : 's'}} queued.`;
+    }} else if (current) {{
+      tailoringStatus.textContent =
+        `Running bulk tailoring; ${{waiting}} request${{waiting === 1 ? '' : 's'}} queued.`;
+    }} else {{
+      tailoringStatus.textContent =
+        `${{waiting}} tailoring request${{waiting === 1 ? '' : 's'}} queued.`;
+    }}
+    scheduleTailoringRefresh();
     return;
   }}
 
-  tailoringButton.disabled = false;
-  tailoringButton.textContent = 'Run Tailoring';
-  jobButtons.forEach(button => {{
-    button.disabled = false;
-    button.textContent = 'Tailor';
-  }});
-  if (state.status === 'complete') {{
-    const result = state.result || {{}};
+  const latest = recent[0] || null;
+  if (latest && latest.status === 'complete') {{
+    const result = latest.result || {{}};
     tailoringStatus.textContent =
       `Finished: ${{result.approved || 0}} tailored, ${{result.failed || 0}} failed, ${{result.errors || 0}} errors.`;
-    if (sessionStorage.getItem('applypilotTailoringRunning')) {{
-      sessionStorage.removeItem('applypilotTailoringRunning');
-      window.setTimeout(() => window.location.reload(), 1000);
-    }}
-  }} else if (state.status === 'error') {{
-    sessionStorage.removeItem('applypilotTailoringRunning');
-    tailoringStatus.textContent = 'Tailoring failed: ' + (state.error || 'unknown error');
+  }} else if (latest && latest.status === 'skipped') {{
+    tailoringStatus.textContent =
+      'Skipped queued tailoring: ' + ((latest.result || {{}}).reason || 'job is no longer eligible');
+  }} else if (latest && latest.status === 'error') {{
+    tailoringStatus.classList.add('error');
+    tailoringStatus.textContent = 'Tailoring failed: ' + (latest.error || 'unknown error');
   }} else {{
     tailoringStatus.textContent = '';
+  }}
+
+  if (sessionStorage.getItem('applypilotTailoringPending')) {{
+    sessionStorage.removeItem('applypilotTailoringPending');
+    window.setTimeout(() => window.location.reload(), 1000);
   }}
 }}
 
@@ -1213,9 +1248,9 @@ async function refreshTailoringStatus() {{
     if (!response.ok) throw new Error(state.error || 'Could not check tailoring');
     renderTailoringStatus(state);
   }} catch (error) {{
-    tailoringButton.disabled = false;
     tailoringStatus.classList.add('error');
     tailoringStatus.textContent = error.message;
+    scheduleTailoringRefresh();
   }}
 }}
 
@@ -1228,10 +1263,10 @@ tailoringButton.addEventListener('click', async () => {{
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{min_score: 7, limit: 20, validation_mode: 'normal'}})
     }});
-    const state = await response.json();
-    if (!response.ok) throw new Error(state.error || 'Could not start tailoring');
-    sessionStorage.setItem('applypilotTailoringRunning', 'true');
-    renderTailoringStatus(state);
+    const request = await response.json();
+    if (!response.ok) throw new Error(request.error || 'Could not start tailoring');
+    sessionStorage.setItem('applypilotTailoringPending', 'true');
+    await refreshTailoringStatus();
   }} catch (error) {{
     tailoringButton.disabled = false;
     tailoringStatus.classList.add('error');
@@ -1250,10 +1285,10 @@ document.querySelectorAll('.tailor-job-btn').forEach(button => {{
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{url: button.dataset.jobUrl, validation_mode: 'normal'}})
       }});
-      const state = await response.json();
-      if (!response.ok) throw new Error(state.error || 'Could not tailor this job');
-      sessionStorage.setItem('applypilotTailoringRunning', 'true');
-      renderTailoringStatus(state);
+      const request = await response.json();
+      if (!response.ok) throw new Error(request.error || 'Could not tailor this job');
+      sessionStorage.setItem('applypilotTailoringPending', 'true');
+      await refreshTailoringStatus();
     }} catch (error) {{
       button.disabled = false;
       button.textContent = 'Tailor';

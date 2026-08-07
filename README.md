@@ -33,6 +33,7 @@ applypilot init          # one-time setup: resume, profile, preferences, API key
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
+applypilot run score --score-workers 3  # parallel scoring with global rate pacing
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
@@ -119,7 +120,8 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `LLM_RPM`, `LLM_TPM`, and `CAPSOLVER_API_KEY`
+(optional). Hosted LLMs default to 15 RPM; set either rate limit to `0` to disable it.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -137,7 +139,10 @@ Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrap
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
 
 ### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+AI scores every job 1-10 against your profile. Scoring uses three concurrent requests by default while a shared limiter
+paces calls across all workers. Use `--score-workers` to change concurrency and `LLM_RPM`/`LLM_TPM` to match your
+provider quota. 9-10 = strong match, 7-8 = good, and 6 = moderate. Valid scores from 1-5 are automatically removed;
+score 0 is treated as an error and preserved for retry. Only jobs above your threshold proceed to tailoring.
 
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
@@ -173,7 +178,9 @@ applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
 applypilot run [stages...]              # Run pipeline stages (or 'all')
 applypilot run --workers 4              # Parallel discovery/enrichment
-applypilot run --stream                 # Concurrent stages (streaming mode)
+applypilot run --score-workers 3        # Parallel scoring (paced by LLM_RPM/LLM_TPM)
+applypilot run                          # Concurrent stages (streaming mode, default)
+applypilot run --no-stream              # Run stages sequentially
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)

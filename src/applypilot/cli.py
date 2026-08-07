@@ -85,7 +85,16 @@ def run(
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
-    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
+    score_workers: int = typer.Option(
+        3,
+        "--score-workers",
+        help="Concurrent scoring requests (paced by LLM_RPM/LLM_TPM).",
+    ),
+    stream: bool = typer.Option(
+        True,
+        "--stream/--no-stream",
+        help="Run stages concurrently (default). Use --no-stream for sequential execution.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
     validation: str = typer.Option(
         "normal",
@@ -129,12 +138,17 @@ def run(
         )
         raise typer.Exit(code=1)
 
+    if score_workers < 1:
+        console.print("[red]--score-workers must be at least 1.[/red]")
+        raise typer.Exit(code=1)
+
     result = run_pipeline(
         stages=stage_list,
         min_score=min_score,
         dry_run=dry_run,
         stream=stream,
         workers=workers,
+        score_workers=score_workers,
         validation_mode=validation,
     )
 

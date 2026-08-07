@@ -3,8 +3,8 @@
 Runs pipeline stages in sequence or concurrently (streaming mode).
 
 Usage (via CLI):
-    applypilot run                        # all stages, sequential
-    applypilot run --stream               # all stages, concurrent
+    applypilot run                        # all stages, concurrent (default)
+    applypilot run --no-stream            # all stages, sequential
     applypilot run discover enrich        # specific stages
     applypilot run score tailor cover     # LLM-only stages
     applypilot run --dry-run              # preview without executing
@@ -35,7 +35,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (Greenhouse boards only)"},
+    "discover": {"desc": "Job discovery (Greenhouse + Workday + big-tech)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -61,7 +61,7 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1) -> dict:
     """Stage: direct-employer job discovery."""
-    stats: dict = {"greenhouse": None, "bigtech": None}
+    stats: dict = {"greenhouse": None, "workday": None, "bigtech": None}
     totals = {
         key: 0
         for key in ("found", "kept", "new", "existing", "errors", "companies")
@@ -79,6 +79,18 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Greenhouse error:[/red] {e}")
         stats["greenhouse"] = f"error: {e}"
 
+    console.print("  [cyan]Workday corporate scraper...[/cyan]")
+    try:
+        from applypilot.discovery.workday import run_workday_discovery
+        result = run_workday_discovery(workers=workers)
+        stats["workday"] = "ok"
+        for key in totals:
+            totals[key] += result.get(key, 0)
+    except Exception as e:
+        log.error("Workday scraper failed: %s", e)
+        console.print(f"  [red]Workday error:[/red] {e}")
+        stats["workday"] = f"error: {e}"
+
     console.print("  [cyan]Big-tech career sites crawl...[/cyan]")
     try:
         from applypilot.discovery.greenhouse import run_bigtech_discovery
@@ -92,9 +104,6 @@ def _run_discover(workers: int = 1) -> dict:
         stats["bigtech"] = f"error: {e}"
 
     stats.update(totals)
-
-    # Workday discovery is intentionally disabled.
-    stats["workday"] = "disabled"
 
     # Smart extract
     # console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
@@ -121,11 +130,11 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(workers: int = 3) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        run_scoring(workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
@@ -285,6 +294,7 @@ def _run_stage_streaming(
     stop_event: threading.Event,
     min_score: int = 7,
     workers: int = 1,
+    score_workers: int = 3,
     validation_mode: str = "normal",
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
@@ -300,6 +310,8 @@ def _run_stage_streaming(
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
+    if stage == "score":
+        kwargs["workers"] = score_workers
 
     upstream = _UPSTREAM[stage]
 
@@ -348,7 +360,7 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    score_workers: int = 3, validation_mode: str = "normal") -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -371,6 +383,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
+            if name == "score":
+                kwargs["workers"] = score_workers
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -402,7 +416,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   score_workers: int = 3, validation_mode: str = "normal") -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -424,7 +438,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, workers, score_workers, validation_mode),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -469,8 +483,9 @@ def run_pipeline(
     stages: list[str] | None = None,
     min_score: int = 7,
     dry_run: bool = False,
-    stream: bool = False,
+    stream: bool = True,
     workers: int = 1,
+    score_workers: int = 3,
     validation_mode: str = "normal",
 ) -> dict:
     """Run pipeline stages.
@@ -479,8 +494,9 @@ def run_pipeline(
         stages: List of stage names, or None / ["all"] for full pipeline.
         min_score: Minimum fit score for tailor/cover stages.
         dry_run: If True, preview stages without executing.
-        stream: If True, run stages concurrently (streaming mode).
+        stream: If True, run stages concurrently (streaming mode). Defaults to True.
         workers: Number of parallel threads for discovery/enrichment stages.
+        score_workers: Maximum concurrent LLM requests in the scoring stage.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -489,6 +505,9 @@ def run_pipeline(
     load_env()
     ensure_dirs()
     init_db()
+
+    if score_workers < 1:
+        raise ValueError("score_workers must be at least 1")
 
     # Resolve stages
     if stages is None:
@@ -504,6 +523,7 @@ def run_pipeline(
     ))
     console.print(f"  Min score:  {min_score}")
     console.print(f"  Workers:    {workers}")
+    console.print(f"  Score workers: {score_workers}")
     console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
@@ -522,9 +542,11 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
+                                score_workers=score_workers,
                                 validation_mode=validation_mode)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
+                                 score_workers=score_workers,
                                  validation_mode=validation_mode)
 
     # Summary table

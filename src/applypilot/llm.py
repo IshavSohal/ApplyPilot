@@ -11,7 +11,10 @@ LLM_MODEL env var overrides the model name for any provider.
 
 import logging
 import os
+import random
+import threading
 import time
+from collections import deque
 
 import httpx
 
@@ -92,6 +95,80 @@ _TIMEOUT = 120  # seconds
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
+_DEFAULT_HOSTED_RPM = 15
+
+
+def _env_rate_limit(name: str, default: int) -> int:
+    """Read a non-negative integer rate limit from the environment."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value < 0:
+        log.warning("Ignoring negative %s=%r; using %d", name, raw, default)
+        return default
+    return value
+
+
+class RateLimiter:
+    """Thread-safe request pacer with an optional token-per-minute budget.
+
+    RPM requests are evenly spaced instead of released in bursts. Token usage
+    is conservatively reserved for a rolling 60-second window before a request
+    starts. A zero limit disables that dimension.
+    """
+
+    def __init__(self, rpm: int = 0, tpm: int = 0) -> None:
+        self.rpm = max(0, rpm)
+        self.tpm = max(0, tpm)
+        self._request_interval = 60.0 / self.rpm if self.rpm else 0.0
+        self._next_request_at = 0.0
+        self._blocked_until = 0.0
+        self._token_reservations: deque[tuple[float, int]] = deque()
+        self._condition = threading.Condition()
+
+    def acquire(self, estimated_tokens: int = 0) -> None:
+        """Wait until both request and token budgets permit a request."""
+        tokens = max(0, estimated_tokens)
+        if self.tpm and tokens > self.tpm:
+            # A single oversized prompt can never fit the rolling budget. Let
+            # it through alone rather than deadlocking forever.
+            tokens = self.tpm
+
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                cutoff = now - 60.0
+                while self._token_reservations and self._token_reservations[0][0] <= cutoff:
+                    self._token_reservations.popleft()
+
+                wait_until = max(self._blocked_until, self._next_request_at)
+                if self.tpm and tokens:
+                    used = sum(reserved for _, reserved in self._token_reservations)
+                    if used + tokens > self.tpm and self._token_reservations:
+                        wait_until = max(wait_until, self._token_reservations[0][0] + 60.0)
+
+                delay = wait_until - now
+                if delay > 0:
+                    self._condition.wait(timeout=delay)
+                    continue
+
+                started_at = time.monotonic()
+                if self.rpm:
+                    self._next_request_at = started_at + self._request_interval
+                if self.tpm and tokens:
+                    self._token_reservations.append((started_at, tokens))
+                return
+
+    def defer(self, seconds: float) -> None:
+        """Apply a provider-requested cooldown to all waiting threads."""
+        with self._condition:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + max(0.0, seconds))
+            self._condition.notify_all()
 
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -115,6 +192,17 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        hosted_provider = base_url.startswith((_GEMINI_COMPAT_BASE, "https://api.openai.com"))
+        default_rpm = _DEFAULT_HOSTED_RPM if hosted_provider else 0
+        self._rate_limiter = RateLimiter(
+            rpm=_env_rate_limit("LLM_RPM", default_rpm),
+            tpm=_env_rate_limit("LLM_TPM", 0),
+        )
+        log.info(
+            "LLM rate limits: %s RPM, %s TPM",
+            self._rate_limiter.rpm or "unlimited",
+            self._rate_limiter.tpm or "unlimited",
+        )
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -236,15 +324,21 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
+        estimated_tokens = (
+            sum(len(str(message.get("content", ""))) for message in messages) // 4
+            + max_tokens
+        )
+
         for attempt in range(_MAX_RETRIES):
             try:
+                self._rate_limiter.acquire(estimated_tokens)
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
@@ -253,15 +347,9 @@ class LLMClient:
                     self.model,
                 )
                 self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
-                try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-                except httpx.HTTPStatusError as native_exc:
-                    raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
-                        f"Native: {native_exc.response.status_code} — "
-                        f"{native_exc.response.text[:200]}"
-                    ) from native_exc
+                # Re-enter through chat so the native request gets the same
+                # pacing, retry, and global 429 handling as every other call.
+                return self.chat(messages, temperature=temperature, max_tokens=max_tokens)
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
@@ -279,13 +367,18 @@ class LLMClient:
                     else:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
 
+                    wait += random.uniform(0.0, min(1.0, wait * 0.1))
+
                     log.warning(
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
                         "Tip: Gemini free tier = 15 RPM. Consider a paid account "
                         "or switching to a local model.",
                         resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
-                    time.sleep(wait)
+                    if resp.status_code == 429:
+                        self._rate_limiter.defer(wait)
+                    else:
+                        time.sleep(wait)
                     continue
                 raise
 
@@ -322,13 +415,16 @@ class _GeminiCompatForbidden(Exception):
 # ---------------------------------------------------------------------------
 
 _instance: LLMClient | None = None
+_instance_lock = threading.Lock()
 
 
 def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        with _instance_lock:
+            if _instance is None:
+                base_url, model, api_key = _detect_provider()
+                log.info("LLM provider: %s  model: %s", base_url, model)
+                _instance = LLMClient(base_url, model, api_key)
     return _instance

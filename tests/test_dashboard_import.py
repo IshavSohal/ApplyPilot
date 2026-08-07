@@ -27,6 +27,8 @@ from applypilot.dashboard_server import (
     save_dashboard_profile,
     save_dashboard_resume,
     save_dashboard_searches,
+    start_tailoring,
+    tailoring_status,
 )
 from applypilot.config import location_is_allowed
 from applypilot.database import get_connection, init_db
@@ -523,19 +525,12 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
         complete_discovery,
     )
 
-    def complete_tailoring(server, min_score, limit, validation_mode, target_url):
-        with server.tailoring_lock:
-            server.tailoring_state = {
-                **server.tailoring_state,
-                "status": "complete",
-                "result": {"approved": 2, "failed": 1, "errors": 0},
-                "target_url": target_url,
-                "finished_at": "2026-07-29T15:05:00+00:00",
-            }
+    def complete_tailoring(request):
+        return "complete", {"approved": 2, "failed": 1, "errors": 0}, None
 
     monkeypatch.setattr(
         dashboard_server,
-        "_execute_tailoring",
+        "_run_tailoring_request",
         complete_tailoring,
     )
 
@@ -585,10 +580,11 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
         for _ in range(20):
             with urllib.request.urlopen(f"{base_url}/api/tailoring/status") as response:
                 individual = json.load(response)
-            if individual["status"] == "complete":
+            if individual["status"] == "idle" and individual["recent"]:
                 break
             time.sleep(0.01)
-        assert individual["target_url"] == result["url"]
+        assert individual["recent"][0]["target_url"] == result["url"]
+        assert individual["recent"][0]["status"] == "complete"
 
         applied_request = urllib.request.Request(
             f"{base_url}/api/jobs/applied",
@@ -658,21 +654,187 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
         with urllib.request.urlopen(tailoring_request) as response:
             tailoring = json.load(response)
             assert response.status == 202
-            assert tailoring["status"] == "running"
+            assert tailoring["status"] == "queued"
+            assert tailoring["kind"] == "batch"
 
         for _ in range(20):
             with urllib.request.urlopen(
                 f"{base_url}/api/tailoring/status"
             ) as response:
                 tailoring = json.load(response)
-            if tailoring["status"] == "complete":
+            if (
+                tailoring["status"] == "idle"
+                and tailoring["recent"]
+                and tailoring["recent"][0]["kind"] == "batch"
+            ):
                 break
             time.sleep(0.01)
-        assert tailoring["result"] == {"approved": 2, "failed": 1, "errors": 0}
+        assert tailoring["recent"][0]["result"] == {
+            "approved": 2,
+            "failed": 1,
+            "errors": 0,
+        }
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_tailoring_queue_runs_fifo_deduplicates_and_continues_after_error(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "tailoring-queue.db"
+    conn = init_db(db_path)
+    urls = [f"https://example.com/jobs/{index}" for index in range(3)]
+    for url in urls:
+        conn.execute(
+            "INSERT INTO jobs (url, title, full_description, fit_score) "
+            "VALUES (?, 'Engineer', 'Complete description', 8)",
+            (url,),
+        )
+    conn.commit()
+    monkeypatch.setattr(
+        dashboard_server,
+        "get_connection",
+        lambda: get_connection(db_path),
+    )
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[str] = []
+    active = 0
+    max_active = 0
+    calls_lock = threading.Lock()
+
+    def execute(request):
+        nonlocal active, max_active
+        with calls_lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(request["target_url"])
+        if request["target_url"] == urls[0]:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        with calls_lock:
+            active -= 1
+        if request["target_url"] == urls[1]:
+            return "error", None, "simulated failure"
+        return "complete", {"approved": 1, "failed": 0, "errors": 0}, None
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        first = start_tailoring(server, min_score=1, limit=1, target_url=urls[0])
+        assert first["status"] == "queued"
+        assert first_started.wait(timeout=2)
+
+        second = start_tailoring(server, min_score=1, limit=1, target_url=urls[1])
+        third = start_tailoring(server, min_score=1, limit=1, target_url=urls[2])
+        duplicate = start_tailoring(server, min_score=1, limit=1, target_url=urls[1])
+
+        assert second["queue_position"] == 1
+        assert third["queue_position"] == 2
+        assert duplicate["id"] == second["id"]
+        assert duplicate["deduplicated"] is True
+        state = tailoring_status(server)
+        assert state["current"]["target_url"] == urls[0]
+        assert [item["target_url"] for item in state["queued"]] == urls[1:]
+
+        release_first.set()
+        for _ in range(100):
+            state = tailoring_status(server)
+            if state["status"] == "idle":
+                break
+            time.sleep(0.01)
+
+        assert state["status"] == "idle"
+        assert calls == urls
+        assert max_active == 1
+        statuses = {item["target_url"]: item["status"] for item in state["recent"]}
+        assert statuses == {
+            urls[0]: "complete",
+            urls[1]: "error",
+            urls[2]: "complete",
+        }
+    finally:
+        release_first.set()
+        server.server_close()
+
+
+def test_tailoring_queue_skips_job_that_becomes_ineligible(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "tailoring-stale.db"
+    conn = init_db(db_path)
+    urls = ["https://example.com/jobs/active", "https://example.com/jobs/stale"]
+    for url in urls:
+        conn.execute(
+            "INSERT INTO jobs (url, title, full_description, fit_score) "
+            "VALUES (?, 'Engineer', 'Complete description', 8)",
+            (url,),
+        )
+    conn.commit()
+    monkeypatch.setattr(
+        dashboard_server,
+        "get_connection",
+        lambda: get_connection(db_path),
+    )
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    original_execute = dashboard_server._run_tailoring_request
+
+    def execute(request):
+        if request["target_url"] == urls[0]:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+            return "complete", {"approved": 1, "failed": 0, "errors": 0}, None
+        return original_execute(request)
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        start_tailoring(server, min_score=1, limit=1, target_url=urls[0])
+        assert first_started.wait(timeout=2)
+        start_tailoring(server, min_score=1, limit=1, target_url=urls[1])
+        conn.execute(
+            "UPDATE jobs SET applied_at = '2026-08-03T12:00:00+00:00' WHERE url = ?",
+            (urls[1],),
+        )
+        conn.commit()
+        release_first.set()
+
+        for _ in range(100):
+            state = tailoring_status(server)
+            if state["status"] == "idle":
+                break
+            time.sleep(0.01)
+
+        stale = next(item for item in state["recent"] if item["target_url"] == urls[1])
+        assert stale["status"] == "skipped"
+        assert stale["result"]["reason"] == "This job is already marked as applied"
+    finally:
+        release_first.set()
+        server.server_close()
+
+
+def test_tailoring_queue_allows_only_one_outstanding_batch(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(_request):
+        started.set()
+        assert release.wait(timeout=2)
+        return "complete", {"approved": 0, "failed": 0, "errors": 0}, None
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        start_tailoring(server)
+        assert started.wait(timeout=2)
+        with pytest.raises(RuntimeError, match="bulk tailoring request"):
+            start_tailoring(server)
+    finally:
+        release.set()
+        server.server_close()
 
 
 def test_dashboard_settings_api(settings_files) -> None:
@@ -824,6 +986,8 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "/api/discovery/status" in html
     assert "Run Tailoring" in html
     assert "/api/tailoring/status" in html
+    assert "Queued (#" in html
+    assert "applypilotTailoringPending" in html
     assert "Tailored resume" in html
     assert "Resume PDF" in html
     assert "kind=tex" in html
