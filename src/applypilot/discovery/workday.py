@@ -468,7 +468,7 @@ def scrape_employers(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> dict:
+def run_workday_discovery(employers: dict | None = None, workers: int = 3) -> dict:
     """Main entry point for Workday-based corporate job discovery.
 
     Loads employer registry from config/employers.yaml (or uses the provided
@@ -477,7 +477,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     Args:
         employers: Override the employer registry. If None, loads from YAML.
-        workers: Number of parallel threads for employer scraping. Default 1 (sequential).
+        workers: Number of parallel threads for employer scraping. Default 3.
 
     Returns:
         Dict with stats: found, new, existing, queries.

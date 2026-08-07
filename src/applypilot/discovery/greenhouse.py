@@ -654,7 +654,7 @@ def _process_bigtech_company(
 
 def run_greenhouse_discovery(
     companies: dict | None = None,
-    workers: int = 1,
+    workers: int = 3,
 ) -> dict:
     """Main entry point for Greenhouse-based discovery.
 
@@ -665,7 +665,7 @@ def run_greenhouse_discovery(
 
     Args:
         companies: Override the company registry. If None, loads from YAML.
-        workers: Number of parallel threads for company scraping. Default 1.
+        workers: Number of parallel threads for company scraping. Default 3.
 
     Returns:
         Dict with stats: found, kept, new, existing, errors, companies.
@@ -744,7 +744,7 @@ def run_greenhouse_discovery(
 
 def run_bigtech_discovery(
     companies: dict | None = None,
-    workers: int = 1,
+    workers: int = 3,
 ) -> dict:
     """Discover jobs from configured proprietary big-tech career sites."""
     if companies is None:

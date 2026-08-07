@@ -689,7 +689,7 @@ def _execute_discovery(server: DashboardHTTPServer, workers: int) -> None:
         }
 
 
-def start_discovery(server: DashboardHTTPServer, workers: int = 4) -> dict:
+def start_discovery(server: DashboardHTTPServer, workers: int = 3) -> dict:
     """Start one background discovery run, rejecting overlapping runs."""
     if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 8:
         raise ValueError("Workers must be an integer between 1 and 8")
@@ -1106,7 +1106,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if path == "/api/discovery":
-                result = start_discovery(self.server, payload.get("workers", 4))
+                result = start_discovery(self.server, payload.get("workers", 3))
             elif path == "/api/tailoring":
                 result = start_tailoring(
                     self.server,

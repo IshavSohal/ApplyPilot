@@ -1035,12 +1035,11 @@ def _run_all(
     targets: list[dict],
     accept_locs: list[str],
     reject_locs: list[str],
-    workers: int = 1,
+    workers: int = 3,
 ) -> dict:
-    """Run smart extract on all targets.
+    """Run smart extract on all targets in parallel when multiple workers are configured.
 
-    Sequential by default. When workers > 1, scrapes multiple sites in parallel
-    using ThreadPoolExecutor. DB storage is still serialized after each result.
+    DB storage is still serialized after each result.
     """
     conn = init_db()
     pre_stats = get_stats(conn)
@@ -1118,7 +1117,7 @@ def _run_all(
 
 def run_smart_extract(
     sites: list[dict] | None = None,
-    workers: int = 1,
+    workers: int = 3,
 ) -> dict:
     """Main entry point for AI-powered smart extraction.
 
@@ -1127,7 +1126,7 @@ def run_smart_extract(
 
     Args:
         sites: Override the site list. If None, loads from YAML.
-        workers: Number of parallel threads for site scraping. Default 1 (sequential).
+        workers: Number of parallel threads for site scraping. Default 3.
 
     Returns:
         Dict with stats: total_new, total_existing, passed, total.

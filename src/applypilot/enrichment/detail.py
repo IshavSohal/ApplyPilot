@@ -1034,7 +1034,7 @@ def stream_detail(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
+def run_enrichment(limit: int = 100, workers: int = 3) -> dict:
     """Main entry point for detail page enrichment.
 
     Fetches pending jobs from the database (those without full_description),
@@ -1043,7 +1043,7 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
 
     Args:
         limit: Maximum number of jobs per site to process.
-        workers: Number of parallel threads for site batch processing. Default 1 (sequential).
+        workers: Number of parallel threads for site batch processing. Default 3.
 
     Returns:
         Dict with stats: processed, ok, partial, error, tiers.

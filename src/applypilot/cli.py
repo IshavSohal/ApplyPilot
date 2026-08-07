@@ -84,7 +84,7 @@ def run(
         ),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    workers: int = typer.Option(3, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     score_workers: int = typer.Option(
         3,
         "--score-workers",

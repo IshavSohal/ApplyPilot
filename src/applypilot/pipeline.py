@@ -59,7 +59,7 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
+def _run_discover(workers: int = 3) -> dict:
     """Stage: direct-employer job discovery."""
     stats: dict = {"greenhouse": None, "workday": None, "bigtech": None}
     totals = {
@@ -119,7 +119,7 @@ def _run_discover(workers: int = 1) -> dict:
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
+def _run_enrich(workers: int = 3) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from applypilot.enrichment.detail import run_enrichment
@@ -293,7 +293,7 @@ def _run_stage_streaming(
     tracker: _StageTracker,
     stop_event: threading.Event,
     min_score: int = 7,
-    workers: int = 1,
+    workers: int = 3,
     score_workers: int = 3,
     validation_mode: str = "normal",
 ) -> None:
@@ -359,7 +359,7 @@ def _run_stage_streaming(
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
+def _run_sequential(ordered: list[str], min_score: int, workers: int = 3,
                     score_workers: int = 3, validation_mode: str = "normal") -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -415,7 +415,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
+def _run_streaming(ordered: list[str], min_score: int, workers: int = 3,
                    score_workers: int = 3, validation_mode: str = "normal") -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
@@ -484,7 +484,7 @@ def run_pipeline(
     min_score: int = 7,
     dry_run: bool = False,
     stream: bool = True,
-    workers: int = 1,
+    workers: int = 3,
     score_workers: int = 3,
     validation_mode: str = "normal",
 ) -> dict:
@@ -495,7 +495,7 @@ def run_pipeline(
         min_score: Minimum fit score for tailor/cover stages.
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode). Defaults to True.
-        workers: Number of parallel threads for discovery/enrichment stages.
+        workers: Number of parallel threads for discovery/enrichment stages. Defaults to 3.
         score_workers: Maximum concurrent LLM requests in the scoring stage.
 
     Returns:

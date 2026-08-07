@@ -177,7 +177,7 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
 applypilot run [stages...]              # Run pipeline stages (or 'all')
-applypilot run --workers 4              # Parallel discovery/enrichment
+applypilot run --workers 4              # Override the default 3 discovery/enrichment workers
 applypilot run --score-workers 3        # Parallel scoring (paced by LLM_RPM/LLM_TPM)
 applypilot run                          # Concurrent stages (streaming mode, default)
 applypilot run --no-stream              # Run stages sequentially

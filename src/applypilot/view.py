@@ -1151,7 +1151,7 @@ discoveryButton.addEventListener('click', async () => {{
     const response = await fetch('/api/discovery', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{workers: 4}})
+      body: JSON.stringify({{workers: 3}})
     }});
     const state = await response.json();
     if (!response.ok) throw new Error(state.error || 'Could not start discovery');

@@ -52,6 +52,10 @@ def test_pipeline_defaults_to_streaming() -> None:
     assert inspect.signature(pipeline.run_pipeline).parameters["stream"].default is True
 
 
+def test_pipeline_defaults_to_three_discovery_enrichment_workers() -> None:
+    assert inspect.signature(pipeline.run_pipeline).parameters["workers"].default == 3
+
+
 def test_pending_tailoring_excludes_jobs_already_applied_to(tmp_path) -> None:
     connection = init_db(tmp_path / "jobs.db")
     for url, applied_at in (
