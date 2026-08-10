@@ -61,10 +61,23 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 3) -> dict:
     """Stage: direct-employer job discovery."""
+    from applypilot.config import load_search_config
+    from applypilot.discovery.filters import reconcile_unscored_jobs
+
+    conn = init_db()
+    audit = reconcile_unscored_jobs(conn, load_search_config())
+    if audit["checked"]:
+        log.info(
+            "Discovery title audit: %d checked, %d accepted, %d rejected, %d changed",
+            audit["checked"], audit["accepted"], audit["rejected"], audit["changed"],
+        )
     stats: dict = {"greenhouse": None, "workday": None, "bigtech": None}
     totals = {
         key: 0
-        for key in ("found", "kept", "new", "existing", "errors", "companies")
+        for key in (
+            "found", "kept", "title_rejected", "location_rejected",
+            "new", "existing", "errors", "companies",
+        )
     }
 
     console.print("  [cyan]Greenhouse boards crawl...[/cyan]")
@@ -253,8 +266,14 @@ class _StageTracker:
 
 # SQL to count pending work for each stage
 _PENDING_SQL: dict[str, str] = {
-    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
-    "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
+    "enrich": (
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL "
+        "AND COALESCE(discovery_status, 'accepted') = 'accepted'"
+    ),
+    "score":  (
+        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL "
+        "AND COALESCE(discovery_status, 'accepted') = 'accepted'"
+    ),
     "tailor": (
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
         "AND full_description IS NOT NULL "
@@ -575,6 +594,7 @@ def run_pipeline(
     final = get_stats()
     console.print(f"\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
+    console.print(f"    Discovery filtered: {final['discovery_rejected']}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")
     console.print(f"    Tailored:       {final['tailored']}")

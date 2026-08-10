@@ -71,12 +71,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
     out = Path(output_path) if output_path else APP_DIR / "dashboard.html"
 
     conn = get_connection()
+    active = "COALESCE(discovery_status, 'accepted') = 'accepted'"
 
     # Stats
-    total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    total = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {active}").fetchone()[0]
+    discovery_rejected = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE discovery_status = 'rejected'"
+    ).fetchone()[0]
     ready = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
+        f"WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND {active}"
     ).fetchone()[0]
     scored = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
@@ -115,7 +119,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
                SUM(CASE WHEN fit_score < 5 AND fit_score IS NOT NULL THEN 1 ELSE 0 END) as low_fit,
                SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) as unscored,
                ROUND(AVG(fit_score), 1) as avg_score
-        FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
+        FROM jobs
+        WHERE COALESCE(discovery_status, 'accepted') = 'accepted'
+        GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
     # All jobs, with scored jobs first and unscored discovery results last
@@ -126,6 +132,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
                fit_score, score_reasoning, applied_at, tailored_resume_path,
                COALESCE(tailor_attempts, 0) AS tailor_attempts
         FROM jobs
+        WHERE COALESCE(discovery_status, 'accepted') = 'accepted'
         """
     ).fetchall()
 
@@ -573,7 +580,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <section id="dashboard-view" class="app-view active">
 
 <h1>ApplyPilot Dashboard</h1>
-<p class="subtitle">{active_count} active jobs &middot; {applied_count} applied &middot; {priority_count} early-career priorities &middot; {high_fit} strong matches (7+)</p>
+<p class="subtitle">{active_count} active jobs &middot; {applied_count} applied &middot; {discovery_rejected} filtered at discovery &middot; {priority_count} early-career priorities &middot; {high_fit} strong matches (7+)</p>
 
 <section class="import-panel">
   <h2>Add a job from the web</h2>
@@ -617,6 +624,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <div class="stat-card stat-ok"><div class="stat-num">{ready}</div><div class="stat-label">Ready (desc + URL)</div></div>
   <div class="stat-card stat-scored"><div class="stat-num">{scored}</div><div class="stat-label">Scored by LLM</div></div>
   <div class="stat-card stat-high"><div class="stat-num">{high_fit}</div><div class="stat-label">Strong Fit (7+)</div></div>
+  <div class="stat-card"><div class="stat-num">{discovery_rejected}</div><div class="stat-label">Discovery Filtered</div></div>
 </div>
 
 <div class="filters">
@@ -945,6 +953,17 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
       <section class="settings-card">
         <h2>Title Preferences</h2>
+        <div class="field">
+          <label for="included-titles-input">Included target titles</label>
+          <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="include_titles">
+            <div class="tag-list" data-tag-list aria-live="polite"></div>
+            <div class="tag-editor-controls">
+              <input id="included-titles-input" data-tag-input autocomplete="off">
+              <button class="tag-add-btn" data-tag-add type="button" aria-label="Add included title">Add</button>
+            </div>
+          </div>
+          <small>Jobs must match at least one title before enrichment or scoring.</small>
+        </div>
         <div class="field">
           <label for="priority-titles-input">Priority titles</label>
           <div class="tag-editor" data-tag-editor data-tag-scope="searches" data-tag-path="priority_titles">

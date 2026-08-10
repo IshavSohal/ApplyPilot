@@ -394,6 +394,7 @@ def _validate_searches(searches: object) -> dict:
         "allowed_countries",
         "location_accept",
         "location_reject_non_remote",
+        "include_titles",
         "exclude_titles",
         "priority_titles",
         "boards",

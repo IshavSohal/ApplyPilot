@@ -100,6 +100,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             strategy              TEXT,
             discovered_at         TEXT,
             posted_at             TEXT,
+            discovery_status      TEXT DEFAULT 'accepted',
+            discovery_rejection_reason TEXT,
+            discovery_checked_at  TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -157,6 +160,9 @@ _ALL_COLUMNS: dict[str, str] = {
     "strategy": "TEXT",
     "discovered_at": "TEXT",
     "posted_at": "TEXT",
+    "discovery_status": "TEXT DEFAULT 'accepted'",
+    "discovery_rejection_reason": "TEXT",
+    "discovery_checked_at": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -244,25 +250,29 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     stats: dict = {}
 
     # Total jobs
-    stats["total"] = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    active = "COALESCE(discovery_status, 'accepted') = 'accepted'"
+    stats["total"] = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {active}").fetchone()[0]
+    stats["discovery_rejected"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE discovery_status = 'rejected'"
+    ).fetchone()[0]
 
     # By site breakdown
     rows = conn.execute(
-        "SELECT site, COUNT(*) as cnt FROM jobs GROUP BY site ORDER BY cnt DESC"
+        f"SELECT site, COUNT(*) as cnt FROM jobs WHERE {active} GROUP BY site ORDER BY cnt DESC"
     ).fetchall()
     stats["by_site"] = [(row[0], row[1]) for row in rows]
 
     # Enrichment stage
     stats["pending_detail"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND {active}"
     ).fetchone()[0]
 
     stats["with_description"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND {active}"
     ).fetchone()[0]
 
     stats["detail_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL"
+        f"SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL AND {active}"
     ).fetchone()[0]
 
     # Scoring stage
@@ -272,7 +282,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     stats["unscored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND fit_score IS NULL"
+        f"WHERE full_description IS NOT NULL AND fit_score IS NULL AND {active}"
     ).fetchone()[0]
 
     # Score distribution
@@ -386,9 +396,9 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     conditions = {
         "discovered": "1=1",
-        "pending_detail": "detail_scraped_at IS NULL",
-        "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        "pending_detail": "detail_scraped_at IS NULL AND COALESCE(discovery_status, 'accepted') = 'accepted'",
+        "enriched": "full_description IS NOT NULL AND COALESCE(discovery_status, 'accepted') = 'accepted'",
+        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND COALESCE(discovery_status, 'accepted') = 'accepted'",
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "

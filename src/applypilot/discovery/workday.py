@@ -22,6 +22,7 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
+from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +193,8 @@ def search_employer(
     search_cfg = config.load_search_config()
 
     all_jobs: list[dict] = []
+    title_rejected = 0
+    location_rejected = 0
     offset = 0
     page_size = 20
     max_pages = 25  # Cap at 500 results
@@ -213,13 +216,23 @@ def search_employer(
             break
 
         for j in postings:
+            title = j.get("title", "")
+            if not classify_title(title, search_cfg).accepted:
+                title_rejected += 1
+                continue
             loc = j.get("locationsText", "")
-            if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs, search_cfg):
-                    continue
+            enforce_location = location_filter or config.location_filter_is_mandatory(search_cfg)
+            if (
+                enforce_location
+                and accept_locs is not None
+                and reject_locs is not None
+                and not _location_ok(loc, accept_locs, reject_locs, search_cfg)
+            ):
+                location_rejected += 1
+                continue
 
             all_jobs.append({
-                "title": j.get("title", ""),
+                "title": title,
                 "location": loc,
                 "posted": j.get("postedOn", ""),
                 "external_path": j.get("externalPath", ""),
@@ -238,8 +251,10 @@ def search_employer(
             all_jobs = all_jobs[:max_results]
             break
 
-    log.info("%s: %d jobs found%s", employer["name"], len(all_jobs),
-             " (filtered)" if location_filter else "")
+    log.info(
+        "%s: %d accepted (%d title-rejected, %d location-rejected)",
+        employer["name"], len(all_jobs), title_rejected, location_rejected,
+    )
     return all_jobs
 
 
@@ -490,6 +505,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 3) -> di
         return {"found": 0, "new": 0, "existing": 0, "queries": 0}
 
     search_cfg = config.load_search_config()
+    reconcile_unscored_jobs(init_db(), search_cfg)
     queries_cfg = search_cfg.get("queries", [])
     accept_locs, reject_locs = _load_location_filter(search_cfg)
 

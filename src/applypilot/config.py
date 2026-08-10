@@ -183,7 +183,7 @@ US_STATE_CODES = {
 CANADA_PROVINCE_CODES = {"AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT"}
 US_STATE_NAMES = {
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
-    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "connecticut", "delaware", "florida", "hawaii", "idaho",
     "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
     "maine", "maryland", "massachusetts", "michigan", "minnesota",
     "mississippi", "missouri", "montana", "nebraska", "nevada",
@@ -247,6 +247,21 @@ def location_is_allowed(location: str | None, search_cfg: dict | None = None) ->
 
     accept = search_cfg.get("location_accept", [])
     return any(str(pattern).lower() in lowered for pattern in accept)
+
+
+def location_filter_is_mandatory(search_cfg: dict | None = None) -> bool:
+    """Return whether a country allowlist makes location filtering non-optional.
+
+    Source-specific filter switches are useful for loose, pattern-based searches,
+    but an explicit country allowlist is a hard boundary. Discovery adapters must
+    not allow their local switch to bypass it.
+    """
+    if search_cfg is None:
+        search_cfg = load_search_config()
+    countries = search_cfg.get("allowed_countries", [])
+    return isinstance(countries, list) and any(
+        isinstance(country, str) and country.strip() for country in countries
+    )
 
 
 def load_env():

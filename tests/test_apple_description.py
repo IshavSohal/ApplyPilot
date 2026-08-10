@@ -120,6 +120,46 @@ def test_apple_search_summary_is_not_marked_as_full_description(monkeypatch):
     assert row[2] is None
 
 
+def test_country_allowlist_cannot_be_disabled_by_bigtech_switch(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE jobs ("
+        "url TEXT PRIMARY KEY, title TEXT, company TEXT, salary TEXT, description TEXT, "
+        "location TEXT, site TEXT, strategy TEXT, discovered_at TEXT, posted_at TEXT, "
+        "full_description TEXT, application_url TEXT, detail_scraped_at TEXT)"
+    )
+    monkeypatch.setitem(
+        greenhouse.BIGTECH_FETCHERS,
+        "outside_country_test",
+        lambda _company, _terms: [{
+            "title": "Software Engineer",
+            "location": "London, United Kingdom",
+            "url": "https://example.com/jobs/london",
+            "content": "Full job description " * 20,
+        }],
+    )
+    monkeypatch.setattr(greenhouse, "get_connection", lambda: conn)
+
+    result = greenhouse._process_bigtech_company(
+        "outside",
+        {"name": "Outside", "provider": "outside_country_test"},
+        ["software engineer"],
+        [],
+        [],
+        [],
+        {
+            "allowed_countries": ["Canada", "United States"],
+            "accept_remote_anywhere": False,
+            "accept_unknown_locations": False,
+        },
+        False,
+    )
+
+    assert result["kept"] == 0
+    assert result["new"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
 def test_reset_incomplete_apple_descriptions_requeues_summary_only_rows():
     conn = sqlite3.connect(":memory:")
     conn.execute(

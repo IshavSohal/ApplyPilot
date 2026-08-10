@@ -33,6 +33,7 @@ from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db, store_jobs, get_stats
 from applypilot.llm import get_client
+from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
 
@@ -58,20 +59,17 @@ def _load_location_filter(search_cfg: dict | None = None):
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    policy = dict(search_cfg or {})
+    policy.setdefault("location_accept", accept)
+    policy.setdefault("location_reject_non_remote", reject)
+    return config.location_is_allowed(location, policy)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -93,18 +91,24 @@ def _store_jobs_filtered(
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+    search_cfg: dict | None = None,
 ) -> tuple[int, int]:
-    """Store jobs with location filtering. Returns (new, existing)."""
+    """Store jobs with deterministic title and location filtering."""
+    search_cfg = search_cfg or config.load_search_config()
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
     filtered = 0
+    title_filtered = 0
 
     for job in jobs:
         url = job.get("url")
         if not url:
             continue
-        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+        if not classify_title(job.get("title"), search_cfg).accepted:
+            title_filtered += 1
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs, search_cfg):
             filtered += 1
             continue
         try:
@@ -120,6 +124,8 @@ def _store_jobs_filtered(
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
+    if title_filtered:
+        log.info("Filtered %d jobs (non-target title)", title_filtered)
     conn.commit()
     return new, existing
 
@@ -1042,6 +1048,7 @@ def _run_all(
     DB storage is still serialized after each result.
     """
     conn = init_db()
+    reconcile_unscored_jobs(conn)
     pre_stats = get_stats(conn)
     log.info("Database: %d jobs already stored, %d pending detail scrape",
              pre_stats["total"], pre_stats["pending_detail"])

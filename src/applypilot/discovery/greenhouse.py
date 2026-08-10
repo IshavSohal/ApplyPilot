@@ -30,6 +30,7 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
+from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 from applypilot.discovery.workday import strip_html
 
 log = logging.getLogger(__name__)
@@ -114,18 +115,11 @@ def _title_matches(title: str | None, terms: list[str], excludes: list[str]) -> 
     """Case-insensitive substring match: title must contain any query term and
     must not contain any excluded phrase.
     """
-    if not title:
-        return False
-    title_lower = title.lower()
-
-    for ex in excludes:
-        if ex and ex in title_lower:
-            return False
-
-    if not terms:
-        return True
-
-    return any(term in title_lower for term in terms)
+    policy = {
+        "include_titles": terms,
+        "exclude_titles": excludes,
+    }
+    return classify_title(title, policy).accepted
 
 
 # -- HTTP fetch --------------------------------------------------------------
@@ -466,7 +460,8 @@ def _process_company(
     """Fetch + filter + store jobs for one Greenhouse company."""
     name = company.get("name", key)
     token = company.get("board_token", key)
-    result = {"company": name, "found": 0, "kept": 0, "new": 0, "existing": 0, "error": None}
+    result = {"company": name, "found": 0, "kept": 0, "title_rejected": 0,
+              "location_rejected": 0, "new": 0, "existing": 0, "error": None}
 
     try:
         raw_jobs = fetch_company_jobs(token)
@@ -489,9 +484,12 @@ def _process_company(
         loc_obj = job.get("location") or {}
         location = loc_obj.get("name") if isinstance(loc_obj, dict) else None
 
-        if not _title_matches(title, terms, excludes):
+        if not classify_title(title, search_cfg).accepted:
+            result["title_rejected"] += 1
             continue
-        if location_filter and not _location_ok(location, accept_locs, reject_locs, search_cfg):
+        enforce_location = location_filter or config.location_filter_is_mandatory(search_cfg)
+        if enforce_location and not _location_ok(location, accept_locs, reject_locs, search_cfg):
+            result["location_rejected"] += 1
             continue
 
         url = job.get("absolute_url") or ""
@@ -539,7 +537,11 @@ def _process_company(
 
     result["new"] = new
     result["existing"] = existing
-    log.info("%s: %d kept after filter -> %d new, %d dupes", name, len(rows), new, existing)
+    log.info(
+        "%s: %d found, %d title-rejected, %d location-rejected, %d kept -> %d new, %d dupes",
+        name, result["found"], result["title_rejected"], result["location_rejected"],
+        len(rows), new, existing,
+    )
     return result
 
 
@@ -560,6 +562,8 @@ def _process_bigtech_company(
         "company": name,
         "found": 0,
         "kept": 0,
+        "title_rejected": 0,
+        "location_rejected": 0,
         "new": 0,
         "existing": 0,
         "error": None,
@@ -582,9 +586,12 @@ def _process_bigtech_company(
     for job in raw_jobs:
         title = job.get("title") or ""
         location = job.get("location") or None
-        if not _title_matches(title, terms, excludes):
+        if not classify_title(title, search_cfg).accepted:
+            result["title_rejected"] += 1
             continue
-        if location_filter and not _location_ok(location, accept_locs, reject_locs, search_cfg):
+        enforce_location = location_filter or config.location_filter_is_mandatory(search_cfg)
+        if enforce_location and not _location_ok(location, accept_locs, reject_locs, search_cfg):
+            result["location_rejected"] += 1
             continue
         url = job.get("url") or ""
         if not url:
@@ -640,9 +647,11 @@ def _process_bigtech_company(
             result["existing"] += 1
     conn.commit()
     log.info(
-        "%s: %d found, %d kept -> %d new, %d dupes",
+        "%s: %d found, %d title-rejected, %d location-rejected, %d kept -> %d new, %d dupes",
         name,
         result["found"],
+        result["title_rejected"],
+        result["location_rejected"],
         result["kept"],
         result["new"],
         result["existing"],
@@ -677,9 +686,8 @@ def run_greenhouse_discovery(
         log.warning("No Greenhouse companies configured. Create config/greenhouse_companies.yaml.")
         return {"found": 0, "kept": 0, "new": 0, "existing": 0, "errors": 0, "companies": 0}
 
-    init_db()
-
     search_cfg = config.load_search_config()
+    reconcile_unscored_jobs(init_db(), search_cfg)
     terms = _load_query_terms(search_cfg)
     excludes = _load_excluded_titles(search_cfg)
     accept_locs, reject_locs = _load_location_filter(search_cfg)
@@ -689,7 +697,8 @@ def run_greenhouse_discovery(
              len(companies), len(terms), len(excludes), workers)
 
     keys = list(companies.keys())
-    grand: dict = {"found": 0, "kept": 0, "new": 0, "existing": 0, "errors": 0,
+    grand: dict = {"found": 0, "kept": 0, "title_rejected": 0,
+                   "location_rejected": 0, "new": 0, "existing": 0, "errors": 0,
                    "companies": len(keys)}
     t0 = time.time()
 
@@ -708,6 +717,8 @@ def run_greenhouse_discovery(
                 completed += 1
                 grand["found"] += r["found"]
                 grand["kept"] += r["kept"]
+                grand["title_rejected"] += r["title_rejected"]
+                grand["location_rejected"] += r["location_rejected"]
                 grand["new"] += r["new"]
                 grand["existing"] += r["existing"]
                 if r["error"]:
@@ -725,6 +736,8 @@ def run_greenhouse_discovery(
             )
             grand["found"] += r["found"]
             grand["kept"] += r["kept"]
+            grand["title_rejected"] += r["title_rejected"]
+            grand["location_rejected"] += r["location_rejected"]
             grand["new"] += r["new"]
             grand["existing"] += r["existing"]
             if r["error"]:
@@ -736,9 +749,12 @@ def run_greenhouse_discovery(
                          grand["errors"], elapsed)
 
     elapsed = time.time() - t0
-    log.info("Greenhouse crawl done in %.0fs: %d found, %d kept, %d new, %d dupes, %d errors",
-             elapsed, grand["found"], grand["kept"], grand["new"], grand["existing"],
-             grand["errors"])
+    log.info(
+        "Greenhouse crawl done in %.0fs: %d found, %d title-rejected, "
+        "%d location-rejected, %d kept, %d new, %d dupes, %d errors",
+        elapsed, grand["found"], grand["title_rejected"], grand["location_rejected"],
+        grand["kept"], grand["new"], grand["existing"], grand["errors"],
+    )
     return grand
 
 
@@ -759,8 +775,8 @@ def run_bigtech_discovery(
             "companies": 0,
         }
 
-    init_db()
     search_cfg = config.load_search_config()
+    reconcile_unscored_jobs(init_db(), search_cfg)
     terms = _load_query_terms(search_cfg)
     excludes = _load_excluded_titles(search_cfg)
     accept_locs, reject_locs = _load_location_filter(search_cfg)
@@ -772,6 +788,8 @@ def run_bigtech_discovery(
     grand = {
         "found": 0,
         "kept": 0,
+        "title_rejected": 0,
+        "location_rejected": 0,
         "new": 0,
         "existing": 0,
         "errors": 0,
@@ -779,7 +797,7 @@ def run_bigtech_discovery(
     }
 
     def add_result(result: dict) -> None:
-        for field in ("found", "kept", "new", "existing"):
+        for field in ("found", "kept", "title_rejected", "location_rejected", "new", "existing"):
             grand[field] += result[field]
         if result["error"]:
             grand["errors"] += 1
@@ -825,8 +843,11 @@ def run_bigtech_discovery(
             )
 
     log.info(
-        "Big-tech crawl done: %d found, %d kept, %d new, %d dupes, %d errors",
+        "Big-tech crawl done: %d found, %d title-rejected, %d location-rejected, "
+        "%d kept, %d new, %d dupes, %d errors",
         grand["found"],
+        grand["title_rejected"],
+        grand["location_rejected"],
         grand["kept"],
         grand["new"],
         grand["existing"],

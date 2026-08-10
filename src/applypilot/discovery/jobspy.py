@@ -16,6 +16,7 @@ from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
 
@@ -101,8 +102,18 @@ def _location_ok(
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
-    """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
+def store_jobspy_results(
+    conn: sqlite3.Connection,
+    df,
+    source_label: str,
+    search_cfg: dict | None = None,
+) -> tuple[int, int]:
+    """Store allowed JobSpy results in the DB. Returns (new, existing).
+
+    This repeats the location check at the persistence boundary so callers that
+    bypass the full-crawl filtering path still cannot store out-of-policy jobs.
+    """
+    search_cfg = search_cfg or config.load_search_config()
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
@@ -113,6 +124,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
+        if not classify_title(title, search_cfg).accepted:
+            continue
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
@@ -137,6 +150,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         site_label = f"{site_name}"
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
+
+        if not config.location_is_allowed(location_str, search_cfg):
+            continue
 
         strategy = "jobspy"
 
@@ -261,18 +277,26 @@ def _run_one_search(
     # Filter by location before storing
     before = len(df)
     location_policy = config.load_search_config()
+    df = df[df.apply(lambda row: classify_title(
+        str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None,
+        location_policy,
+    ).accepted, axis=1)]
+    title_filtered = before - len(df)
+    before_location = len(df)
     df = df[df.apply(lambda row: _location_ok(
         str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
         accept_locs, reject_locs, location_policy,
     ), axis=1)]
-    filtered = before - len(df)
+    filtered = before_location - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(conn, df, s["query"], location_policy)
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
         msg += f", {filtered} filtered (location)"
+    if title_filtered:
+        msg += f", {title_filtered} filtered (title)"
     log.info(msg)
 
     return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
@@ -336,7 +360,8 @@ def search_jobs(
             log.info("  %s: %d", site, count)
 
     conn = init_db()
-    new, existing = store_jobspy_results(conn, df, query)
+    search_cfg = config.load_search_config()
+    new, existing = store_jobspy_results(conn, df, query, search_cfg)
     log.info("Stored: %d new, %d already in DB", new, existing)
 
     db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
@@ -391,7 +416,7 @@ def _full_crawl(
              ", ".join(sites), results_per_site, hours_old)
 
     # Ensure DB schema is ready
-    init_db()
+    reconcile_unscored_jobs(init_db(), search_cfg)
 
     total_new = 0
     total_existing = 0

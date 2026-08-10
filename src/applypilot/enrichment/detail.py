@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot.database import init_db
+from applypilot.discovery.filters import reconcile_unscored_jobs
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -878,7 +879,11 @@ def _run_detail_scraper(
     Returns aggregate stats dict.
     """
     skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
-    where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
+    where = (
+        "WHERE detail_scraped_at IS NULL "
+        "AND COALESCE(discovery_status, 'accepted') = 'accepted' "
+        f"AND {skip_filter}"
+    )
     rows = conn.execute(
         f"SELECT url, title, site FROM jobs {where} ORDER BY site"
     ).fetchall()
@@ -978,6 +983,9 @@ def stream_detail(
         set_proxy(proxy_str)
 
     conn = init_db()
+    audit = reconcile_unscored_jobs(conn)
+    if audit["rejected"]:
+        log.info("Discovery title gate excludes %d pending job(s) from enrichment", audit["rejected"])
 
     reset_count = reset_incomplete_apple_descriptions(conn)
     if reset_count:
@@ -996,7 +1004,9 @@ def stream_detail(
             skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
             rows = conn.execute(
                 "SELECT url, title, site FROM jobs "
-                f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
+                "WHERE detail_scraped_at IS NULL "
+                "AND COALESCE(discovery_status, 'accepted') = 'accepted' "
+                f"AND {skip_filter} "
                 "ORDER BY site LIMIT 200"
             ).fetchall()
 
@@ -1049,6 +1059,9 @@ def run_enrichment(limit: int = 100, workers: int = 3) -> dict:
         Dict with stats: processed, ok, partial, error, tiers.
     """
     conn = init_db()
+    audit = reconcile_unscored_jobs(conn)
+    if audit["rejected"]:
+        log.info("Discovery title gate excludes %d pending job(s) from enrichment", audit["rejected"])
 
     reset_count = reset_incomplete_apple_descriptions(conn)
     if reset_count:

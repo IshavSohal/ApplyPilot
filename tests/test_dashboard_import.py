@@ -14,6 +14,7 @@ import yaml
 
 import applypilot.dashboard_server as dashboard_server
 from applypilot.apply.prompt import _build_salary_section
+from applypilot.config import location_filter_is_mandatory, location_is_allowed
 from applypilot.dashboard_server import (
     DashboardHTTPServer,
     DashboardRequestHandler,
@@ -30,7 +31,6 @@ from applypilot.dashboard_server import (
     start_tailoring,
     tailoring_status,
 )
-from applypilot.config import location_is_allowed
 from applypilot.database import get_connection, init_db
 from applypilot.enrichment.detail import extract_job_metadata
 from applypilot.view import format_applied_at, format_posted_at, generate_dashboard
@@ -489,7 +489,13 @@ def test_country_location_policy_accepts_canada_and_us(location: str) -> None:
 
 @pytest.mark.parametrize(
     "location",
-    ["China - Remote", "Remote - India", "London, United Kingdom", "Remote"],
+    [
+        "China - Remote",
+        "Remote - India",
+        "London, United Kingdom",
+        "Tbilisi, Georgia",
+        "Remote",
+    ],
 )
 def test_country_location_policy_rejects_other_or_unknown_regions(location: str) -> None:
     config = {
@@ -498,6 +504,16 @@ def test_country_location_policy_rejects_other_or_unknown_regions(location: str)
         "accept_unknown_locations": False,
     }
     assert not location_is_allowed(location, config)
+
+
+def test_country_allowlist_makes_discovery_filter_mandatory() -> None:
+    config = {
+        "allowed_countries": ["Canada", "United States"],
+        "greenhouse_location_filter": False,
+        "bigtech_location_filter": False,
+    }
+
+    assert location_filter_is_mandatory(config)
 
 
 def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
@@ -1027,6 +1043,7 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
         "allowed_countries",
         "location_accept",
         "location_reject_non_remote",
+        "include_titles",
         "priority_titles",
         "exclude_titles",
     )

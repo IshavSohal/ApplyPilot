@@ -267,7 +267,10 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
     conn = get_connection()
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        query = (
+            "SELECT * FROM jobs WHERE full_description IS NOT NULL "
+            "AND COALESCE(discovery_status, 'accepted') = 'accepted'"
+        )
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()

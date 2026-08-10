@@ -54,6 +54,29 @@ queries:
   - query: "security engineer"
     tier: 3
 
+# Strict discovery allowlist. A posting must contain one of these normalized
+# title phrases before it can be enriched or scored. Remove this key to use the
+# query titles as a backward-compatible fallback.
+include_titles:
+  - "software engineer"
+  - "software engineering"
+  - "software developer"
+  - "frontend engineer"
+  - "frontend developer"
+  - "backend engineer"
+  - "backend developer"
+  - "full stack engineer"
+  - "full stack developer"
+  - "web engineer"
+  - "web developer"
+  - "AI engineer"
+  - "AI developer"
+  - "machine learning engineer"
+  - "machine learning developer"
+  - "ML engineer"
+  - "ML developer"
+  - "SDE"
+
 # Locations to search
 locations:
   - location: "San Francisco, CA"
@@ -61,26 +84,25 @@ locations:
   - location: "Remote"
     remote: true
 
-# Location filtering -- accept/reject patterns for job location text
-location:
-  accept_patterns:
-    - "San Francisco"
-    - "Bay Area"
-    - "SF"
-    - "California"
-    - "CA"
-    - "Remote"
-    - "Anywhere"
-    - "United States"
-    - "US"
-    - "USA"
-  reject_patterns:
-    - "New York only"
-    - "Seattle only"
-    - "onsite only"
-    - "London, UK"
-    - "India"
-    - "Philippines"
+# Hard country boundary. When this list is present, every discovery adapter
+# filters even if one of its source-specific filter switches is disabled.
+allowed_countries:
+  - "Canada"
+  - "United States"
+accept_remote_anywhere: false
+accept_unknown_locations: false
+
+# Optional extra aliases and explicit rejections for job location text.
+location_accept:
+  - "San Francisco"
+  - "Bay Area"
+location_reject_non_remote:
+  - "London, UK"
+  - "India"
+  - "Philippines"
+
+greenhouse_location_filter: true
+bigtech_location_filter: true
 
 # Country for Indeed/LinkedIn/Google Jobs searches
 country: "USA"
