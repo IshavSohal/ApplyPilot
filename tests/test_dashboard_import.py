@@ -13,11 +13,13 @@ import pytest
 import yaml
 
 import applypilot.dashboard_server as dashboard_server
+from applypilot import config
 from applypilot.apply.prompt import _build_salary_section
 from applypilot.config import location_filter_is_mandatory, location_is_allowed
 from applypilot.dashboard_server import (
     DashboardHTTPServer,
     DashboardRequestHandler,
+    clear_tailored_resume,
     delete_job,
     import_external_job,
     job_import_status,
@@ -77,6 +79,53 @@ def test_import_external_job_and_duplicate(db) -> None:
     assert job_import_status(first["url"], db)["status"] == "pending"
 
 
+def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "automatic-score.db"
+    connection = init_db(db_path)
+    imported = import_external_job("https://example.com/jobs/score-me", connection)
+    connection.close()
+    calls = []
+
+    def fake_scrape(conn, _site, jobs, delay):
+        assert jobs == [(imported["url"], "Imported job from example.com")]
+        assert delay == 0
+        conn.execute(
+            "UPDATE jobs SET full_description = ?, detail_scraped_at = ? WHERE url = ?",
+            ("Python API role", "2026-08-09T12:00:00+00:00", imported["url"]),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+    monkeypatch.setattr(config, "get_tier", lambda: 2)
+    monkeypatch.setattr("applypilot.enrichment.detail.scrape_site_batch", fake_scrape)
+    monkeypatch.setattr(
+        "applypilot.scoring.scorer.run_scoring",
+        lambda **kwargs: calls.append(kwargs) or {"scored": 1},
+    )
+
+    dashboard_server.enrich_external_job(imported["url"])
+
+    assert calls == [{"target_url": imported["url"], "workers": 1}]
+
+
+def test_import_status_waits_for_automatic_score(db, monkeypatch) -> None:
+    imported = import_external_job("https://example.com/jobs/scoring-status", db)
+    db.execute(
+        "UPDATE jobs SET full_description = ?, detail_scraped_at = ? WHERE url = ?",
+        ("Python API role", "2026-08-09T12:00:00+00:00", imported["url"]),
+    )
+    db.commit()
+    monkeypatch.setattr(config, "get_tier", lambda: 2)
+
+    assert job_import_status(imported["url"], db)["status"] == "scoring"
+
+    db.execute("UPDATE jobs SET fit_score = 8 WHERE url = ?", (imported["url"],))
+    db.commit()
+    status = job_import_status(imported["url"], db)
+    assert status["status"] == "complete"
+    assert status["score"] == 8
+
+
 def test_mark_job_applied(db) -> None:
     imported = import_external_job("https://example.com/jobs/applied", db)
 
@@ -122,6 +171,121 @@ def test_delete_job(db) -> None:
 def test_delete_job_requires_url(db) -> None:
     with pytest.raises(ValueError, match="Job URL is required"):
         delete_job("", db)
+
+
+def test_clear_tailored_resume_deletes_files_and_preserves_attempts(
+    db, tmp_path, monkeypatch
+) -> None:
+    tailored_dir = tmp_path / "tailored"
+    tailored_dir.mkdir()
+    monkeypatch.setattr(config, "TAILORED_DIR", tailored_dir)
+
+    stem = "Acme_Engineer_Tailored_Resume"
+    tex_path = tailored_dir / f"{stem}.tex"
+    siblings = [
+        tex_path,
+        tailored_dir / f"{stem}.pdf",
+        tailored_dir / f"{stem}.txt",
+        tailored_dir / f"{stem}_REPORT.json",
+        tailored_dir / f"{stem}_JOB.txt",
+    ]
+    for path in siblings:
+        path.write_text("artifact", encoding="utf-8")
+
+    imported = import_external_job("https://example.com/jobs/clear-tailored", db)
+    cover_path = str(tmp_path / "cover.txt")
+    db.execute(
+        """
+        UPDATE jobs
+        SET tailored_resume_path = ?,
+            tailored_at = ?,
+            tailor_attempts = ?,
+            cover_letter_path = ?,
+            cover_letter_at = ?
+        WHERE url = ?
+        """,
+        (
+            str(tex_path),
+            "2026-01-01T00:00:00+00:00",
+            3,
+            cover_path,
+            "2026-01-02T00:00:00+00:00",
+            imported["url"],
+        ),
+    )
+    db.commit()
+
+    result = clear_tailored_resume(imported["url"], db)
+
+    assert result["cleared"] is True
+    assert result["status"] == "cleared"
+    assert set(result["deleted_files"]) == {str(path) for path in siblings}
+    for path in siblings:
+        assert not path.exists()
+
+    row = db.execute(
+        """
+        SELECT tailored_resume_path, tailored_at, tailor_attempts,
+               cover_letter_path, cover_letter_at
+        FROM jobs WHERE url = ?
+        """,
+        (imported["url"],),
+    ).fetchone()
+    assert row["tailored_resume_path"] is None
+    assert row["tailored_at"] is None
+    assert row["tailor_attempts"] == 3
+    assert row["cover_letter_path"] == cover_path
+    assert row["cover_letter_at"] == "2026-01-02T00:00:00+00:00"
+
+
+def test_clear_tailored_resume_reports_missing_and_not_tailored(db) -> None:
+    missing = clear_tailored_resume("https://example.com/jobs/missing", db)
+    assert missing == {
+        "cleared": False,
+        "url": "https://example.com/jobs/missing",
+        "status": "missing",
+    }
+
+    imported = import_external_job("https://example.com/jobs/untailored", db)
+    not_tailored = clear_tailored_resume(imported["url"], db)
+    assert not_tailored == {
+        "cleared": False,
+        "url": imported["url"],
+        "status": "not_tailored",
+    }
+
+
+def test_clear_tailored_resume_rejects_path_outside_tailored_dir(
+    db, tmp_path, monkeypatch
+) -> None:
+    tailored_dir = tmp_path / "tailored"
+    tailored_dir.mkdir()
+    monkeypatch.setattr(config, "TAILORED_DIR", tailored_dir)
+
+    outside = tmp_path / "outside.tex"
+    outside.write_text("private", encoding="utf-8")
+    imported = import_external_job("https://example.com/jobs/bad-path", db)
+    db.execute(
+        """
+        UPDATE jobs
+        SET tailored_resume_path = ?, tailored_at = ?, tailor_attempts = 2
+        WHERE url = ?
+        """,
+        (str(outside), "2026-01-01T00:00:00+00:00", imported["url"]),
+    )
+    db.commit()
+
+    with pytest.raises(PermissionError):
+        clear_tailored_resume(imported["url"], db)
+
+    assert outside.exists()
+    row = db.execute(
+        "SELECT tailored_resume_path, tailored_at, tailor_attempts FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert row["tailored_resume_path"] == str(outside)
+    assert row["tailored_at"] == "2026-01-01T00:00:00+00:00"
+    assert row["tailor_attempts"] == 2
 
 
 @pytest.fixture
@@ -1008,6 +1172,8 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "Resume PDF" in html
     assert "kind=tex" in html
     assert "kind=report" in html
+    assert "clear-tailored-btn" in html
+    assert "/api/jobs/tailored/clear" in html
     assert 'class="tailor-job-btn"' in html
     assert "/api/tailoring/job" in html
     assert 'data-view="dashboard"' in html

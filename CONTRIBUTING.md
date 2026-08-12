@@ -48,6 +48,30 @@ Workday employer portals are configured in `config/employers.yaml`. To add a new
 4. Test discovery: `applypilot discover --employer "Company Name"`
 5. Submit a PR with the new entry
 
+### Adding Ashby or Lever Employers
+
+Ashby and Lever expose public, unauthenticated job-board APIs. Add an Ashby
+company to `src/applypilot/config/ashby_companies.yaml` using the slug from
+`https://jobs.ashbyhq.com/<slug>`:
+
+```yaml
+companies:
+  example: { name: "Example", board: "example" }
+```
+
+Add a Lever company to `src/applypilot/config/lever_companies.yaml` using the
+slug from `https://jobs.lever.co/<slug>`. Lever boards hosted in the EU must
+also set `region: eu`:
+
+```yaml
+companies:
+  example: { name: "Example", site: "example" }
+  example_eu: { name: "Example EU", site: "example-eu", region: "eu" }
+```
+
+Run `applypilot run discover` and confirm the source reports jobs without an
+adapter error.
+
 ### Adding New Career Sites
 
 Direct career site scrapers are configured in `config/sites.yaml`. To add a new site:

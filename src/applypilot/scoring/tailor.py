@@ -241,7 +241,7 @@ Do not add a skill or technology absent from the master resume.
 
 EDUCATION: Return the source education as structured entries. Keep it immediately after the header.
 
-SKILLS: Select and reorder source-supported skills so the job's must-haves appear first.
+SKILLS: Structure skills with exactly these five categories, in this order: Languages, Technologies/Frameworks, Systems/DevOps, Databases/Storage, Concepts. Select or omit source-supported skills within each category so only job-relevant skills remain; put the job's must-haves first. Include every category key; use an empty list when a category has no source-supported skills relevant to the job.
 
 BULLETS: Return only source bullet IDs. Maximum 4 bullet IDs per entity. Bullet length, wording, punctuation, and line wrapping are not your concern.
 
@@ -271,7 +271,13 @@ Return ONLY valid JSON. Each rationale must be one concise sentence.
   "projects": [
     {{"entity_id":"project_1","name":"...","technologies":["..."],"dates":"...","rationale":"...","bullet_ids":["bullet_010","bullet_011","bullet_012"]}}
   ],
-  "skills": {{"Languages":["..."],"Frameworks":["..."],"Developer Tools":["..."],"Libraries":["..."]}},
+  "skills": {{
+    "Languages": ["..."],
+    "Technologies/Frameworks": ["..."],
+    "Systems/DevOps": ["..."],
+    "Databases/Storage": ["..."],
+    "Concepts": ["..."]
+  }},
   "courses": [],
   "awards": [],
   "keyword_usage": {{"incorporated":["..."],"skipped":[{{"keyword":"...","reason":"unsupported"}}]}}
@@ -302,7 +308,7 @@ ISSUES: (list any problems, or "none")
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
 - Reorder bullets and projects to put the most relevant first
 - Select or omit existing bullets without changing their text
-- Reorder the skills section to put job-relevant skills first
+- Select or omit skills so only job-relevant ones remain, ordered with must-haves first
 
 ## WHAT IS FABRICATION (FAIL for these):
 1. Adding tools, languages, or frameworks that appear in neither the original resume nor this confirmed profile boundary: {skills_str}
@@ -850,9 +856,7 @@ def run_tailoring(
                     from applypilot.scoring.latex import fit_one_page
 
                     fitted, tex_source, pdf_bytes, fit_changes, visual_audit = fit_one_page(
-                        report["structured_data"],
-                        profile,
-                        master_resume_text=resume_text,
+                        report["structured_data"], profile
                     )
                     report["structured_data"] = fitted
                     report["fit_to_one_page"] = {

@@ -385,6 +385,8 @@ def _validate_searches(searches: object) -> dict:
         "accept_remote_anywhere",
         "accept_unknown_locations",
         "greenhouse_location_filter",
+        "ashby_location_filter",
+        "lever_location_filter",
         "bigtech_location_filter",
     ):
         if key in searches and not isinstance(searches[key], bool):
@@ -512,7 +514,8 @@ def job_import_status(raw_url: str, conn: sqlite3.Connection | None = None) -> d
     url = normalize_job_url(raw_url)
     conn = conn or get_connection()
     row = conn.execute(
-        "SELECT url, title, site, full_description, detail_scraped_at, detail_error "
+        "SELECT url, title, site, strategy, full_description, detail_scraped_at, "
+        "detail_error, fit_score "
         "FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
@@ -521,7 +524,10 @@ def job_import_status(raw_url: str, conn: sqlite3.Connection | None = None) -> d
     if row["detail_error"]:
         status = "error"
     elif row["detail_scraped_at"] and row["full_description"]:
-        status = "complete"
+        from applypilot.config import get_tier
+
+        needs_score = row["strategy"] == "external_upload" and get_tier() >= 2
+        status = "scoring" if needs_score and row["fit_score"] is None else "complete"
     elif row["detail_scraped_at"]:
         status = "partial"
     else:
@@ -531,6 +537,7 @@ def job_import_status(raw_url: str, conn: sqlite3.Connection | None = None) -> d
         "status": status,
         "title": row["title"],
         "site": row["site"],
+        "score": row["fit_score"],
         "error": row["detail_error"],
     }
 
@@ -602,6 +609,58 @@ def load_tailored_artifact(
     return path, path.read_bytes(), content_types[kind]
 
 
+def clear_tailored_resume(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
+    """Remove tailored-resume artifacts for a job and clear its tailored DB fields."""
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("Job URL is required")
+    url = raw_url.strip()
+    if len(url) > MAX_URL_LENGTH:
+        raise ValueError("URL is too long")
+
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT tailored_resume_path FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row:
+        return {"cleared": False, "url": url, "status": "missing"}
+    stored = (row["tailored_resume_path"] or "").strip()
+    if not stored:
+        return {"cleared": False, "url": url, "status": "not_tailored"}
+
+    stored_path = Path(stored).resolve()
+    tailored_root = config.TAILORED_DIR.resolve()
+    if stored_path.parent != tailored_root:
+        raise PermissionError("Stored artifact path is outside the tailored resume directory")
+
+    siblings = (
+        stored_path.with_suffix(".tex"),
+        stored_path.with_suffix(".pdf"),
+        stored_path.with_suffix(".txt"),
+        stored_path.with_name(f"{stored_path.stem}_REPORT.json"),
+        stored_path.with_name(f"{stored_path.stem}_JOB.txt"),
+    )
+    deleted_files: list[str] = []
+    for path in siblings:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        deleted_files.append(str(path))
+
+    conn.execute(
+        "UPDATE jobs SET tailored_resume_path = NULL, tailored_at = NULL WHERE url = ?",
+        (url,),
+    )
+    conn.commit()
+    return {
+        "cleared": True,
+        "url": url,
+        "status": "cleared",
+        "deleted_files": deleted_files,
+    }
+
+
 def delete_job(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
     """Delete a job posting from the dashboard database."""
     if not isinstance(raw_url, str) or not raw_url.strip():
@@ -629,7 +688,7 @@ def delete_job(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
 
 
 def enrich_external_job(url: str) -> None:
-    """Enrich one imported URL in an isolated background worker."""
+    """Enrich and, when configured, score one imported URL."""
     from applypilot.enrichment.detail import scrape_site_batch
 
     conn = get_connection()
@@ -645,6 +704,27 @@ def enrich_external_job(url: str) -> None:
         conn.execute(
             "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
             (str(exc)[:500], now, url),
+        )
+        conn.commit()
+        return
+
+    from applypilot.config import get_tier
+
+    if get_tier() < 2:
+        return
+
+    try:
+        from applypilot.scoring.scorer import run_scoring
+
+        run_scoring(target_url=url, workers=1)
+    except Exception as exc:
+        # Scoring configuration/runtime failures should not make a successful
+        # detail scrape look like an enrichment failure.
+        log.exception("External job scoring failed for %s", url)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE jobs SET fit_score = 0, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (f"Scoring error: {str(exc)[:500]}", now, url),
         )
         conn.commit()
 
@@ -1097,6 +1177,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/jobs",
             "/api/jobs/applied",
             "/api/jobs/delete",
+            "/api/jobs/tailored/clear",
             "/api/discovery",
             "/api/tailoring",
             "/api/tailoring/job",
@@ -1127,8 +1208,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 result = mark_job_applied(payload.get("url", ""))
             elif path == "/api/jobs/delete":
                 result = delete_job(payload.get("url", ""))
+            elif path == "/api/jobs/tailored/clear":
+                result = clear_tailored_resume(payload.get("url", ""))
             else:
                 result = import_external_job(payload.get("url", ""))
+        except PermissionError as exc:
+            self._send_json(403, {"error": str(exc)})
+            return
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -1159,6 +1245,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
             else:
                 self._send_json(404, {"error": "Job not found"})
+            return
+
+        if path == "/api/jobs/tailored/clear":
+            if result["cleared"]:
+                self._send_json(200, result)
+            elif result["status"] == "missing":
+                self._send_json(404, {"error": "Job not found"})
+            else:
+                self._send_json(404, {"error": "Tailored resume not found"})
             return
 
         if result["created"]:

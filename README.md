@@ -125,6 +125,8 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `LLM_RPM`, `LLM_TPM`
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
+- `config/ashby_companies.yaml` - Ashby public job-board registry
+- `config/lever_companies.yaml` - Lever public job-board registry (global and EU)
 - `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
 - `config/searches.example.yaml` - Example search configuration
 
@@ -133,7 +135,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `LLM_RPM`, `LLM_TPM`
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes configured Workday, Greenhouse, Ashby, and Lever employer portals, plus proprietary big-tech career sites. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.

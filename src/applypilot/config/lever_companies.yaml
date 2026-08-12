@@ -1,0 +1,6 @@
+# Public Lever job sites. The site slug is the path segment in
+# https://jobs.lever.co/<site>. Use region: eu for api.eu.lever.co boards.
+companies:
+  achievers: { name: "Achievers", site: "achievers" }
+  waabi: { name: "Waabi", site: "waabi" }
+  caseware: { name: "Caseware", site: "caseware" }

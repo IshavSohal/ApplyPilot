@@ -35,7 +35,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (Greenhouse + Workday + big-tech)"},
+    "discover": {"desc": "Job discovery (Greenhouse + Workday + Ashby + Lever + big-tech)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -71,7 +71,9 @@ def _run_discover(workers: int = 3) -> dict:
             "Discovery title audit: %d checked, %d accepted, %d rejected, %d changed",
             audit["checked"], audit["accepted"], audit["rejected"], audit["changed"],
         )
-    stats: dict = {"greenhouse": None, "workday": None, "bigtech": None}
+    stats: dict = {
+        "greenhouse": None, "workday": None, "ashby": None, "lever": None, "bigtech": None,
+    }
     totals = {
         key: 0
         for key in (
@@ -103,6 +105,19 @@ def _run_discover(workers: int = 3) -> dict:
         log.error("Workday scraper failed: %s", e)
         console.print(f"  [red]Workday error:[/red] {e}")
         stats["workday"] = f"error: {e}"
+
+    for provider in ("ashby", "lever"):
+        console.print(f"  [cyan]{provider.title()} boards crawl...[/cyan]")
+        try:
+            from applypilot.discovery.ats import run_ats_discovery
+            result = run_ats_discovery(provider, workers=workers)
+            stats[provider] = "ok"
+            for key in totals:
+                totals[key] += result.get(key, 0)
+        except Exception as e:
+            log.error("%s crawl failed: %s", provider.title(), e)
+            console.print(f"  [red]{provider.title()} error:[/red] {e}")
+            stats[provider] = f"error: {e}"
 
     console.print("  [cyan]Big-tech career sites crawl...[/cyan]")
     try:

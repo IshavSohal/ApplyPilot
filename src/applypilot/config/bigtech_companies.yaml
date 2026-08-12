@@ -26,3 +26,8 @@ companies:
     name: "Apple"
     provider: "apple"
     max_pages: 5
+
+  microsoft:
+    name: "Microsoft"
+    provider: "microsoft"
+    max_pages: 5

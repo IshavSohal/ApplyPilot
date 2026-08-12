@@ -1,0 +1,5 @@
+# Public Ashby job boards. The board slug is the path segment in
+# https://jobs.ashbyhq.com/<board>.
+companies:
+  openai: { name: "OpenAI", board: "openai" }
+  linear: { name: "Linear", board: "linear" }

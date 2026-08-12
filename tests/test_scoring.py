@@ -82,6 +82,32 @@ def test_experience_evidence_must_appear_in_posting() -> None:
     )
 
 
+def test_posting_required_years_extracts_hard_minimum() -> None:
+    description = """Minimum Qualifications
+Bachelor's degree or equivalent experience.
+5+ years of software development experience.
+Preferred Qualifications
+8+ years of software development experience.
+"""
+
+    assert scorer._posting_required_years(description) == 5
+
+
+def test_posting_required_years_uses_least_demanding_alternative() -> None:
+    description = (
+        "Bachelor's degree and 1+ years of experience; OR 3+ years of "
+        "professional experience in lieu of a degree."
+    )
+
+    assert scorer._posting_required_years(description) == 1
+
+
+def test_posting_required_years_ignores_preferred_requirement() -> None:
+    assert scorer._posting_required_years(
+        "PREFERRED SKILLS AND EXPERIENCE:\n5+ years of web development experience"
+    ) is None
+
+
 def test_score_job_passes_candidate_years_and_applies_cap(monkeypatch) -> None:
     client = _ScoringClient(_response(score=8, years="5", kind="REQUIRED"))
     monkeypatch.setattr(scorer, "get_client", lambda: client)
@@ -97,7 +123,25 @@ def test_score_job_does_not_cap_preferred_experience(monkeypatch) -> None:
     client = _ScoringClient(_response(score=8, years="5", kind="PREFERRED"))
     monkeypatch.setattr(scorer, "get_client", lambda: client)
 
-    result = scorer.score_job("Python backend developer", _job(), candidate_years=2)
+    result = scorer.score_job(
+        "Python backend developer",
+        _job("Preferred Qualifications:\n5+ years of professional experience"),
+        candidate_years=2,
+    )
+
+    assert result["score"] == 8
+    assert "guardrail" not in result["reasoning"]
+
+
+def test_score_job_does_not_cap_preferred_section_mislabeled_as_required(monkeypatch) -> None:
+    client = _ScoringClient(_response(score=8, years="5", kind="REQUIRED"))
+    monkeypatch.setattr(scorer, "get_client", lambda: client)
+
+    result = scorer.score_job(
+        "Python backend developer",
+        _job("Preferred Qualifications:\n5+ years of professional experience"),
+        candidate_years=2,
+    )
 
     assert result["score"] == 8
     assert "guardrail" not in result["reasoning"]
@@ -115,6 +159,20 @@ def test_score_job_ignores_ungrounded_required_experience(monkeypatch) -> None:
 
     assert result["score"] == 8
     assert "guardrail" not in result["reasoning"]
+
+
+def test_score_job_caps_when_model_omits_required_experience(monkeypatch) -> None:
+    response = _response(score=8, years="NONE", kind="NONE").replace(
+        "EXPERIENCE_EVIDENCE: 5+ years of professional experience",
+        "EXPERIENCE_EVIDENCE: NONE",
+    )
+    client = _ScoringClient(response)
+    monkeypatch.setattr(scorer, "get_client", lambda: client)
+
+    result = scorer.score_job("Python backend developer", _job(), candidate_years=2)
+
+    assert result["score"] == 5
+    assert "raw score 8 was capped at 5" in result["reasoning"]
 
 
 def test_invalid_candidate_years_disable_cap() -> None:
@@ -231,3 +289,40 @@ def test_run_scoring_removes_valid_low_scores_but_preserves_errors(monkeypatch, 
     assert result["removed"] == 2
     assert result["errors"] == 1
     assert remaining == {"Error": 0, "High": 7}
+
+
+def test_run_scoring_target_url_only_scores_requested_job(monkeypatch, tmp_path) -> None:
+    conn = init_db(tmp_path / "targeted-scoring.db")
+    urls = ["https://example.com/imported", "https://example.com/unrelated"]
+    for url in urls:
+        conn.execute(
+            "INSERT INTO jobs (url, title, site, full_description) VALUES (?, ?, ?, ?)",
+            (url, url.rsplit("/", 1)[-1], "Example Co", "Python APIs"),
+        )
+    conn.commit()
+
+    resume = tmp_path / "resume.txt"
+    resume.write_text("Python developer", encoding="utf-8")
+    monkeypatch.setattr(scorer, "RESUME_PATH", resume)
+    monkeypatch.setattr(scorer, "RESUME_TEX_PATH", tmp_path / "missing.tex")
+    monkeypatch.setattr(scorer, "load_profile", lambda: {"experience": {}})
+    monkeypatch.setattr(scorer, "get_connection", lambda: conn)
+    monkeypatch.setattr(scorer, "get_client", lambda: object())
+    monkeypatch.setattr(
+        scorer,
+        "score_job",
+        lambda *_args, **_kwargs: {
+            "score": 8,
+            "keywords": "Python",
+            "reasoning": "Strong fit",
+        },
+    )
+
+    result = scorer.run_scoring(target_url=urls[0], workers=1)
+
+    rows = conn.execute("SELECT url, fit_score FROM jobs ORDER BY url").fetchall()
+    assert result["scored"] == 1
+    assert [(row["url"], row["fit_score"]) for row in rows] == [
+        (urls[0], 8),
+        (urls[1], None),
+    ]

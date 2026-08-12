@@ -307,7 +307,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
                 '<div class="tailored-artifacts">'
                 '<div><div class="tailored-artifacts-title">Tailored resume</div>'
                 '<div class="tailored-artifacts-copy">Generated specifically for this job posting.</div></div>'
-                f'<div class="tailored-artifact-actions">{artifact_links}</div>'
+                f'<div class="tailored-artifact-actions">{artifact_links}'
+                f'<button class="clear-tailored-btn" data-job-url="{url}" type="button">'
+                'Remove</button></div>'
                 '</div>'
             )
 
@@ -520,6 +522,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .tailored-artifact-actions {{ display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }}
   .artifact-download {{ color: #bfdbfe; font-size: 0.76rem; font-weight: 600; text-decoration: none; padding: 0.35rem 0.6rem; border: 1px solid #60a5fa66; border-radius: 6px; background: #1e3a8a44; }}
   .artifact-download:hover {{ background: #1d4ed866; }}
+  .clear-tailored-btn {{ color: #fca5a5; font-size: 0.76rem; font-weight: 600; padding: 0.35rem 0.6rem; border: 1px solid #f8717166; border-radius: 6px; background: #450a0a44; cursor: pointer; }}
+  .clear-tailored-btn:hover {{ background: #7f1d1d66; }}
+  .clear-tailored-btn:disabled {{ opacity: 0.55; cursor: wait; }}
   .apply-link {{ font-size: 0.8rem; color: #60a5fa; text-decoration: none; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa33; border-radius: 6px; font-weight: 500; }}
   .apply-link:hover {{ background: #60a5fa22; }}
   .mark-applied-btn {{ font-size: 0.8rem; color: #6ee7b7; background: transparent; padding: 0.3rem 0.8rem; border: 1px solid #10b98155; border-radius: 6px; font-weight: 500; cursor: pointer; }}
@@ -900,6 +905,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
       <section class="settings-card">
         <h2>Discovery Filters</h2>
         <label class="check-field"><input type="checkbox" data-search-check="greenhouse_location_filter"> Filter Greenhouse locations</label>
+        <label class="check-field"><input type="checkbox" data-search-check="ashby_location_filter"> Filter Ashby locations</label>
+        <label class="check-field"><input type="checkbox" data-search-check="lever_location_filter"> Filter Lever locations</label>
         <label class="check-field"><input type="checkbox" data-search-check="bigtech_location_filter"> Filter big-tech locations</label>
         <label class="check-field"><input type="checkbox" data-search-check="accept_remote_anywhere"> Accept remote jobs anywhere</label>
         <label class="check-field"><input type="checkbox" data-search-check="accept_unknown_locations"> Accept unknown locations</label>
@@ -1101,7 +1108,10 @@ async function pollPendingImport() {{
     const response = await fetch('/api/jobs/status?url=' + encodeURIComponent(url));
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not check import');
-    if (result.status === 'pending') {{
+    if (result.status === 'pending' || result.status === 'scoring') {{
+      if (result.status === 'scoring') {{
+        setImportStatus('Job details fetched. Scoring fit against your resume...');
+      }}
       window.setTimeout(pollPendingImport, 1500);
       return;
     }}
@@ -1111,7 +1121,10 @@ async function pollPendingImport() {{
       window.setTimeout(() => window.location.reload(), 2500);
       return;
     }}
-    setImportStatus('Job details fetched. Refreshing...');
+    const completion = result.score == null
+      ? 'Job details fetched.'
+      : `Job details fetched and scored. Fit score: ${{result.score}}/10.`;
+    setImportStatus(completion + ' Refreshing...');
     window.setTimeout(() => window.location.reload(), 500);
   }} catch (error) {{
     sessionStorage.removeItem('applypilotPendingImport');
@@ -1397,6 +1410,28 @@ document.addEventListener('click', async event => {{
       applyFilters();
     }} catch (error) {{
       deleteButton.disabled = false;
+      window.alert(error.message);
+    }}
+    return;
+  }}
+
+  const clearTailoredButton = event.target.closest('.clear-tailored-btn');
+  if (clearTailoredButton) {{
+    if (!window.confirm('Remove the tailored resume for this job?')) return;
+    clearTailoredButton.disabled = true;
+    clearTailoredButton.textContent = 'Removing...';
+    try {{
+      const response = await fetch('/api/jobs/tailored/clear', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{url: clearTailoredButton.dataset.jobUrl}})
+      }});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not remove tailored resume');
+      window.location.reload();
+    }} catch (error) {{
+      clearTailoredButton.disabled = false;
+      clearTailoredButton.textContent = 'Remove';
       window.alert(error.message);
     }}
     return;
@@ -1710,7 +1745,7 @@ function populateSearchForm() {{
   }});
   document.querySelectorAll('[data-search-check]').forEach(input => {{
     let value = getPath(searches, input.dataset.searchCheck);
-    if (value === undefined && input.dataset.searchCheck === 'bigtech_location_filter') {{
+    if (value === undefined && ['ashby_location_filter', 'lever_location_filter', 'bigtech_location_filter'].includes(input.dataset.searchCheck)) {{
       value = searches.greenhouse_location_filter;
     }}
     input.checked = Boolean(value);

@@ -102,6 +102,8 @@ location_reject_non_remote:
   - "Philippines"
 
 greenhouse_location_filter: true
+ashby_location_filter: true
+lever_location_filter: true
 bigtech_location_filter: true
 
 # Country for Indeed/LinkedIn/Google Jobs searches

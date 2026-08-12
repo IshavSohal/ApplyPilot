@@ -94,6 +94,83 @@ def _evidence_is_grounded(evidence: str, job_description: str) -> bool:
     return bool(normalized_evidence) and normalized_evidence in normalized_description
 
 
+_YEAR_REQUIREMENT_RE = re.compile(
+    r"(?P<minimum>\d+(?:\.\d+)?)\s*"
+    r"(?:(?:[-\u2013\u2014]|to)\s*\d+(?:\.\d+)?|\+)?\s*"
+    r"(?:years?|yrs?)\b",
+    re.IGNORECASE,
+)
+_PREFERRED_MARKERS = (
+    "preferred",
+    "ideally",
+    "nice to have",
+    "nice-to-have",
+    "an asset",
+    "a plus",
+    "bonus",
+)
+
+
+def _posting_required_years(job_description: str) -> float | None:
+    """Extract the strongest unambiguously mandatory experience minimum.
+
+    This is a deterministic backstop for inconsistent LLM extraction. Each
+    line is treated as one qualification; alternatives on the same line use
+    the least-demanding path, while separate mandatory qualifications use the
+    highest minimum. Preferred sections and non-experience durations are
+    ignored.
+    """
+    required: list[float] = []
+    in_preferred_section = False
+
+    for raw_line in re.split(r"[\r\n]+", job_description):
+        line = " ".join(raw_line.split())
+        if not line:
+            continue
+        lowered = line.lower()
+
+        # Track common section headings, including headings followed by items
+        # on the same line. A new required/minimum heading ends the section.
+        if re.match(r"^(?:minimum|required|basic|must[- ]have) qualifications?\b", lowered):
+            in_preferred_section = False
+        elif re.match(r"^(?:preferred|nice[- ]to[- ]have|bonus)\b", lowered):
+            in_preferred_section = True
+
+        if "experience" not in lowered:
+            continue
+        if in_preferred_section or any(marker in lowered for marker in _PREFERRED_MARKERS):
+            continue
+
+        matches = list(_YEAR_REQUIREMENT_RE.finditer(line))
+        if not matches:
+            continue
+
+        # Avoid unrelated durations elsewhere in a long prose line. The
+        # number must be reasonably close to the word "experience".
+        experience_positions = [m.start() for m in re.finditer(r"\bexperience\b", lowered)]
+        values = [
+            float(match.group("minimum"))
+            for match in matches
+            if min(abs(match.start() - pos) for pos in experience_positions) <= 100
+        ]
+        if values:
+            required.append(min(values))
+
+    return max(required) if required else None
+
+
+def _grounded_required_years(job_description: str) -> float | None:
+    """Return a posting-grounded mandatory minimum despite LLM field drift."""
+    posting_years = _posting_required_years(job_description)
+    if posting_years is not None:
+        return posting_years
+
+    # Never enforce a number that cannot be independently located in a hard
+    # requirement. This also protects preferred qualifications that the model
+    # accidentally labels as mandatory.
+    return None
+
+
 def _parse_score_response(response: str) -> dict:
     """Parse the LLM's score response into structured data.
 
@@ -183,30 +260,24 @@ def score_job(resume_text: str, job: dict, candidate_years: float | None = None)
         response = client.chat(messages, max_tokens=1024, temperature=0.2)
         result = _parse_score_response(response)
         raw_score = result["score"]
+        description = job.get("full_description") or ""
+        grounded_required_years = _grounded_required_years(description)
         cap = _experience_score_cap(
             candidate_years,
-            result["required_years"],
-            result["requirement_type"],
+            grounded_required_years,
+            "REQUIRED" if grounded_required_years is not None else result["requirement_type"],
         )
-        if cap is not None and not _evidence_is_grounded(
-            result["experience_evidence"],
-            job.get("full_description") or "",
-        ):
-            log.warning(
-                "Ignoring ungrounded experience requirement for '%s': %s",
-                job.get("title", "?"),
-                result["experience_evidence"] or "no evidence returned",
-            )
-            cap = None
         if raw_score and cap is not None and raw_score > cap:
             result["score"] = cap
+            result["required_years"] = grounded_required_years
+            result["requirement_type"] = "REQUIRED"
             evidence = (
                 f" Requirement evidence: {result['experience_evidence']}."
                 if result["experience_evidence"] else ""
             )
             result["reasoning"] = (
                 f"{result['reasoning']} Experience guardrail applied: candidate has "
-                f"{candidate_years:g} years versus {result['required_years']:g} required; "
+                f"{candidate_years:g} years versus {grounded_required_years:g} required; "
                 f"raw score {raw_score} was capped at {cap}.{evidence}"
             ).strip()
         return result
@@ -241,13 +312,20 @@ def _remove_stored_low_scores(conn) -> int:
     return max(getattr(cursor, "rowcount", 0), 0)
 
 
-def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict:
+def run_scoring(
+    limit: int = 0,
+    rescore: bool = False,
+    workers: int = 3,
+    target_url: str | None = None,
+) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
         limit: Maximum number of jobs to score in this run.
         rescore: If True, re-score all jobs (not just unscored ones).
         workers: Maximum number of concurrent LLM scoring requests.
+        target_url: When supplied, score only this job. This is used for jobs
+            imported directly by URL so unrelated pending jobs are untouched.
 
     Returns:
         {"scored": int, "removed": int, "errors": int, "elapsed": float,
@@ -266,7 +344,16 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
         )
     conn = get_connection()
 
-    if rescore:
+    if target_url:
+        query = (
+            "SELECT * FROM jobs WHERE url = ? AND full_description IS NOT NULL "
+            "AND COALESCE(discovery_status, 'accepted') = 'accepted'"
+        )
+        params: tuple[object, ...] = (target_url,)
+        if not rescore:
+            query += " AND fit_score IS NULL"
+        jobs = conn.execute(query, params).fetchall()
+    elif rescore:
         query = (
             "SELECT * FROM jobs WHERE full_description IS NOT NULL "
             "AND COALESCE(discovery_status, 'accepted') = 'accepted'"
@@ -278,7 +365,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
         jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
 
     if not jobs:
-        removed = _remove_stored_low_scores(conn)
+        removed = _remove_stored_low_scores(conn) if target_url is None else 0
         if removed:
             log.info("Removed %d stored job(s) with score <= %d.", removed, LOW_SCORE_REMOVAL_MAX)
         log.info("No unscored jobs with descriptions found.")
@@ -348,7 +435,8 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
 
     # A normal scoring run processes only pending jobs, so also remove any
     # valid low scores left by older versions or interrupted runs.
-    removed += _remove_stored_low_scores(conn)
+    if target_url is None:
+        removed += _remove_stored_low_scores(conn)
 
     elapsed = time.time() - t0
     log.info(

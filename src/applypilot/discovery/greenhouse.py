@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import yaml
 
@@ -437,11 +437,65 @@ def _fetch_meta_jobs(company: dict, terms: list[str]) -> list[dict]:
     return list(jobs.values())
 
 
+def _fetch_microsoft_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from Microsoft's public Eightfold/PCSX search endpoint."""
+    origin = "https://apply.careers.microsoft.com"
+    endpoint = f"{origin}/api/pcsx/search"
+    jobs: dict[str, dict] = {}
+    page_size = 10
+    max_pages = int(company.get("max_pages", 5))
+
+    for term in terms or [""]:
+        for page in range(max_pages):
+            params = {
+                "domain": "microsoft.com",
+                "query": term,
+                "start": page * page_size,
+                "sort_by": "relevance",
+            }
+            payload = json.loads(
+                _http_request(
+                    f"{endpoint}?{urllib.parse.urlencode(params)}",
+                    headers={"Accept": "application/json"},
+                )
+            )
+            data = payload.get("data", {}) or {}
+            results = data.get("positions", []) or []
+            for item in results:
+                job_id = str(item.get("id") or "")
+                if not job_id:
+                    continue
+                locations = item.get("locations") or item.get("standardizedLocations") or []
+                position_path = item.get("positionUrl") or f"/careers/job/{job_id}"
+                posted_at = None
+                if item.get("postedTs"):
+                    try:
+                        posted_at = datetime.fromtimestamp(
+                            int(item["postedTs"]), UTC
+                        ).date().isoformat()
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                jobs[job_id] = {
+                    "title": item.get("name"),
+                    "location": "; ".join(str(location) for location in locations),
+                    "url": urllib.parse.urljoin(origin, position_path),
+                    "content": "",
+                    "content_is_full": False,
+                    "posted_at": posted_at,
+                }
+
+            total = int(data.get("count") or len(results))
+            if len(results) < page_size or (page + 1) * page_size >= total:
+                break
+    return list(jobs.values())
+
+
 BIGTECH_FETCHERS = {
     "google": _fetch_google_jobs,
     "amazon": _fetch_amazon_jobs,
     "apple": _fetch_apple_jobs,
     "meta": _fetch_meta_jobs,
+    "microsoft": _fetch_microsoft_jobs,
 }
 
 
