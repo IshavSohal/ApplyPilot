@@ -23,6 +23,7 @@ from applypilot.dashboard_server import (
     delete_job,
     import_external_job,
     job_import_status,
+    load_dashboard_company_logo,
     load_dashboard_resume,
     load_dashboard_settings,
     mark_job_applied,
@@ -537,6 +538,53 @@ def test_dashboard_resume_rejects_empty_content(settings_files) -> None:
         save_dashboard_resume("resume.txt", " \n\t")
 
 
+def test_remove_latex_comments_preserves_escaped_and_verbatim_percent() -> None:
+    source = (
+        "% heading comment\n"
+        "Value 10\\% % inline comment\n"
+        "Escaped slash \\\\% removed\n"
+        "\\verb|literal % value| % trailing comment\n"
+        "\\begin{verbatim}\n"
+        "literal % value\n"
+        "\\end{verbatim}\n"
+        "\\begin{document}Done\\end{document}\n"
+    )
+
+    cleaned, count = dashboard_server.remove_latex_comments(source)
+
+    assert count == 4
+    assert cleaned == (
+        "\n"
+        "Value 10\\%\n"
+        "Escaped slash \\\\\n"
+        "\\verb|literal % value|\n"
+        "\\begin{verbatim}\n"
+        "literal % value\n"
+        "\\end{verbatim}\n"
+        "\\begin{document}Done\\end{document}\n"
+    )
+
+
+def test_dashboard_latex_upload_can_remove_comments(settings_files) -> None:
+    source = (
+        "% remove this\n"
+        "\\documentclass{article}\n"
+        "\\begin{document}Rate: 10\\% % and this\n"
+        "\\end{document}\n"
+    )
+
+    result = save_dashboard_resume("resume.tex", source, remove_comments=True)
+
+    assert result["comments_removed"] == 2
+    assert "% remove this" not in result["content"]
+    assert r"10\%" in result["content"]
+
+
+def test_dashboard_resume_rejects_non_boolean_remove_comments(settings_files) -> None:
+    with pytest.raises(ValueError, match="must be a boolean"):
+        save_dashboard_resume("resume.tex", "Resume", remove_comments="yes")
+
+
 def test_prepare_tex_for_tectonic_disables_pdftex_glyph_map() -> None:
     source = (
         "\\documentclass{article}\n"
@@ -584,7 +632,10 @@ def test_extract_job_metadata_from_json_ld() -> None:
                     "@type": "JobPosting",
                     "title": "Junior Software Engineer",
                     "datePosted": "2026-07-20",
-                    "hiringOrganization": {"name": "Example Corp"},
+                    "hiringOrganization": {
+                        "name": "Example Corp",
+                        "logo": {"@type": "ImageObject", "url": "https://example.com/logo.png"},
+                    },
                     "jobLocation": {
                         "@type": "Place",
                         "address": {
@@ -601,6 +652,7 @@ def test_extract_job_metadata_from_json_ld() -> None:
     assert metadata == {
         "title": "Junior Software Engineer",
         "company": "Example Corp",
+        "company_logo": "https://example.com/logo.png",
         "location": "Toronto, ON, Canada",
         "posted_at": "2026-07-20",
     }
@@ -608,10 +660,70 @@ def test_extract_job_metadata_from_json_ld() -> None:
 
 def test_extract_job_metadata_uses_page_title_fallback() -> None:
     metadata = extract_job_metadata(
-        {"page_title": "Backend Engineer | Example Careers", "json_ld": []}
+        {
+            "page_title": "Backend Engineer | Example Careers",
+            "page_icon": "https://example.com/favicon.ico",
+            "json_ld": [],
+        }
     )
     assert metadata["title"] == "Backend Engineer"
     assert metadata["company"] is None
+    assert metadata["company_logo"] == "https://example.com/favicon.ico"
+
+
+def test_extract_job_metadata_resolves_relative_logo_url() -> None:
+    metadata = extract_job_metadata({
+        "final_url": "https://example.com/jobs/engineer",
+        "json_ld": [{
+            "@type": "JobPosting",
+            "title": "Engineer",
+            "hiringOrganization": {"name": "Example Corp", "logo": "/brand/logo.png"},
+        }],
+    })
+
+    assert metadata["company_logo"] == "https://example.com/brand/logo.png"
+
+
+def test_load_dashboard_company_logo_uses_stored_logo_url(db, monkeypatch) -> None:
+    imported = import_external_job("https://example.com/jobs/logo", db)
+    db.execute(
+        "UPDATE jobs SET company = ?, company_logo = ? WHERE url = ?",
+        ("Example Corp", "https://cdn.example.com/logo.png", imported["url"]),
+    )
+    db.commit()
+    calls = []
+
+    def fake_load(company, source_url):
+        calls.append((company, source_url))
+        return b"logo", "image/png"
+
+    monkeypatch.setattr("applypilot.company_logos.load_company_logo", fake_load)
+
+    assert load_dashboard_company_logo(imported["url"], db) == (b"logo", "image/png")
+    assert calls == [("Example Corp", "https://cdn.example.com/logo.png")]
+
+
+def test_load_dashboard_company_logo_backfills_existing_company(db, monkeypatch) -> None:
+    imported = import_external_job("https://example.com/jobs/existing-logo", db)
+    db.execute(
+        "UPDATE jobs SET company = ? WHERE url = ?",
+        ("OpenAI", imported["url"]),
+    )
+    db.commit()
+    calls = []
+
+    def fake_load(company, source_url):
+        calls.append((company, source_url))
+        return (b"logo", "image/x-icon") if source_url.endswith("favicon.ico") else None
+
+    monkeypatch.setattr("applypilot.company_logos.load_company_logo", fake_load)
+
+    assert load_dashboard_company_logo(imported["url"], db) == (b"logo", "image/x-icon")
+    stored = db.execute(
+        "SELECT company_logo FROM jobs WHERE url = ?", (imported["url"],)
+    ).fetchone()[0]
+    assert stored == "https://openai.com/favicon.ico"
+    assert calls == [("OpenAI", "https://openai.com/favicon.ico")]
 
 
 @pytest.mark.parametrize(
@@ -1017,6 +1129,46 @@ def test_tailoring_queue_allows_only_one_outstanding_batch(monkeypatch) -> None:
         server.server_close()
 
 
+def test_tailoring_queue_can_replace_an_existing_resume(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "tailoring-replace.db"
+    conn = init_db(db_path)
+    url = "https://example.com/jobs/replace-resume"
+    conn.execute(
+        "INSERT INTO jobs (url, title, full_description, fit_score, "
+        "tailored_resume_path, tailor_attempts) VALUES (?, 'Engineer', ?, 8, ?, 1)",
+        (url, "Complete description", str(tmp_path / "old.tex")),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        dashboard_server,
+        "get_connection",
+        lambda: get_connection(db_path),
+    )
+
+    default_server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        with pytest.raises(ValueError, match="already has a tailored resume"):
+            start_tailoring(default_server, target_url=url)
+    finally:
+        default_server.server_close()
+
+    finished = threading.Event()
+
+    def execute(request):
+        assert request["replace_existing"] is True
+        finished.set()
+        return "complete", {"approved": 1, "failed": 0, "errors": 0}, None
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        request = start_tailoring(server, target_url=url, replace_existing=True)
+        assert request["replace_existing"] is True
+        assert finished.wait(timeout=2)
+    finally:
+        server.server_close()
+
+
 def test_dashboard_settings_api(settings_files) -> None:
     server = DashboardHTTPServer(
         ("127.0.0.1", 0),
@@ -1047,9 +1199,11 @@ def test_dashboard_settings_api(settings_files) -> None:
                 {
                     "filename": "replacement.tex",
                     "content": (
+                        "% upload comment\n"
                         "\\documentclass{article}\n"
-                        "\\begin{document}\nHello\n\\end{document}\n"
+                        "\\begin{document}\nHello 10\\% % inline\n\\end{document}\n"
                     ),
+                    "remove_comments": True,
                 }
             ).encode(),
             headers={
@@ -1061,6 +1215,9 @@ def test_dashboard_settings_api(settings_files) -> None:
         with urllib.request.urlopen(latex_request) as response:
             latex_uploaded = json.load(response)
         assert latex_uploaded["pdf_available"] is True
+        assert latex_uploaded["comments_removed"] == 2
+        assert "% upload comment" not in latex_uploaded["content"]
+        assert r"10\%" in latex_uploaded["content"]
 
         with urllib.request.urlopen(f"{base_url}/api/resume/pdf") as response:
             assert response.status == 200
@@ -1131,8 +1288,15 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "dashboard.db")
     import_external_job("https://example.com/jobs/active", connection)
     connection.execute(
-        "UPDATE jobs SET full_description = ? WHERE url = ?",
-        ("Complete job description", "https://example.com/jobs/active"),
+        "UPDATE jobs SET full_description = ?, company = ?, company_logo = ?, "
+        "tailored_resume_path = ? WHERE url = ?",
+        (
+            "Complete job description",
+            "Example Corp",
+            "https://cdn.example.com/logo.png",
+            str(tmp_path / "Active_Engineer_Tailored_Resume.tex"),
+            "https://example.com/jobs/active",
+        ),
     )
     applied = import_external_job("https://example.com/jobs/done", connection)
     mark_job_applied(applied["url"], connection)
@@ -1158,11 +1322,39 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert 'data-applied="true"' in html
     assert "Mark as applied" in html
     assert "delete-job-btn" in html
+    assert 'id="workspace-delete-job"' in html
+    assert "deleteWorkspaceJob" in html
     assert "/api/jobs/delete" in html
     assert "All Sources" in html
     assert 'data-site="example.com"' in html
     assert "filterSource(this.value)" in html
     assert "Run Discovery" in html
+    assert 'class="concept-workspace"' in html
+    assert 'id="workspace-resizer"' in html
+    assert "applypilotJobInboxWidth" in html
+    assert "setPointerCapture" in html
+    assert "scrollbar-color: #aeb8c7 #eef1f6" in html
+    assert 'html[data-theme="dark"] *::-webkit-scrollbar-thumb' in html
+    assert "View report" not in html
+    assert "syncWorkspaceTailoringControls" in html
+    assert "border-radius: 999px" in html
+    assert 'class="company-logo"' in html
+    assert ".company-logo[hidden] { display: none; }" in html
+    assert "/api/jobs/company-logo?url=" in html
+    assert 'id="run-pipeline-button"' in html
+    assert "'/api/pipeline'" in html
+    assert 'data-workspace-tab="resume"' in html
+    assert 'data-workspace-tab="report"' in html
+    assert 'data-workspace-filter="all">All active (1)' in html
+    assert 'data-workspace-filter="strong">Strong fit (0)' in html
+    assert 'data-workspace-filter="tailored">Tailored (0)' in html
+    assert 'data-workspace-filter="applied">Applied (1)' in html
+    assert "updateWorkspaceFilterCounts()" in html
+    assert "workspaceFilter === 'applied'" in html
+    assert "!job.applied && (" in html
+    assert 'id="spend-widget"' in html
+    assert "'/api/usage/summary'" in html
+    assert "'/api/settings/pricing'" in html
     assert "/api/discovery/status" in html
     assert "Run Tailoring" in html
     assert "/api/tailoring/status" in html
@@ -1173,17 +1365,29 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "kind=tex" in html
     assert "kind=report" in html
     assert "clear-tailored-btn" in html
+    assert "Tailor again" in html
+    assert 'replace_existing: workspaceJob.has_tailored' in html
+    assert 'data-replace-existing="true"' in html
+    assert "deleteWorkspaceTailoredResume" in html
     assert "/api/jobs/tailored/clear" in html
     assert 'class="tailor-job-btn"' in html
     assert "/api/tailoring/job" in html
     assert 'data-view="dashboard"' in html
     assert 'data-view="profile"' in html
     assert "Profile and Preferences" in html
+    assert "#profile-view { min-height: 100vh; padding: 2rem; background: #f7f8fb;" in html
+    assert "#profile-view .settings-card { background: #fff;" in html
+    assert "#profile-view .field input," in html
+    assert 'id="theme-toggle"' in html
+    assert 'html[data-theme="dark"] #profile-view' in html
+    assert "localStorage.setItem('applypilotTheme'" in html
     assert "fetch('/api/settings/' + type" in html
     assert 'data-settings-tab="resume"' in html
     assert 'id="resume-preview"' in html
     assert 'accept=".txt,text/plain"' in html
     assert 'accept=".tex,text/x-tex,application/x-tex"' in html
+    assert 'id="latex-remove-comments"' in html
+    assert "remove_comments: options.extension === '.tex'" in html
     assert 'id="latex-resume-preview"' in html
     assert "pdfjs-dist@4.10.38" in html
     assert "/api/resume/pdf" in html

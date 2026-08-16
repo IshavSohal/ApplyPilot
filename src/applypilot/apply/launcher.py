@@ -458,6 +458,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         if stats:
             cost = stats.get("cost_usd", 0)
+            from applypilot.usage import record_usage
+            record_usage(
+                provider="anthropic",
+                model="claude-code",
+                stage="auto_apply",
+                tokens={
+                    "input": stats.get("input_tokens"),
+                    "output": stats.get("output_tokens"),
+                    "cache_read": stats.get("cache_read"),
+                    "cache_write": stats.get("cache_create"),
+                },
+                reported_cost_usd=cost,
+            )
             ws = get_state(worker_id)
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)

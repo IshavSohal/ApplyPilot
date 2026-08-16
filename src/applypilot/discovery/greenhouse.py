@@ -304,11 +304,50 @@ def _fetch_amazon_jobs(company: dict, terms: list[str]) -> list[dict]:
                 path = item.get("job_path") or ""
                 if not job_id or not path:
                     continue
+                description_parts = []
+                if item.get("description"):
+                    description_parts.append(str(item["description"]))
+                if item.get("basic_qualifications"):
+                    description_parts.append(
+                        "Basic Qualifications<br/><br/>"
+                        + str(item["basic_qualifications"])
+                    )
+                if item.get("preferred_qualifications"):
+                    description_parts.append(
+                        "Preferred Qualifications<br/><br/>"
+                        + str(item["preferred_qualifications"])
+                    )
+
+                # Amazon appends its compensation disclosure to the preferred
+                # qualifications field instead of exposing a dedicated salary
+                # property. Preserve it in the full description and also make
+                # the range available to the dashboard's salary metadata.
+                preferred = _normalize_description(item.get("preferred_qualifications"))
+                salary = next(
+                    (
+                        line
+                        for line in reversed(preferred.splitlines())
+                        if re.search(
+                            r"\d[\d,.]*\s*-\s*\d[\d,.]*\s+[A-Z]{3}\b",
+                            line,
+                        )
+                    ),
+                    None,
+                )
                 jobs[job_id] = {
                     "title": item.get("title"),
                     "location": item.get("normalized_location") or item.get("location"),
                     "url": urllib.parse.urljoin("https://www.amazon.jobs", path),
-                    "content": item.get("description") or item.get("description_short"),
+                    "content": "<br/><br/>".join(description_parts)
+                    or item.get("description_short"),
+                    # Do not mark a partial API record as enriched. A normal
+                    # Amazon posting has both qualification fields.
+                    "content_is_full": bool(
+                        item.get("basic_qualifications")
+                        and item.get("preferred_qualifications")
+                    ),
+                    "salary": salary,
+                    "application_url": item.get("url_next_step"),
                     "posted_at": item.get("posted_date"),
                 }
             if len(results) < page_size:
@@ -659,7 +698,7 @@ def _process_bigtech_company(
             url,
             title or None,
             name,
-            None,
+            job.get("salary"),
             description[:500] if description else None,
             location,
             name,
@@ -667,7 +706,7 @@ def _process_bigtech_company(
             now,
             job.get("posted_at"),
             full_description if detail_scraped_at else None,
-            url,
+            job.get("application_url") or url,
             detail_scraped_at,
         )
         rows.append((row, description, content_is_full))
@@ -692,6 +731,16 @@ def _process_bigtech_company(
                     "UPDATE jobs SET full_description = NULL, detail_scraped_at = NULL "
                     "WHERE url = ? AND full_description = ?",
                     (row[0], description),
+                )
+            elif provider == "amazon":
+                # Amazon's API supplies a complete, authoritative description.
+                # Refresh rows created by older versions, which stored only the
+                # first `description` field and therefore skipped enrichment.
+                conn.execute(
+                    "UPDATE jobs SET salary = COALESCE(?, salary), description = ?, "
+                    "full_description = ?, application_url = COALESCE(?, application_url), "
+                    "detail_scraped_at = ? WHERE url = ?",
+                    (row[3], row[4], row[10], row[11], row[12], row[0]),
                 )
             conn.execute(
                 "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "

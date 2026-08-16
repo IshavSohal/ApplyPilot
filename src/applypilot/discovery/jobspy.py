@@ -127,6 +127,11 @@ def store_jobspy_results(
         if not classify_title(title, search_cfg).accepted:
             continue
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
+        company_logo = (
+            str(row.get("company_logo", ""))
+            if str(row.get("company_logo", "")) != "nan"
+            else None
+        )
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
         # Build salary string from min/max
@@ -169,19 +174,20 @@ def store_jobspy_results(
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
+                "INSERT INTO jobs (url, title, company, company_logo, salary, "
+                "description, location, site, strategy, discovered_at, "
                 "posted_at, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, company, salary, description, location_str, site_label, strategy, now,
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, company_logo, salary, description, location_str, site_label, strategy, now,
                  posted_at, full_description, apply_url, detail_scraped_at),
             )
             new += 1
         except sqlite3.IntegrityError:
-            if posted_at:
-                conn.execute(
-                    "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
-                    (posted_at, url),
-                )
+            conn.execute(
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "
+                "company_logo = COALESCE(company_logo, ?) WHERE url = ?",
+                (posted_at, company_logo, url),
+            )
             existing += 1
 
     conn.commit()

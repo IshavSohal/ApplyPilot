@@ -93,6 +93,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
             company               TEXT,
+            company_logo          TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
@@ -137,6 +138,45 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             verification_confidence TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            stages_json TEXT NOT NULL,
+            current_stage TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error_summary TEXT,
+            result_json TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            created_at TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reported_cost_microusd INTEGER,
+            estimated_cost_microusd INTEGER,
+            cost_kind TEXT NOT NULL,
+            pricing_json TEXT NOT NULL,
+            error TEXT,
+            FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_usage_run_id ON llm_usage(run_id)"
+    )
     conn.commit()
 
     # Run migrations for any columns added after initial schema
@@ -153,6 +193,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
     "company": "TEXT",
+    "company_logo": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",

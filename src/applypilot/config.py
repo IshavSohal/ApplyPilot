@@ -22,6 +22,7 @@ ENV_PATH = APP_DIR / ".env"
 TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
 LOG_DIR = APP_DIR / "logs"
+COMPANY_LOGO_DIR = APP_DIR / "company_logos"
 
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
@@ -89,7 +90,10 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, COMPANY_LOGO_DIR,
+        CHROME_WORKER_DIR, APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 

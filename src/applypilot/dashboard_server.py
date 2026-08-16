@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -118,6 +119,80 @@ def _prepare_tex_for_tectonic(content: str) -> str:
     return "\n".join(prepared)
 
 
+_VERBATIM_ENVIRONMENTS = {"verbatim", "Verbatim", "lstlisting", "minted"}
+_BEGIN_ENVIRONMENT_RE = re.compile(r"\\begin\{([^{}]+)\}")
+_END_ENVIRONMENT_RE = re.compile(r"\\end\{([^{}]+)\}")
+
+
+def remove_latex_comments(content: str) -> tuple[str, int]:
+    """Remove TeX comments without changing escaped percent signs.
+
+    Newlines are retained so removing an inline comment cannot accidentally join
+    tokens from adjacent lines. Common verbatim-style environments and inline
+    ``\\verb`` expressions are preserved because percent signs are literal there.
+    """
+    cleaned: list[str] = []
+    comments_removed = 0
+    verbatim_environment: str | None = None
+
+    for line in content.splitlines(keepends=True):
+        if verbatim_environment is not None:
+            cleaned.append(line)
+            if any(
+                match.group(1) == verbatim_environment
+                for match in _END_ENVIRONMENT_RE.finditer(line)
+            ):
+                verbatim_environment = None
+            continue
+
+        comment_at: int | None = None
+        index = 0
+        while index < len(line):
+            if line.startswith(r"\verb", index):
+                delimiter_at = index + len(r"\verb")
+                if delimiter_at < len(line) and line[delimiter_at] == "*":
+                    delimiter_at += 1
+                if delimiter_at < len(line):
+                    delimiter = line[delimiter_at]
+                    if not delimiter.isspace() and delimiter not in "\r\n":
+                        closing_at = line.find(delimiter, delimiter_at + 1)
+                        if closing_at >= 0:
+                            index = closing_at + 1
+                            continue
+
+            if line[index] == "%":
+                backslashes = 0
+                before = index - 1
+                while before >= 0 and line[before] == "\\":
+                    backslashes += 1
+                    before -= 1
+                if backslashes % 2 == 0:
+                    comment_at = index
+                    break
+            index += 1
+
+        code = line if comment_at is None else line[:comment_at]
+        if comment_at is not None:
+            comments_removed += 1
+            if line.endswith("\r\n"):
+                newline = "\r\n"
+            elif line.endswith("\n"):
+                newline = "\n"
+            elif line.endswith("\r"):
+                newline = "\r"
+            else:
+                newline = ""
+            code = code.rstrip(" \t") + newline
+        cleaned.append(code)
+
+        for match in _BEGIN_ENVIRONMENT_RE.finditer(code):
+            if match.group(1) in _VERBATIM_ENVIRONMENTS:
+                verbatim_environment = match.group(1)
+                break
+
+    return "".join(cleaned), comments_removed
+
+
 def _compile_latex_resume(content: str) -> bytes:
     """Compile LaTeX with Tectonic and return the generated PDF."""
     executable = _tectonic_executable()
@@ -224,7 +299,11 @@ def load_dashboard_resume(resume_format: str = "txt") -> dict:
     }
 
 
-def save_dashboard_resume(filename: object, content: object) -> dict:
+def save_dashboard_resume(
+    filename: object,
+    content: object,
+    remove_comments: object = False,
+) -> dict:
     """Validate and atomically save an uploaded text or LaTeX resume.
 
     LaTeX uploads are compiled with Tectonic first. On compile failure, neither
@@ -244,6 +323,12 @@ def save_dashboard_resume(filename: object, content: object) -> dict:
         raise ValueError("Resume cannot be empty")
     if len(content.encode("utf-8")) > MAX_RESUME_BYTES:
         raise ValueError("Resume must be 1 MB or smaller")
+    if not isinstance(remove_comments, bool):
+        raise ValueError("Remove comments must be a boolean")
+
+    comments_removed = 0
+    if suffix == ".tex" and remove_comments:
+        content, comments_removed = remove_latex_comments(content)
 
     pdf = _compile_latex_resume(content) if suffix == ".tex" else None
     with _settings_write_lock:
@@ -251,7 +336,10 @@ def save_dashboard_resume(filename: object, content: object) -> dict:
         _atomic_write(target, content)
         if pdf is not None:
             _atomic_write_bytes(config.RESUME_PDF_PATH, pdf)
-    return load_dashboard_resume(suffix.removeprefix("."))
+    result = load_dashboard_resume(suffix.removeprefix("."))
+    if suffix == ".tex":
+        result["comments_removed"] = comments_removed
+    return result
 
 
 def _validate_profile(profile: object) -> dict:
@@ -481,6 +569,35 @@ def normalize_job_url(raw_url: str) -> str:
     )
 
 
+def load_dashboard_company_logo(
+    raw_url: str,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[bytes, str] | None:
+    """Return a job's cached company logo, downloading it on first use."""
+    url = normalize_job_url(raw_url)
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT company, company_logo FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row or not row["company"]:
+        return None
+    from applypilot.company_logos import company_logo_candidates, load_company_logo
+
+    for source_url in company_logo_candidates(row["company"], row["company_logo"]):
+        logo = load_company_logo(row["company"], source_url)
+        if logo:
+            if source_url != row["company_logo"]:
+                conn.execute(
+                    "UPDATE jobs SET company_logo = ? WHERE company = ? "
+                    "AND (company_logo IS NULL OR company_logo = ?)",
+                    (source_url, row["company"], row["company_logo"]),
+                )
+                conn.commit()
+            return logo
+    return None
+
+
 def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
     """Insert an external job URL and return its import state."""
     url = normalize_job_url(raw_url)
@@ -696,8 +813,10 @@ def enrich_external_job(url: str) -> None:
     if not row:
         return
 
+    from applypilot.usage import usage_context
     try:
-        scrape_site_batch(conn, row["site"] or "external", [(url, row["title"])], delay=0)
+        with usage_context(stage="enrich"):
+            scrape_site_batch(conn, row["site"] or "external", [(url, row["title"])], delay=0)
     except Exception as exc:
         log.exception("External job enrichment failed for %s", url)
         now = datetime.now(timezone.utc).isoformat()
@@ -716,7 +835,8 @@ def enrich_external_job(url: str) -> None:
     try:
         from applypilot.scoring.scorer import run_scoring
 
-        run_scoring(target_url=url, workers=1)
+        with usage_context(stage="score"):
+            run_scoring(target_url=url, workers=1)
     except Exception as exc:
         # Scoring configuration/runtime failures should not make a successful
         # detail scrape look like an enrichment failure.
@@ -792,7 +912,46 @@ def start_discovery(server: DashboardHTTPServer, workers: int = 3) -> dict:
     return state
 
 
-def _tailoring_target_error(target_url: str) -> str | None:
+def _execute_dashboard_pipeline(server: DashboardHTTPServer, run_id: str, workers: int) -> None:
+    """Run the dashboard's one-click discover/enrich/score workflow."""
+    from applypilot.pipeline import run_pipeline
+    from applypilot.usage import update_run
+
+    try:
+        result = run_pipeline(
+            stages=["discover", "enrich", "score"],
+            workers=workers,
+            score_workers=workers,
+            run_id=run_id,
+        )
+        errors = result.get("errors") or {}
+        status = "partial" if errors else "complete"
+        update_run(run_id, status=status, result=result,
+                   error=json.dumps(errors) if errors else None)
+    except Exception as exc:
+        log.exception("Dashboard pipeline failed")
+        update_run(run_id, status="error", error=str(exc))
+
+
+def start_dashboard_pipeline(server: DashboardHTTPServer, workers: int = 3) -> dict:
+    """Start one persistent discover/enrich/score run."""
+    from applypilot.usage import create_run, get_run
+
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 8:
+        raise ValueError("Workers must be an integer between 1 and 8")
+    with server.pipeline_lock:
+        latest = get_run()
+        if latest and latest["status"] == "running":
+            raise RuntimeError("A pipeline run is already in progress")
+        run = create_run(["discover", "enrich", "score"])
+        server.pipeline_pool.submit(_execute_dashboard_pipeline, server, run["id"], workers)
+        return run
+
+
+def _tailoring_target_error(
+    target_url: str,
+    replace_existing: bool = False,
+) -> str | None:
     """Return why a queued job cannot be tailored, or None when eligible."""
     row = get_connection().execute(
         "SELECT applied_at, full_description, tailored_resume_path, "
@@ -806,7 +965,7 @@ def _tailoring_target_error(target_url: str) -> str | None:
         return "This job is already marked as applied"
     if not row["full_description"]:
         return "This job needs a full description before tailoring"
-    if row["tailored_resume_path"]:
+    if row["tailored_resume_path"] and not replace_existing:
         return "This job already has a tailored resume"
     if row["tailor_attempts"] >= 5:
         return "This job has reached the tailoring attempt limit"
@@ -845,19 +1004,25 @@ def _run_tailoring_request(request: dict) -> tuple[str, dict | None, str | None]
     """Execute one request and convert stale individual jobs into skips."""
     target_url = request["target_url"]
     if target_url:
-        reason = _tailoring_target_error(target_url)
+        reason = _tailoring_target_error(
+            target_url,
+            request.get("replace_existing", False),
+        )
         if reason:
             return "skipped", {"reason": reason}, None
 
     try:
         from applypilot.scoring.tailor import run_tailoring
+        from applypilot.usage import usage_context
 
-        result = run_tailoring(
-            min_score=request["min_score"],
-            limit=request["limit"],
-            validation_mode=request["validation_mode"],
-            target_url=target_url,
-        )
+        with usage_context(stage="tailor"):
+            result = run_tailoring(
+                min_score=request["min_score"],
+                limit=request["limit"],
+                validation_mode=request["validation_mode"],
+                target_url=target_url,
+                replace_existing=request.get("replace_existing", False),
+            )
         return "complete", result, None
     except Exception as exc:
         log.exception("Dashboard tailoring request failed")
@@ -900,6 +1065,7 @@ def start_tailoring(
     limit: int = 20,
     validation_mode: str = "normal",
     target_url: str | None = None,
+    replace_existing: bool = False,
 ) -> dict:
     """Enqueue a tailoring request for the dashboard's single FIFO worker."""
     if not isinstance(min_score, int) or isinstance(min_score, bool) or not 1 <= min_score <= 10:
@@ -908,11 +1074,15 @@ def start_tailoring(
         raise ValueError("Tailoring limit must be an integer between 1 and 100")
     if validation_mode not in {"strict", "normal", "lenient"}:
         raise ValueError("Validation mode must be strict, normal, or lenient")
+    if not isinstance(replace_existing, bool):
+        raise ValueError("Replace existing must be a boolean")
+    if replace_existing and target_url is None:
+        raise ValueError("Replace existing is only supported for a single job")
     if target_url is not None:
         if not isinstance(target_url, str) or not target_url.strip():
             raise ValueError("Job URL is required")
         target_url = target_url.strip()
-        reason = _tailoring_target_error(target_url)
+        reason = _tailoring_target_error(target_url, replace_existing)
         if reason:
             raise ValueError(reason)
 
@@ -953,6 +1123,7 @@ def start_tailoring(
             "limit": limit,
             "validation_mode": validation_mode,
             "target_url": target_url,
+            "replace_existing": replace_existing,
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
             "started_at": None,
             "finished_at": None,
@@ -991,6 +1162,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address, handler_class):
         super().__init__(server_address, handler_class)
+        from applypilot.usage import recover_interrupted_runs
+        recover_interrupted_runs()
         self.enrichment_pool = ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="applypilot-enrich",
@@ -1003,6 +1176,11 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             max_workers=1,
             thread_name_prefix="applypilot-tailoring",
         )
+        self.pipeline_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="applypilot-pipeline",
+        )
+        self.pipeline_lock = threading.Lock()
         self.discovery_lock = threading.Lock()
         self.discovery_state = {
             "status": "idle",
@@ -1027,6 +1205,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             self.tailoring_stopping = True
             self.tailoring_queue.clear()
         self.tailoring_pool.shutdown(wait=False, cancel_futures=True)
+        self.pipeline_pool.shutdown(wait=False, cancel_futures=True)
         super().server_close()
 
 
@@ -1085,6 +1264,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(200, body, "text/html; charset=utf-8")
             return
 
+        if parsed.path == "/api/jobs/company-logo":
+            raw_url = parse_qs(parsed.query).get("url", [""])[0]
+            try:
+                logo = load_dashboard_company_logo(raw_url)
+                if not logo:
+                    self._send_json(404, {"error": "Company logo unavailable"})
+                    return
+                body, content_type = logo
+                self._send_bytes(200, body, content_type)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
         if parsed.path == "/api/jobs/status":
             raw_url = parse_qs(parsed.query).get("url", [""])[0]
             try:
@@ -1101,6 +1293,47 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/tailoring/status":
             self._send_json(200, tailoring_status(self.server))
+            return
+
+        if parsed.path == "/api/pipeline/status":
+            from applypilot.usage import get_run
+            run_id = parse_qs(parsed.query).get("run_id", [None])[0]
+            self._send_json(200, {"run": get_run(run_id)})
+            return
+
+        if parsed.path == "/api/usage/summary":
+            from applypilot.usage import usage_summary
+            query = parse_qs(parsed.query)
+            self._send_json(200, usage_summary(
+                query.get("run_id", [None])[0],
+                stage=query.get("stage", [None])[0],
+                provider=query.get("provider", [None])[0],
+                model=query.get("model", [None])[0],
+            ))
+            return
+
+        if parsed.path == "/api/usage/history":
+            try:
+                from applypilot.usage import usage_history
+                query = parse_qs(parsed.query)
+                self._send_json(200, {"entries": usage_history(
+                    run_id=query.get("run_id", [None])[0],
+                    stage=query.get("stage", [None])[0],
+                    provider=query.get("provider", [None])[0],
+                    model=query.get("model", [None])[0],
+                    limit=int(query.get("limit", ["100"])[0]),
+                )})
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        if parsed.path == "/api/settings/pricing":
+            try:
+                self._validate_local_host()
+                from applypilot.usage import load_pricing
+                self._send_json(200, load_pricing())
+            except PermissionError as exc:
+                self._send_json(403, {"error": str(exc)})
             return
 
         if parsed.path == "/api/settings":
@@ -1154,10 +1387,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     query.get("url", [""])[0],
                     query.get("kind", [""])[0],
                 )
+                disposition = query.get("disposition", ["download"])[0]
+                if disposition not in {"inline", "download"}:
+                    raise ValueError("Disposition must be inline or download")
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                header_disposition = "inline" if disposition == "inline" else "attachment"
+                self.send_header("Content-Disposition", f'{header_disposition}; filename="{path.name}"')
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
@@ -1181,6 +1418,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/discovery",
             "/api/tailoring",
             "/api/tailoring/job",
+            "/api/pipeline",
         }:
             self._send_json(404, {"error": "Not found"})
             return
@@ -1189,6 +1427,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if path == "/api/discovery":
                 result = start_discovery(self.server, payload.get("workers", 3))
+            elif path == "/api/pipeline":
+                result = start_dashboard_pipeline(self.server, payload.get("workers", 3))
             elif path == "/api/tailoring":
                 result = start_tailoring(
                     self.server,
@@ -1203,6 +1443,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     limit=1,
                     validation_mode=payload.get("validation_mode", "normal"),
                     target_url=payload.get("url"),
+                    replace_existing=payload.get("replace_existing", False),
                 )
             elif path == "/api/jobs/applied":
                 result = mark_job_applied(payload.get("url", ""))
@@ -1229,7 +1470,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"Database error: {exc}"})
             return
 
-        if path in {"/api/discovery", "/api/tailoring", "/api/tailoring/job"}:
+        if path in {"/api/discovery", "/api/tailoring", "/api/tailoring/job", "/api/pipeline"}:
             self._send_json(202, result)
             return
 
@@ -1269,6 +1510,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/settings/profile",
             "/api/settings/searches",
             "/api/resume",
+            "/api/settings/pricing",
         }:
             self._send_json(404, {"error": "Not found"})
             return
@@ -1287,7 +1529,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 result = save_dashboard_resume(
                     payload.get("filename"),
                     payload.get("content"),
+                    payload.get("remove_comments", False),
                 )
+            elif path == "/api/settings/pricing":
+                from applypilot.usage import save_pricing
+                result = save_pricing(payload.get("overrides"))
             else:
                 result = save_dashboard_searches(payload.get("searches"))
         except PermissionError as exc:

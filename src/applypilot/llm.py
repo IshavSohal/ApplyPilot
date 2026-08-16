@@ -192,6 +192,11 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self.provider = (
+            "gemini" if self._is_gemini else
+            "openai" if base_url.startswith("https://api.openai.com") else
+            "local"
+        )
         hosted_provider = base_url.startswith((_GEMINI_COMPAT_BASE, "https://api.openai.com"))
         default_rpm = _DEFAULT_HOSTED_RPM if hosted_provider else 0
         self._rate_limiter = RateLimiter(
@@ -253,6 +258,18 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
+        metadata = data.get("usageMetadata", {})
+        from applypilot.usage import record_usage
+        record_usage(
+            provider=self.provider,
+            model=self.model,
+            tokens={
+                "input": metadata.get("promptTokenCount"),
+                "output": metadata.get("candidatesTokenCount"),
+                "cache_read": metadata.get("cachedContentTokenCount", 0),
+                "cache_write": 0,
+            },
+        )
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
     # -- OpenAI-compat API --------------------------------------------------
@@ -300,13 +317,26 @@ class LLMClient:
         if resp.status_code == 403 and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
-        return self._handle_compat_response(resp)
+        text, usage = self._handle_compat_response(resp)
+        from applypilot.usage import record_usage
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        record_usage(
+            provider=self.provider,
+            model=self.model,
+            tokens={
+                "input": usage.get("prompt_tokens"),
+                "output": usage.get("completion_tokens"),
+                "cache_read": prompt_details.get("cached_tokens", 0),
+                "cache_write": 0,
+            },
+        )
+        return text
 
     @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _handle_compat_response(resp: httpx.Response) -> tuple[str, dict]:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"], data.get("usage") or {}
 
     # -- public API ---------------------------------------------------------
 

@@ -330,6 +330,7 @@ def _run_stage_streaming(
     workers: int = 3,
     score_workers: int = 3,
     validation_mode: str = "normal",
+    run_id: str | None = None,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -348,11 +349,15 @@ def _run_stage_streaming(
         kwargs["workers"] = score_workers
 
     upstream = _UPSTREAM[stage]
+    from applypilot.usage import update_run, usage_context
 
     if stage == "discover":
         # Discover runs once (its sub-scrapers already do their full crawl)
         try:
-            result = runner(**kwargs)
+            if run_id:
+                update_run(run_id, current_stage=stage)
+            with usage_context(run_id, stage):
+                result = runner(**kwargs)
             tracker.mark_done(stage, result)
         except Exception as e:
             log.exception("Stage '%s' crashed", stage)
@@ -371,7 +376,10 @@ def _run_stage_streaming(
 
         if pending > 0:
             try:
-                runner(**kwargs)
+                if run_id:
+                    update_run(run_id, current_stage=stage)
+                with usage_context(run_id, stage):
+                    runner(**kwargs)
                 passes += 1
             except Exception as e:
                 log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
@@ -394,13 +402,17 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 3,
-                    score_workers: int = 3, validation_mode: str = "normal") -> dict:
+                    score_workers: int = 3, validation_mode: str = "normal",
+                    run_id: str | None = None) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
     pipeline_start = time.time()
 
     for name in ordered:
+        from applypilot.usage import update_run, usage_context
+        if run_id:
+            update_run(run_id, current_stage=name)
         meta = STAGE_META[name]
         console.print(f"\n{'=' * 70}")
         console.print(f"  [bold]STAGE: {name}[/bold] — {meta['desc']}")
@@ -419,7 +431,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 3,
                 kwargs["workers"] = workers
             if name == "score":
                 kwargs["workers"] = score_workers
-            result = runner(**kwargs)
+            with usage_context(run_id, name):
+                result = runner(**kwargs)
             elapsed = time.time() - t0
 
             status = "ok"
@@ -450,7 +463,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 3,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 3,
-                   score_workers: int = 3, validation_mode: str = "normal") -> dict:
+                   score_workers: int = 3, validation_mode: str = "normal",
+                   run_id: str | None = None) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -472,7 +486,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 3,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, score_workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, workers, score_workers, validation_mode, run_id),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -521,6 +535,7 @@ def run_pipeline(
     workers: int = 3,
     score_workers: int = 3,
     validation_mode: str = "normal",
+    run_id: str | None = None,
 ) -> dict:
     """Run pipeline stages.
 
@@ -577,11 +592,11 @@ def run_pipeline(
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
                                 score_workers=score_workers,
-                                validation_mode=validation_mode)
+                                validation_mode=validation_mode, run_id=run_id)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
                                  score_workers=score_workers,
-                                 validation_mode=validation_mode)
+                                 validation_mode=validation_mode, run_id=run_id)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

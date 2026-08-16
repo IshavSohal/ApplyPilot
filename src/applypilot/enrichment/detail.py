@@ -210,11 +210,23 @@ def collect_detail_intelligence(page) -> dict:
         "json_ld": [],
         "apple_hydration": None,
         "page_title": "",
+        "page_icon": None,
         "final_url": "",
     }
 
     intel["page_title"] = page.title()
     intel["final_url"] = page.url
+
+    try:
+        icon = page.query_selector(
+            'link[rel~="icon"][href], link[rel="apple-touch-icon"][href]'
+        )
+        if icon:
+            href = icon.get_attribute("href")
+            if href:
+                intel["page_icon"] = urljoin(intel["final_url"], href)
+    except Exception:
+        pass
 
     for el in page.query_selector_all('script[type="application/ld+json"]'):
         try:
@@ -345,6 +357,19 @@ def _job_location(posting: dict) -> str | None:
     return "; ".join(labels) or None
 
 
+def _organization_logo(organization: object) -> str | None:
+    """Return a schema.org Organization logo URL in its common forms."""
+    if not isinstance(organization, dict):
+        return None
+    logo = organization.get("logo")
+    if isinstance(logo, str):
+        return logo.strip() or None
+    if isinstance(logo, dict):
+        value = logo.get("url") or logo.get("contentUrl")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return None
+
+
 def extract_job_metadata(intel: dict) -> dict:
     """Extract title, company, and location from JSON-LD or page metadata."""
     for ld in intel.get("json_ld", []):
@@ -353,9 +378,13 @@ def extract_job_metadata(intel: dict) -> dict:
             continue
         organization = posting.get("hiringOrganization") or {}
         company = organization.get("name") if isinstance(organization, dict) else None
+        company_logo = _organization_logo(organization) or intel.get("page_icon")
+        if company_logo and intel.get("final_url"):
+            company_logo = urljoin(intel["final_url"], company_logo)
         return {
             "title": posting.get("title") or posting.get("name"),
             "company": company,
+            "company_logo": company_logo,
             "location": _job_location(posting),
             "posted_at": posting.get("datePosted"),
         }
@@ -364,6 +393,7 @@ def extract_job_metadata(intel: dict) -> dict:
     return {
         "title": re.split(r"\s+[|–—]\s+", page_title, maxsplit=1)[0] or None,
         "company": None,
+        "company_logo": intel.get("page_icon"),
         "location": None,
         "posted_at": None,
     }
@@ -400,7 +430,11 @@ def extract_from_json_ld(intel: dict) -> dict | None:
             "full_description": desc_clean,
             "application_url": apply_url,
         }
-        result.update(extract_job_metadata({"json_ld": [posting]}))
+        result.update(extract_job_metadata({
+            "json_ld": [posting],
+            "final_url": intel.get("final_url"),
+            "page_icon": intel.get("page_icon"),
+        }))
         return result
 
     return None
@@ -657,6 +691,19 @@ def reset_incomplete_apple_descriptions(conn: sqlite3.Connection) -> int:
     return cursor.rowcount
 
 
+def reset_incomplete_amazon_descriptions(conn: sqlite3.Connection) -> int:
+    """Requeue Amazon rows saved before qualification fields were assembled."""
+    cursor = conn.execute(
+        "UPDATE jobs SET full_description = NULL, detail_scraped_at = NULL "
+        "WHERE (site = 'Amazon' OR strategy = 'amazon_careers') "
+        "AND full_description IS NOT NULL "
+        "AND (full_description NOT LIKE '%Basic Qualifications%' "
+        "OR full_description NOT LIKE '%Preferred Qualifications%')"
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 # -- Orchestration -----------------------------------------------------------
 
 SITE_DELAYS = {
@@ -682,6 +729,7 @@ def scrape_detail_page(page, url: str) -> dict:
         "error": None,
         "title": None,
         "company": None,
+        "company_logo": None,
         "location": None,
         "posted_at": None,
     }
@@ -828,6 +876,7 @@ def scrape_site_batch(
                         "title = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, title) ELSE title END, "
                         "company = COALESCE(company, ?), "
+                        "company_logo = COALESCE(company_logo, ?), "
                         "location = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, location) ELSE location END, "
                         "posted_at = CASE WHEN strategy = 'external_upload' "
@@ -839,6 +888,7 @@ def scrape_site_batch(
                             now,
                             result.get("title"),
                             result.get("company"),
+                            result.get("company_logo"),
                             result.get("location"),
                             result.get("posted_at"),
                             url,
@@ -990,6 +1040,9 @@ def stream_detail(
     reset_count = reset_incomplete_apple_descriptions(conn)
     if reset_count:
         log.info("Apple: requeued %d incomplete descriptions", reset_count)
+    amazon_reset_count = reset_incomplete_amazon_descriptions(conn)
+    if amazon_reset_count:
+        log.info("Amazon: requeued %d incomplete descriptions", amazon_reset_count)
 
     url_stats = resolve_all_urls(conn)
     log.info("URL resolution: %d resolved, %d absolute",
@@ -1066,6 +1119,9 @@ def run_enrichment(limit: int = 100, workers: int = 3) -> dict:
     reset_count = reset_incomplete_apple_descriptions(conn)
     if reset_count:
         log.info("Apple: requeued %d incomplete descriptions", reset_count)
+    amazon_reset_count = reset_incomplete_amazon_descriptions(conn)
+    if amazon_reset_count:
+        log.info("Amazon: requeued %d incomplete descriptions", amazon_reset_count)
 
     # URL resolution first
     url_stats = resolve_all_urls(conn)

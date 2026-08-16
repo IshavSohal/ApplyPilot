@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -179,6 +180,13 @@ def test_judge_reports_an_empty_model_response(monkeypatch) -> None:
 
     assert not result["passed"]
     assert "empty response" in result["issues"]
+
+
+def test_judge_explicitly_allows_reordering_experience_entries() -> None:
+    prompt = tailor._build_judge_prompt(_profile())
+
+    assert "Reorder professional experience entries" in prompt
+    assert "including professional experience entries" in prompt
 
 
 def test_tailoring_records_and_logs_attempt_failure(monkeypatch, caplog) -> None:
@@ -366,3 +374,78 @@ def test_tailored_artifact_download_is_scoped_to_output_directory(tmp_path, monk
     conn.commit()
     with pytest.raises(PermissionError):
         load_tailored_artifact("https://example.com/job", "tex", conn)
+
+
+def test_retailoring_replaces_artifacts_only_after_success(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "tailored"
+    output_dir.mkdir()
+    resume_path = tmp_path / "resume.txt"
+    resume_path.write_text("Master resume", encoding="utf-8")
+    missing_tex = tmp_path / "resume.tex"
+    old_tex = output_dir / "Acme_Engineer_Tailored_Resume.tex"
+    old_artifacts = [
+        old_tex,
+        old_tex.with_suffix(".pdf"),
+        old_tex.with_suffix(".txt"),
+        old_tex.with_name(f"{old_tex.stem}_REPORT.json"),
+        old_tex.with_name(f"{old_tex.stem}_JOB.txt"),
+    ]
+    for artifact in old_artifacts:
+        artifact.write_bytes(b"old")
+
+    conn = init_db(tmp_path / "jobs.db")
+    url = "https://example.com/job"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company, site, full_description, fit_score, "
+        "tailored_resume_path, tailor_attempts) VALUES (?, 'Engineer', 'Acme', "
+        "'example', 'Complete description', 8, ?, 1)",
+        (url, str(old_tex)),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(tailor, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(tailor, "RESUME_TEX_PATH", missing_tex)
+    monkeypatch.setattr(tailor, "TAILORED_DIR", output_dir)
+    monkeypatch.setattr(tailor, "get_connection", lambda: conn)
+    monkeypatch.setattr(tailor, "load_profile", _profile)
+    monkeypatch.setattr(
+        tailor,
+        "tailor_resume",
+        lambda *_args, **_kwargs: (
+            "Tailored text",
+            {"status": "approved", "attempts": 1, "structured_data": _resume_data()},
+        ),
+    )
+    monkeypatch.setattr(
+        latex,
+        "fit_one_page",
+        lambda *_args, **_kwargs: (_resume_data(), "new tex", b"%PDF-new", [], {}),
+    )
+    monkeypatch.setattr(tailor, "build_decision_summary", lambda *_args: {})
+
+    result = tailor.run_tailoring(target_url=url, replace_existing=True)
+
+    assert result["approved"] == 1
+    row = conn.execute(
+        "SELECT tailored_resume_path, tailor_attempts FROM jobs WHERE url = ?", (url,)
+    ).fetchone()
+    replacement = row["tailored_resume_path"]
+    assert replacement != str(old_tex)
+    assert row["tailor_attempts"] == 2
+    assert all(not artifact.exists() for artifact in old_artifacts)
+    assert Path(replacement).exists()
+    assert Path(replacement).with_suffix(".pdf").exists()
+
+    monkeypatch.setattr(
+        tailor,
+        "tailor_resume",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("generation failed")),
+    )
+    failed = tailor.run_tailoring(target_url=url, replace_existing=True)
+    preserved = conn.execute(
+        "SELECT tailored_resume_path, tailor_attempts FROM jobs WHERE url = ?", (url,)
+    ).fetchone()
+    assert failed["errors"] == 1
+    assert preserved["tailored_resume_path"] == replacement
+    assert preserved["tailor_attempts"] == 3
+    assert Path(replacement).exists()

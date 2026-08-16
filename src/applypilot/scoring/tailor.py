@@ -15,6 +15,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from applypilot.config import RESUME_PATH, RESUME_TEX_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
@@ -306,7 +307,7 @@ VERDICT: PASS or FAIL
 ISSUES: (list any problems, or "none")
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Reorder bullets and projects to put the most relevant first
+- Reorder professional experience entries, project entries, and bullets to put the most relevant first
 - Select or omit existing bullets without changing their text
 - Select or omit skills so only job-relevant ones remain, ordered with must-haves first
 
@@ -319,7 +320,7 @@ ISSUES: (list any problems, or "none")
 
 ## WHAT IS NOT FABRICATION (do NOT fail for these):
 - Dropping bullets entirely
-- Reordering anything
+- Reordering any entries or bullets, including professional experience entries
 
 ## TOLERANCE RULE:
 Bullet wording changes are not allowed. Fail invented, altered, or moved bullets, as well as invented projects, companies, degrees, metrics, responsibilities, or technologies. Do not fail for style alone."""
@@ -754,6 +755,7 @@ def run_tailoring(
     limit: int = 20,
     validation_mode: str = "normal",
     target_url: str | None = None,
+    replace_existing: bool = False,
 ) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
@@ -761,6 +763,9 @@ def run_tailoring(
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process.
         validation_mode: "strict", "normal", or "lenient".
+        target_url:      Optional single job URL to tailor.
+        replace_existing: Allow a successful result to replace that job's
+                          current tailored resume.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
@@ -771,10 +776,11 @@ def run_tailoring(
     conn = get_connection()
 
     if target_url:
+        tailored_condition = "" if replace_existing else "AND tailored_resume_path IS NULL "
         row = conn.execute(
             "SELECT * FROM jobs WHERE url = ? "
             "AND full_description IS NOT NULL AND applied_at IS NULL "
-            "AND tailored_resume_path IS NULL "
+            f"{tailored_condition}"
             "AND COALESCE(tailor_attempts, 0) < 5",
             (target_url,),
         ).fetchone()
@@ -824,11 +830,15 @@ def run_tailoring(
             company = (job.get("company") or "").strip()
             safe_company = re.sub(r"[^\w\s-]", "", company)[:40].strip().replace(" ", "_")
             prefix_parts = [part for part in (safe_company, safe_title) if part]
-            prefix = "_".join(prefix_parts) or "Resume"
-            prefix += "_Tailored_Resume"
-            if (TAILORED_DIR / f"{prefix}.tex").exists() or (TAILORED_DIR / f"{prefix}_REPORT.json").exists():
+            prefix = ("_".join(prefix_parts) or "Resume") + "_Tailored_Resume"
+            if any((TAILORED_DIR / f"{prefix}{suffix}").exists() for suffix in (".tex", "_REPORT.json")):
                 url_suffix = hashlib.sha256(job["url"].encode("utf-8")).hexdigest()[:8]
                 prefix = f"{prefix}_{url_suffix}"
+            version = 2
+            base_prefix = prefix
+            while any((TAILORED_DIR / f"{prefix}{suffix}").exists() for suffix in (".tex", "_REPORT.json")):
+                prefix = f"{base_prefix}_{version}"
+                version += 1
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
@@ -915,19 +925,45 @@ def run_tailoring(
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
+    replaced_paths: list[tuple[str, str]] = []
     for r in results:
         if r["status"] in _success_statuses:
+            previous = next(
+                (job.get("tailored_resume_path") for job in jobs if job["url"] == r["url"]),
+                None,
+            )
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                 (r["path"], now, r["url"]),
             )
+            if previous and previous != r["path"]:
+                replaced_paths.append((previous, r["path"]))
         else:
             conn.execute(
                 "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                 (r["url"],),
             )
     conn.commit()
+
+    # The old resume remains available throughout generation and is removed
+    # only after the replacement has been committed successfully.
+    tailored_root = TAILORED_DIR.resolve()
+    for previous, replacement in replaced_paths:
+        old_path = Path(previous).resolve()
+        if old_path.parent != tailored_root or old_path == Path(replacement).resolve():
+            continue
+        for artifact in (
+            old_path.with_suffix(".tex"),
+            old_path.with_suffix(".pdf"),
+            old_path.with_suffix(".txt"),
+            old_path.with_name(f"{old_path.stem}_REPORT.json"),
+            old_path.with_name(f"{old_path.stem}_JOB.txt"),
+        ):
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not remove replaced tailoring artifact %s: %s", artifact, exc)
 
     elapsed = time.time() - t0
     approved = stats.get("approved", 0) + stats.get("approved_with_judge_warning", 0)
