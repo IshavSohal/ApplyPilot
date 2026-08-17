@@ -207,7 +207,7 @@ def release_lock(url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
+# Utility modes (--gen, --mark-applied, --unmark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
@@ -269,6 +269,16 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
                            apply_attempts = 99, agent_id = NULL
             WHERE url = ?
         """, (reason or "manual", url))
+    conn.commit()
+
+
+def unmark_job(url: str) -> None:
+    """Clear a job's applied state so it can return to the active queue."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE jobs SET apply_status = NULL, applied_at = NULL WHERE url = ?",
+        (url,),
+    )
     conn.commit()
 
 

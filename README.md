@@ -160,6 +160,7 @@ The Playwright MCP server is configured automatically at runtime per worker. No 
 ```bash
 # Utility modes (no Chrome/Claude needed)
 applypilot apply --mark-applied URL    # manually mark a job as applied
+applypilot apply --unmark-applied URL  # return an applied job to the active queue
 applypilot apply --mark-failed URL     # manually mark a job as failed
 applypilot apply --reset-failed        # reset all failed jobs for retry
 applypilot apply --gen --url URL       # generate prompt file for manual debugging

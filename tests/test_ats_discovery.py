@@ -151,6 +151,39 @@ def test_process_ats_company_filters_and_persists_full_description(monkeypatch):
     assert row[4]
 
 
+def test_process_ats_company_backfills_posted_date_for_existing_job(monkeypatch):
+    conn = _jobs_connection()
+    url = "https://jobs.ashbyhq.com/example/one"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company) VALUES (?, ?, ?)",
+        (url, "Software Engineer", "Example"),
+    )
+    monkeypatch.setattr(ats, "get_connection", lambda: conn)
+    monkeypatch.setitem(
+        ats.ATS_FETCHERS,
+        "ashby",
+        lambda _company: [{
+            "title": "Software Engineer",
+            "location": "Toronto, Canada",
+            "url": url,
+            "posted_at": "2026-08-14T12:00:00Z",
+        }],
+    )
+
+    result = ats._process_company(
+        "example",
+        {"name": "Example"},
+        "ashby",
+        {"include_titles": ["software engineer"]},
+        False,
+    )
+
+    assert result["existing"] == 1
+    assert conn.execute(
+        "SELECT posted_at FROM jobs WHERE url = ?", (url,)
+    ).fetchone()[0] == "2026-08-14T12:00:00Z"
+
+
 def test_default_ats_registries_have_required_slugs():
     assert all(company.get("board") for company in ats.load_ashby_companies().values())
     assert all(company.get("site") for company in ats.load_lever_companies().values())

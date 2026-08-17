@@ -230,6 +230,10 @@ def _process_company(
             )
             result["new"] += 1
         except sqlite3.IntegrityError:
+            conn.execute(
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
+                (job.get("posted_at"), url),
+            )
             result["existing"] += 1
     conn.commit()
     return result

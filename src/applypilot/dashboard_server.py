@@ -569,6 +569,16 @@ def normalize_job_url(raw_url: str) -> str:
     )
 
 
+def _amazon_job_id(url: str) -> str | None:
+    """Return the numeric job ID for an Amazon Jobs detail URL."""
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "amazon.jobs" and not hostname.endswith(".amazon.jobs"):
+        return None
+    match = re.search(r"/jobs/(\d+)(?:/|$)", parsed.path, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def load_dashboard_company_logo(
     raw_url: str,
     conn: sqlite3.Connection | None = None,
@@ -603,15 +613,26 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
     url = normalize_job_url(raw_url)
     conn = conn or get_connection()
     existing = conn.execute(
-        "SELECT url, title, detail_scraped_at, detail_error FROM jobs WHERE url = ?",
+        "SELECT url, title, full_description, detail_scraped_at, detail_error "
+        "FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
     if existing:
+        should_enrich = not bool(existing["full_description"])
+        if should_enrich:
+            conn.execute(
+                "UPDATE jobs SET detail_scraped_at = NULL, detail_error = NULL, "
+                "fit_score = NULL, score_reasoning = NULL, scored_at = NULL "
+                "WHERE url = ?",
+                (url,),
+            )
+            conn.commit()
         return {
             "created": False,
             "url": url,
             "title": existing["title"],
-            "status": job_import_status(url, conn)["status"],
+            "status": "pending" if should_enrich else job_import_status(url, conn)["status"],
+            "enrichment_pending": should_enrich,
         }
 
     hostname = urlparse(url).hostname or "external"
@@ -623,7 +644,13 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
         (url, title, hostname, now, url),
     )
     conn.commit()
-    return {"created": True, "url": url, "title": title, "status": "pending"}
+    return {
+        "created": True,
+        "url": url,
+        "title": title,
+        "status": "pending",
+        "enrichment_pending": True,
+    }
 
 
 def job_import_status(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
@@ -688,6 +715,36 @@ def mark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> di
         "title": row["title"],
         "status": "applied",
         "applied_at": applied_at,
+    }
+
+
+def unmark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
+    """Return an applied dashboard job to the active queue."""
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("Job URL is required")
+    url = raw_url.strip()
+    if len(url) > MAX_URL_LENGTH:
+        raise ValueError("URL is too long")
+
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT title FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row:
+        return {"updated": False, "url": url, "status": "missing"}
+
+    conn.execute(
+        "UPDATE jobs SET applied_at = NULL, apply_status = NULL WHERE url = ?",
+        (url,),
+    )
+    conn.commit()
+    return {
+        "updated": True,
+        "url": url,
+        "title": row["title"],
+        "status": "active",
+        "applied_at": None,
     }
 
 
@@ -804,6 +861,48 @@ def delete_job(raw_url: str, conn: sqlite3.Connection | None = None) -> dict:
     }
 
 
+def _enrich_external_amazon_job(conn: sqlite3.Connection, url: str) -> bool:
+    """Use Amazon's public JSON endpoint for a complete manual import."""
+    job_id = _amazon_job_id(url)
+    if not job_id:
+        return False
+
+    from applypilot.discovery.greenhouse import (
+        _normalize_description,
+        fetch_amazon_job,
+    )
+
+    job = fetch_amazon_job(job_id)
+    if not job or not job.get("content_is_full"):
+        return False
+    full_description = _normalize_description(job.get("content"))
+    if len(full_description) < 200:
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET title = COALESCE(?, title), company = 'Amazon', "
+        "salary = COALESCE(?, salary), description = ?, location = COALESCE(?, location), "
+        "site = 'Amazon', full_description = ?, application_url = COALESCE(?, ?), "
+        "posted_at = COALESCE(?, posted_at), detail_scraped_at = ?, detail_error = NULL "
+        "WHERE url = ?",
+        (
+            job.get("title"),
+            job.get("salary"),
+            full_description[:500],
+            job.get("location"),
+            full_description,
+            job.get("application_url"),
+            url,
+            job.get("posted_at"),
+            now,
+            url,
+        ),
+    )
+    conn.commit()
+    return True
+
+
 def enrich_external_job(url: str) -> None:
     """Enrich and, when configured, score one imported URL."""
     from applypilot.enrichment.detail import scrape_site_batch
@@ -816,7 +915,14 @@ def enrich_external_job(url: str) -> None:
     from applypilot.usage import usage_context
     try:
         with usage_context(stage="enrich"):
-            scrape_site_batch(conn, row["site"] or "external", [(url, row["title"])], delay=0)
+            enriched = _enrich_external_amazon_job(conn, url)
+            if not enriched:
+                scrape_site_batch(
+                    conn,
+                    row["site"] or "external",
+                    [(url, row["title"])],
+                    delay=0,
+                )
     except Exception as exc:
         log.exception("External job enrichment failed for %s", url)
         now = datetime.now(timezone.utc).isoformat()
@@ -1446,7 +1552,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     replace_existing=payload.get("replace_existing", False),
                 )
             elif path == "/api/jobs/applied":
-                result = mark_job_applied(payload.get("url", ""))
+                applied = payload.get("applied", True)
+                if not isinstance(applied, bool):
+                    raise ValueError("Applied must be a boolean")
+                result = (
+                    mark_job_applied(payload.get("url", ""))
+                    if applied
+                    else unmark_job_applied(payload.get("url", ""))
+                )
             elif path == "/api/jobs/delete":
                 result = delete_job(payload.get("url", ""))
             elif path == "/api/jobs/tailored/clear":
@@ -1497,9 +1610,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "Tailored resume not found"})
             return
 
-        if result["created"]:
+        if result.get("enrichment_pending"):
             self.server.enrichment_pool.submit(enrich_external_job, result["url"])
-            self._send_json(201, result)
+            if result["created"]:
+                self._send_json(201, result)
+            else:
+                result["message"] = "This job is already in the dashboard; enrichment was retried"
+                self._send_json(202, result)
         else:
             result["message"] = "This job is already in the dashboard"
             self._send_json(200, result)

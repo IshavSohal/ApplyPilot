@@ -404,13 +404,17 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, posted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, job.get("posted_at")),
             )
             new += 1
         except sqlite3.IntegrityError:
+            conn.execute(
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
+                (job.get("posted_at"), url),
+            )
             existing += 1
 
     conn.commit()
@@ -466,7 +470,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         where += " AND fit_score >= ?"
         params.append(min_score)
 
-    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    query = (
+        f"SELECT * FROM jobs WHERE {where} "
+        "ORDER BY fit_score DESC NULLS LAST, COALESCE(posted_at, discovered_at) DESC"
+    )
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)

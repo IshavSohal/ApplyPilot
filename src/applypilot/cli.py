@@ -168,6 +168,7 @@ def apply(
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
+    unmark_applied: Optional[str] = typer.Option(None, "--unmark-applied", help="Return an applied job URL to the active queue."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
@@ -184,6 +185,12 @@ def apply(
         from applypilot.apply.launcher import mark_job
         mark_job(mark_applied, "applied")
         console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+        return
+
+    if unmark_applied:
+        from applypilot.apply.launcher import unmark_job
+        unmark_job(unmark_applied)
+        console.print(f"[green]Returned to active jobs:[/green] {unmark_applied}")
         return
 
     if mark_failed:

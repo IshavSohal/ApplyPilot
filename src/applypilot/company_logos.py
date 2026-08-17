@@ -73,11 +73,27 @@ COMPANY_DOMAINS = {
     "workday": "workday.com",
 }
 
+# Some company sites do not expose a dependable browser-friendly favicon:
+# Discord's conventional path returns 404, while Pinterest and Stripe serve
+# small or inconsistent ICO variants. Prefer Google's normalized PNG for these
+# known exceptions, including when an older favicon URL is stored in the DB.
+PREFERRED_LOGO_URLS = {
+    company: f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+    for company, domain in {
+        "discord": "discord.com",
+        "pinterest": "pinterest.com",
+        "stripe": "stripe.com",
+    }.items()
+}
+
 
 def company_logo_candidates(company: str, stored_url: str | None = None) -> list[str]:
     """Return stored and domain-based logo sources in preference order."""
-    candidates = [stored_url] if stored_url else []
     normalized = re.sub(r"\s+", " ", company.casefold()).strip()
+    preferred_url = PREFERRED_LOGO_URLS.get(normalized)
+    candidates = [preferred_url] if preferred_url else []
+    if stored_url:
+        candidates.append(stored_url)
     domain = COMPANY_DOMAINS.get(normalized)
     if domain:
         candidates.extend([

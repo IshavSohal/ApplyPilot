@@ -77,7 +77,9 @@ class _HTMLStripper(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style"):
             self._skip = True
-        elif tag in ("br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+        elif tag == "li":
+            self._parts.append("\n- ")
+        elif tag in ("br", "p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
             self._parts.append("\n")
 
     def handle_endtag(self, tag):

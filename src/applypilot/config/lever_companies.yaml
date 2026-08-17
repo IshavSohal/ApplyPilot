@@ -4,3 +4,4 @@ companies:
   achievers: { name: "Achievers", site: "achievers" }
   waabi: { name: "Waabi", site: "waabi" }
   caseware: { name: "Caseware", site: "caseware" }
+  spotify: { name: "Spotify", site: "spotify" }

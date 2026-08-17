@@ -16,10 +16,11 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from urllib.parse import urljoin
+from datetime import UTC, datetime, timezone
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from applypilot.database import init_db
@@ -209,6 +210,7 @@ def collect_detail_intelligence(page) -> dict:
     intel: dict = {
         "json_ld": [],
         "apple_hydration": None,
+        "microsoft_details": None,
         "page_title": "",
         "page_icon": None,
         "final_url": "",
@@ -242,6 +244,27 @@ def collect_detail_intelligence(page) -> dict:
             )
         except Exception:
             pass
+
+    if "apply.careers.microsoft.com" in intel["final_url"]:
+        job_id_match = re.search(r"/job/(\d+)", intel["final_url"])
+        if job_id_match:
+            try:
+                intel["microsoft_details"] = page.evaluate(
+                    """async ({positionId}) => {
+                        const params = new URLSearchParams({
+                            position_id: positionId,
+                            domain: "microsoft.com",
+                            hl: "en",
+                        });
+                        const response = await fetch(`/api/pcsx/position_details?${params}`);
+                        if (!response.ok) return null;
+                        const payload = await response.json();
+                        return payload?.data || null;
+                    }""",
+                    {"positionId": job_id_match.group(1)},
+                )
+            except PlaywrightError:
+                pass
 
     return intel
 
@@ -306,6 +329,37 @@ def extract_from_apple_hydration(intel: dict) -> dict | None:
         "company": "Apple",
         "location": None,
         "posted_at": posting.get("postDateInGMT") or posting.get("postingDateMeta"),
+    }
+
+
+def extract_from_microsoft_details(intel: dict) -> dict | None:
+    """Extract Microsoft's complete description from its position-details API."""
+    details = intel.get("microsoft_details")
+    if not isinstance(details, dict):
+        return None
+
+    description = clean_description(details.get("jobDescription", ""))
+    if len(description) < 50:
+        return None
+
+    posted_at = None
+    if details.get("postedTs"):
+        try:
+            posted_at = datetime.fromtimestamp(
+                int(details["postedTs"]), UTC
+            ).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    locations = details.get("locations") or []
+    location = details.get("location") or "; ".join(str(item) for item in locations)
+    return {
+        "full_description": description,
+        "application_url": intel.get("final_url") or None,
+        "title": details.get("name"),
+        "company": "Microsoft",
+        "location": location or None,
+        "posted_at": posted_at,
     }
 
 
@@ -390,6 +444,26 @@ def extract_job_metadata(intel: dict) -> dict:
         }
 
     page_title = (intel.get("page_title") or "").strip()
+    final_url = intel.get("final_url") or ""
+    hostname = (urlparse(final_url).hostname or "").lower()
+    if hostname == "greenhouse.io" or hostname.endswith(".greenhouse.io"):
+        # Greenhouse's current job-board pages do not consistently expose
+        # JobPosting JSON-LD, but their document title is stable and contains
+        # both values: "Job Application for <role> at <company>".
+        greenhouse_title = re.fullmatch(
+            r"Job Application for\s+(.+)\s+at\s+(.+)",
+            page_title,
+            flags=re.IGNORECASE,
+        )
+        if greenhouse_title:
+            return {
+                "title": greenhouse_title.group(1).strip(),
+                "company": greenhouse_title.group(2).strip(),
+                "company_logo": intel.get("page_icon"),
+                "location": None,
+                "posted_at": None,
+            }
+
     return {
         "title": re.split(r"\s+[|–—]\s+", page_title, maxsplit=1)[0] or None,
         "company": None,
@@ -704,6 +778,18 @@ def reset_incomplete_amazon_descriptions(conn: sqlite3.Connection) -> int:
     return cursor.rowcount
 
 
+def reset_incomplete_microsoft_descriptions(conn: sqlite3.Connection) -> int:
+    """Requeue Microsoft rows captured from JSON-LD without the Overview."""
+    cursor = conn.execute(
+        "UPDATE jobs SET full_description = NULL, detail_scraped_at = NULL "
+        "WHERE (site = 'Microsoft' OR strategy = 'microsoft_careers') "
+        "AND full_description IS NOT NULL "
+        "AND full_description NOT LIKE '%Overview%'"
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 # -- Orchestration -----------------------------------------------------------
 
 SITE_DELAYS = {
@@ -757,6 +843,16 @@ def scrape_detail_page(page, url: str) -> dict:
 
     intel = collect_detail_intelligence(page)
     result.update(extract_job_metadata(intel))
+
+    # Microsoft's JSON-LD omits the Overview. Prefer the complete PCS/X API
+    # payload used to render the page.
+    microsoft_result = extract_from_microsoft_details(intel)
+    if microsoft_result and microsoft_result.get("full_description"):
+        result.update(microsoft_result)
+        result["tier_used"] = 1
+        result["status"] = "ok"
+        result["elapsed"] = time.time() - t0
+        return result
 
     # Apple exposes each description section separately in its router payload.
     # Run this before JSON-LD, which may contain only the Summary section.
@@ -879,8 +975,7 @@ def scrape_site_batch(
                         "company_logo = COALESCE(company_logo, ?), "
                         "location = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, location) ELSE location END, "
-                        "posted_at = CASE WHEN strategy = 'external_upload' "
-                        "THEN COALESCE(?, posted_at) ELSE posted_at END "
+                        "posted_at = COALESCE(posted_at, ?) "
                         "WHERE url = ?",
                         (
                             result.get("full_description"),
@@ -1043,6 +1138,9 @@ def stream_detail(
     amazon_reset_count = reset_incomplete_amazon_descriptions(conn)
     if amazon_reset_count:
         log.info("Amazon: requeued %d incomplete descriptions", amazon_reset_count)
+    microsoft_reset_count = reset_incomplete_microsoft_descriptions(conn)
+    if microsoft_reset_count:
+        log.info("Microsoft: requeued %d incomplete descriptions", microsoft_reset_count)
 
     url_stats = resolve_all_urls(conn)
     log.info("URL resolution: %d resolved, %d absolute",
@@ -1122,6 +1220,9 @@ def run_enrichment(limit: int = 100, workers: int = 3) -> dict:
     amazon_reset_count = reset_incomplete_amazon_descriptions(conn)
     if amazon_reset_count:
         log.info("Amazon: requeued %d incomplete descriptions", amazon_reset_count)
+    microsoft_reset_count = reset_incomplete_microsoft_descriptions(conn)
+    if microsoft_reset_count:
+        log.info("Microsoft: requeued %d incomplete descriptions", microsoft_reset_count)
 
     # URL resolution first
     url_stats = resolve_all_urls(conn)

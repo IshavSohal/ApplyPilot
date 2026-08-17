@@ -33,6 +33,7 @@ from applypilot.dashboard_server import (
     save_dashboard_searches,
     start_tailoring,
     tailoring_status,
+    unmark_job_applied,
 )
 from applypilot.database import get_connection, init_db
 from applypilot.enrichment.detail import extract_job_metadata
@@ -80,6 +81,35 @@ def test_import_external_job_and_duplicate(db) -> None:
     assert job_import_status(first["url"], db)["status"] == "pending"
 
 
+def test_duplicate_incomplete_import_is_requeued(db) -> None:
+    imported = import_external_job("https://example.com/jobs/retry", db)
+    db.execute(
+        "UPDATE jobs SET detail_scraped_at = ?, detail_error = ?, "
+        "fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+        (
+            "2026-08-01T12:00:00+00:00",
+            "old extraction error",
+            0,
+            "old scoring error",
+            "2026-08-01T12:01:00+00:00",
+            imported["url"],
+        ),
+    )
+    db.commit()
+
+    retried = import_external_job(imported["url"], db)
+
+    assert retried["created"] is False
+    assert retried["status"] == "pending"
+    assert retried["enrichment_pending"] is True
+    row = db.execute(
+        "SELECT detail_scraped_at, detail_error, fit_score, score_reasoning, scored_at "
+        "FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None, None)
+
+
 def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "automatic-score.db"
     connection = init_db(db_path)
@@ -107,6 +137,59 @@ def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) 
     dashboard_server.enrich_external_job(imported["url"])
 
     assert calls == [{"target_url": imported["url"], "workers": 1}]
+
+
+def test_enrich_external_amazon_job_uses_exact_api_record(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "amazon-import.db"
+    connection = init_db(db_path)
+    url = "https://www.amazon.jobs/en/jobs/10502743/software-engineer"
+    imported = import_external_job(url, connection)
+    connection.close()
+
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+    monkeypatch.setattr(config, "get_tier", lambda: 1)
+    monkeypatch.setattr(
+        "applypilot.discovery.greenhouse.fetch_amazon_job",
+        lambda job_id: {
+            "id": job_id,
+            "title": "Software Development Engineer, Early Career - 2026",
+            "company": "Amazon",
+            "location": "Vancouver, British Columbia, CAN",
+            "content": (
+                "Build services for customers.<br/><br/>"
+                "Basic Qualifications<br/><br/>Programming experience.<br/><br/>"
+                "Preferred Qualifications<br/><br/>Internship experience. " * 5
+            ),
+            "content_is_full": True,
+            "salary": "CAN, BC, Vancouver - 89,700.00 - 149,800.00 CAD annually",
+            "application_url": "https://account.amazon.jobs/jobs/10502743/apply",
+            "posted_at": "August 15, 2026",
+        },
+    )
+
+    def fail_generic_scrape(*_args, **_kwargs):
+        raise AssertionError("generic scraper should not run for a complete Amazon API record")
+
+    monkeypatch.setattr(
+        "applypilot.enrichment.detail.scrape_site_batch",
+        fail_generic_scrape,
+    )
+
+    dashboard_server.enrich_external_job(imported["url"])
+
+    row = get_connection(db_path).execute(
+        "SELECT title, company, site, salary, location, full_description, "
+        "application_url, detail_error FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert row["title"] == "Software Development Engineer, Early Career - 2026"
+    assert row["company"] == "Amazon"
+    assert row["site"] == "Amazon"
+    assert row["salary"] == "CAN, BC, Vancouver - 89,700.00 - 149,800.00 CAD annually"
+    assert row["location"] == "Vancouver, British Columbia, CAN"
+    assert "Basic Qualifications" in row["full_description"]
+    assert row["application_url"] == "https://account.amazon.jobs/jobs/10502743/apply"
+    assert row["detail_error"] is None
 
 
 def test_import_status_waits_for_automatic_score(db, monkeypatch) -> None:
@@ -146,6 +229,33 @@ def test_mark_job_applied(db) -> None:
 
 def test_mark_job_applied_reports_missing_job(db) -> None:
     result = mark_job_applied("https://example.com/jobs/missing", db)
+    assert result["updated"] is False
+    assert result["status"] == "missing"
+
+
+def test_unmark_job_applied(db) -> None:
+    imported = import_external_job("https://example.com/jobs/unapply", db)
+    mark_job_applied(imported["url"], db)
+
+    result = unmark_job_applied(imported["url"], db)
+
+    assert result == {
+        "updated": True,
+        "url": imported["url"],
+        "title": imported["title"],
+        "status": "active",
+        "applied_at": None,
+    }
+    row = db.execute(
+        "SELECT applied_at, apply_status FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert row["applied_at"] is None
+    assert row["apply_status"] is None
+
+
+def test_unmark_job_applied_reports_missing_job(db) -> None:
+    result = unmark_job_applied("https://example.com/jobs/missing", db)
     assert result["updated"] is False
     assert result["status"] == "missing"
 
@@ -671,6 +781,24 @@ def test_extract_job_metadata_uses_page_title_fallback() -> None:
     assert metadata["company_logo"] == "https://example.com/favicon.ico"
 
 
+def test_extract_job_metadata_parses_greenhouse_page_title() -> None:
+    metadata = extract_job_metadata(
+        {
+            "final_url": "https://job-boards.greenhouse.io/newsbreak/jobs/4615879006",
+            "page_title": (
+                "Job Application for Software Engineer, ML Infra "
+                "(Junior & New Grad) at NewsBreak"
+            ),
+            "page_icon": "https://job-boards.greenhouse.io/favicon.ico",
+            "json_ld": [],
+        }
+    )
+
+    assert metadata["title"] == "Software Engineer, ML Infra (Junior & New Grad)"
+    assert metadata["company"] == "NewsBreak"
+    assert metadata["company_logo"] == "https://job-boards.greenhouse.io/favicon.ico"
+
+
 def test_extract_job_metadata_resolves_relative_logo_url() -> None:
     metadata = extract_job_metadata({
         "final_url": "https://example.com/jobs/engineer",
@@ -894,6 +1022,24 @@ def test_dashboard_api_imports_job(tmp_path, monkeypatch) -> None:
             (result["url"],),
         ).fetchone()
         assert row["applied_at"] is not None
+
+        unapplied_request = urllib.request.Request(
+            f"{base_url}/api/jobs/applied",
+            data=json.dumps({"url": result["url"], "applied": False}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(unapplied_request) as response:
+            unapplied = json.load(response)
+            assert response.status == 200
+            assert unapplied["status"] == "active"
+
+        row = get_connection(db_path).execute(
+            "SELECT applied_at, apply_status FROM jobs WHERE url = ?",
+            (result["url"],),
+        ).fetchone()
+        assert row["applied_at"] is None
+        assert row["apply_status"] is None
 
         delete_request = urllib.request.Request(
             f"{base_url}/api/jobs/delete",
@@ -1321,6 +1467,7 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert 'data-applied="false"' in html
     assert 'data-applied="true"' in html
     assert "Mark as applied" in html
+    assert "Unmark as applied" in html
     assert "delete-job-btn" in html
     assert 'id="workspace-delete-job"' in html
     assert "deleteWorkspaceJob" in html
@@ -1345,12 +1492,24 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "'/api/pipeline'" in html
     assert 'data-workspace-tab="resume"' in html
     assert 'data-workspace-tab="report"' in html
+    assert "Complete report" in html
+    assert "function renderCompleteReport(report)" in html
+    assert "Object.entries(report)" in html
+    assert "function renderReportValue(value, depth = 0)" in html
+    assert "View raw JSON" in html
     assert 'data-workspace-filter="all">All active (1)' in html
     assert 'data-workspace-filter="strong">Strong fit (0)' in html
     assert 'data-workspace-filter="tailored">Tailored (0)' in html
     assert 'data-workspace-filter="applied">Applied (1)' in html
+    assert 'id="company-filter-toggle"' in html
+    assert 'id="company-filter-search"' in html
+    assert 'id="company-filter-select-all"' in html
+    assert 'id="company-filter-clear"' in html
+    assert "const workspaceCompanySelections = {all: null, strong: null, tailored: null, applied: null}" in html
+    assert "companySelection.has(job.company)" in html
+    assert "function renderWorkspaceCompanyFilter()" in html
     assert "updateWorkspaceFilterCounts()" in html
-    assert "workspaceFilter === 'applied'" in html
+    assert "filter === 'applied'" in html
     assert "!job.applied && (" in html
     assert 'id="spend-widget"' in html
     assert "'/api/usage/summary'" in html
@@ -1366,7 +1525,11 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "kind=report" in html
     assert "clear-tailored-btn" in html
     assert "Tailor again" in html
-    assert 'replace_existing: workspaceJob.has_tailored' in html
+    assert 'replace_existing: targetJob.has_tailored' in html
+    assert "let tailoringJobUrls = new Set()" in html
+    assert "tailoringJobUrls.has(workspaceJob.url)" in html
+    assert "tailoringJobUrls.add(targetJob.url)" in html
+    assert "tailoringInProgress" not in html
     assert 'data-replace-existing="true"' in html
     assert "deleteWorkspaceTailoredResume" in html
     assert "/api/jobs/tailored/clear" in html
@@ -1433,3 +1596,48 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "const value = input.value.trim();" in html
     assert "if (!value || values.includes(value)) return;" in html
     assert "if (event.key !== 'Enter') return;" in html
+
+
+def test_dashboard_cards_show_dates_and_sort_newest_within_score(
+    tmp_path, monkeypatch
+) -> None:
+    connection = init_db(tmp_path / "posted-dates.db")
+    connection.executemany(
+        "INSERT INTO jobs (url, title, company, discovered_at, posted_at, fit_score) "
+        "VALUES (?, ?, 'Example Corp', ?, ?, ?)",
+        [
+            (
+                "https://example.com/jobs/older",
+                "Older same-score job",
+                "2026-08-15T00:00:00+00:00",
+                "2026-08-01",
+                8,
+            ),
+            (
+                "https://example.com/jobs/newer",
+                "Newer same-score job",
+                "2026-08-15T00:00:00+00:00",
+                "2026-08-14",
+                8,
+            ),
+            (
+                "https://example.com/jobs/legacy",
+                "Legacy job",
+                "2026-08-13T00:00:00+00:00",
+                None,
+                7,
+            ),
+        ],
+    )
+    connection.commit()
+
+    import applypilot.view as view
+
+    monkeypatch.setattr(view, "get_connection", lambda: connection)
+    output = tmp_path / "dashboard.html"
+    generate_dashboard(str(output))
+    html = output.read_text(encoding="utf-8")
+
+    assert html.index("Newer same-score job") < html.index("Older same-score job")
+    assert 'class="inbox-job-posted">Posted Aug 14, 2026</small>' in html
+    assert 'class="inbox-job-posted">Posted Aug 13, 2026</small>' in html

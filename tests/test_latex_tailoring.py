@@ -159,6 +159,33 @@ def test_validator_rejects_an_invented_metric() -> None:
     assert any("99%" in error for error in result["errors"])
 
 
+@pytest.mark.parametrize("mode", ["strict", "normal", "lenient"])
+def test_validator_hard_rejects_duplicate_project_names(mode: str) -> None:
+    data = _resume_data()
+    data["projects"][1]["name"] = data["projects"][0]["name"]
+
+    result = validate_json_fields(
+        data,
+        _profile(),
+        mode=mode,
+        original_text=_master_source(),
+    )
+
+    assert not result["passed"]
+    assert "Duplicate project name: 'Project 1' is selected more than once" in result["errors"]
+
+
+def test_validator_normalizes_project_names_before_duplicate_check() -> None:
+    data = _resume_data()
+    data["projects"][0]["name"] = "Bitly"
+    data["projects"][1]["name"] = "  BITLY!!!  "
+
+    result = validate_json_fields(data, _profile())
+
+    assert not result["passed"]
+    assert any("Duplicate project name: 'Bitly'" in error for error in result["errors"])
+
+
 def test_validator_accepts_percent_metric_escaped_in_latex_source() -> None:
     data = _resume_data()
     latex_source = _master_source().replace("10%", r"10\%")

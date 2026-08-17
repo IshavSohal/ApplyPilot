@@ -13,6 +13,7 @@ lenient -- banned words ignored; only fabrication and required structure checked
 
 import logging
 import re
+import unicodedata
 
 log = logging.getLogger(__name__)
 
@@ -78,9 +79,7 @@ def _build_skills_set(profile: dict) -> set[str]:
     boundary = profile.get("skills_boundary", {})
     allowed: set[str] = set()
     for category in boundary.values():
-        if isinstance(category, list):
-            allowed.update(s.lower().strip() for s in category)
-        elif isinstance(category, set):
+        if isinstance(category, (list, set)):
             allowed.update(s.lower().strip() for s in category)
     return allowed
 
@@ -110,6 +109,12 @@ def _source_contains(source: str, claim: object) -> bool:
         return True
     normalized_source = _canonical_source_text(source)
     return all(word in normalized_source.split() for word in words)
+
+
+def _canonical_entity_name(value: object) -> str:
+    """Normalize an entity name so cosmetic differences cannot hide a duplicate."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^\w]+", " ", text).strip()
 
 
 def validate_json_fields(
@@ -180,6 +185,25 @@ def validate_json_fields(
     for entry in projects:
         if not isinstance(entry, dict) or not entry.get("name"):
             errors.append("Every project requires a name field")
+
+    # A project may have multiple source variants, but only one variant can be
+    # selected for a tailored resume. This is a hard error in every validation
+    # mode; unique entity IDs alone do not prevent duplicate named projects.
+    project_names: dict[str, str] = {}
+    duplicate_project_names: set[str] = set()
+    for entry in projects:
+        if not isinstance(entry, dict):
+            continue
+        display_name = str(entry.get("name") or "").strip()
+        canonical_name = _canonical_entity_name(display_name)
+        if not canonical_name:
+            continue
+        if canonical_name in project_names:
+            duplicate_project_names.add(project_names[canonical_name])
+        else:
+            project_names[canonical_name] = display_name
+    for name in sorted(duplicate_project_names, key=str.casefold):
+        errors.append(f"Duplicate project name: '{name}' is selected more than once")
 
     for entry in entities:
         bullets = entry.get("bullets", []) if isinstance(entry, dict) else []

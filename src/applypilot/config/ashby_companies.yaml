@@ -3,3 +3,11 @@
 companies:
   openai: { name: "OpenAI", board: "openai" }
   linear: { name: "Linear", board: "linear" }
+  cerebras: { name: "Cerebras Systems", board: "cerebras" }
+  color_health: { name: "Color Health", board: "color-health" }
+  faros: { name: "Faros", board: "faros-ai" }
+  interface_ai: { name: "interface.ai", board: "interface-ai" }
+  julius: { name: "Julius AI", board: "julius" }
+  notion: { name: "Notion", board: "notion" }
+  quora: { name: "Quora", board: "quora" }
+  strada: { name: "Strada", board: "stradahq" }

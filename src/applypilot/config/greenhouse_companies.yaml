@@ -30,6 +30,7 @@ companies:
   lyft:       { name: "Lyft",       board_token: "lyft" }
   discord:    { name: "Discord",    board_token: "discord" }
   roblox:     { name: "Roblox",     board_token: "roblox" }
+  newsbreak:  { name: "NewsBreak",  board_token: "newsbreak" }
 
   # -- Fintech -------------------------------------------------------------
   coinbase:   { name: "Coinbase",   board_token: "coinbase" }

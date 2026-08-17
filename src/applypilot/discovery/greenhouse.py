@@ -277,9 +277,89 @@ def _fetch_google_jobs(company: dict, terms: list[str]) -> list[dict]:
     return list(jobs.values())
 
 
+AMAZON_SEARCH_URL = "https://www.amazon.jobs/en/search.json"
+AMAZON_REQUEST_HEADERS = {
+    "Accept": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _normalize_amazon_job(item: dict) -> dict | None:
+    """Convert one Amazon API record to ApplyPilot's discovery job shape."""
+    job_id = str(item.get("id_icims") or item.get("id") or "")
+    path = item.get("job_path") or ""
+    if not job_id or not path:
+        return None
+
+    description_parts = []
+    if item.get("description"):
+        description_parts.append(str(item["description"]))
+    if item.get("basic_qualifications"):
+        description_parts.append(
+            "Basic Qualifications<br/><br/>"
+            + str(item["basic_qualifications"])
+        )
+    if item.get("preferred_qualifications"):
+        description_parts.append(
+            "Preferred Qualifications<br/><br/>"
+            + str(item["preferred_qualifications"])
+        )
+
+    # Amazon appends its compensation disclosure to the preferred
+    # qualifications field instead of exposing a dedicated salary property.
+    preferred = _normalize_description(item.get("preferred_qualifications"))
+    salary = next(
+        (
+            line
+            for line in reversed(preferred.splitlines())
+            if re.search(
+                r"\d[\d,.]*\s*-\s*\d[\d,.]*\s+[A-Z]{3}\b",
+                line,
+            )
+        ),
+        None,
+    )
+    return {
+        "id": job_id,
+        "title": item.get("title"),
+        "company": "Amazon",
+        "location": item.get("normalized_location") or item.get("location"),
+        "url": urllib.parse.urljoin("https://www.amazon.jobs", path),
+        "content": "<br/><br/>".join(description_parts)
+        or item.get("description_short"),
+        # Do not mark a partial API record as enriched. A normal Amazon
+        # posting has both qualification fields.
+        "content_is_full": bool(
+            item.get("basic_qualifications")
+            and item.get("preferred_qualifications")
+        ),
+        "salary": salary,
+        "application_url": item.get("url_next_step"),
+        "posted_at": item.get("posted_date"),
+    }
+
+
+def fetch_amazon_job(job_id: str) -> dict | None:
+    """Fetch one exact Amazon job by its numeric public job ID."""
+    job_id = str(job_id).strip()
+    if not job_id.isdigit():
+        return None
+    params = {"base_query": job_id, "result_limit": 10, "offset": 0}
+    data = json.loads(
+        _http_request(
+            f"{AMAZON_SEARCH_URL}?{urllib.parse.urlencode(params)}",
+            headers=AMAZON_REQUEST_HEADERS,
+        )
+    )
+    for item in data.get("jobs", []) or []:
+        candidate_id = str(item.get("id_icims") or item.get("id") or "")
+        if candidate_id == job_id:
+            return _normalize_amazon_job(item)
+    return None
+
+
 def _fetch_amazon_jobs(company: dict, terms: list[str]) -> list[dict]:
     """Fetch jobs from Amazon Jobs' JSON search endpoint."""
-    base = "https://www.amazon.jobs/en/search.json"
     jobs: dict[str, dict] = {}
     page_size = int(company.get("page_size", 100))
     for term in terms or [""]:
@@ -291,65 +371,15 @@ def _fetch_amazon_jobs(company: dict, terms: list[str]) -> list[dict]:
             }
             data = json.loads(
                 _http_request(
-                    f"{base}?{urllib.parse.urlencode(params)}",
-                    headers={
-                        "Accept": "application/json",
-                        "X-Requested-With": "XMLHttpRequest",
-                    },
+                    f"{AMAZON_SEARCH_URL}?{urllib.parse.urlencode(params)}",
+                    headers=AMAZON_REQUEST_HEADERS,
                 )
             )
             results = data.get("jobs", []) or []
             for item in results:
-                job_id = str(item.get("id_icims") or item.get("id") or "")
-                path = item.get("job_path") or ""
-                if not job_id or not path:
-                    continue
-                description_parts = []
-                if item.get("description"):
-                    description_parts.append(str(item["description"]))
-                if item.get("basic_qualifications"):
-                    description_parts.append(
-                        "Basic Qualifications<br/><br/>"
-                        + str(item["basic_qualifications"])
-                    )
-                if item.get("preferred_qualifications"):
-                    description_parts.append(
-                        "Preferred Qualifications<br/><br/>"
-                        + str(item["preferred_qualifications"])
-                    )
-
-                # Amazon appends its compensation disclosure to the preferred
-                # qualifications field instead of exposing a dedicated salary
-                # property. Preserve it in the full description and also make
-                # the range available to the dashboard's salary metadata.
-                preferred = _normalize_description(item.get("preferred_qualifications"))
-                salary = next(
-                    (
-                        line
-                        for line in reversed(preferred.splitlines())
-                        if re.search(
-                            r"\d[\d,.]*\s*-\s*\d[\d,.]*\s+[A-Z]{3}\b",
-                            line,
-                        )
-                    ),
-                    None,
-                )
-                jobs[job_id] = {
-                    "title": item.get("title"),
-                    "location": item.get("normalized_location") or item.get("location"),
-                    "url": urllib.parse.urljoin("https://www.amazon.jobs", path),
-                    "content": "<br/><br/>".join(description_parts)
-                    or item.get("description_short"),
-                    # Do not mark a partial API record as enriched. A normal
-                    # Amazon posting has both qualification fields.
-                    "content_is_full": bool(
-                        item.get("basic_qualifications")
-                        and item.get("preferred_qualifications")
-                    ),
-                    "salary": salary,
-                    "application_url": item.get("url_next_step"),
-                    "posted_at": item.get("posted_date"),
-                }
+                job = _normalize_amazon_job(item)
+                if job:
+                    jobs[job["id"]] = job
             if len(results) < page_size:
                 break
     return list(jobs.values())
@@ -476,6 +506,42 @@ def _fetch_meta_jobs(company: dict, terms: list[str]) -> list[dict]:
     return list(jobs.values())
 
 
+def _fetch_microsoft_job_details(job: dict) -> None:
+    """Attach Microsoft's authoritative full description to one search result."""
+    origin = "https://apply.careers.microsoft.com"
+    details_endpoint = f"{origin}/api/pcsx/position_details"
+    job_id_match = re.search(r"/job/(\d+)", job.get("url") or "")
+    if not job_id_match:
+        return
+
+    job_id = job_id_match.group(1)
+    params = {
+        "position_id": job_id,
+        "domain": "microsoft.com",
+        "hl": "en",
+    }
+    try:
+        payload = json.loads(
+            _http_request(
+                f"{details_endpoint}?{urllib.parse.urlencode(params)}",
+                headers={
+                    "Accept": "application/json",
+                    "Referer": job["url"],
+                },
+            )
+        )
+        details = payload.get("data", {}) or {}
+        description = details.get("jobDescription") or ""
+        if description:
+            job["content"] = description
+            job["content_is_full"] = True
+            job["application_url"] = job["url"]
+    except (OSError, TypeError, ValueError) as exc:
+        # Leave the posting pending for the normal browser enrichment cascade
+        # rather than failing the entire Microsoft discovery run.
+        log.warning("Microsoft: could not fetch details for %s: %s", job_id, exc)
+
+
 def _fetch_microsoft_jobs(company: dict, terms: list[str]) -> list[dict]:
     """Fetch jobs from Microsoft's public Eightfold/PCSX search endpoint."""
     origin = "https://apply.careers.microsoft.com"
@@ -526,6 +592,170 @@ def _fetch_microsoft_jobs(company: dict, terms: list[str]) -> list[dict]:
             total = int(data.get("count") or len(results))
             if len(results) < page_size or (page + 1) * page_size >= total:
                 break
+
+    return list(jobs.values())
+
+
+def _fetch_netflix_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from Netflix's public Eightfold careers endpoint."""
+    origin = "https://explore.jobs.netflix.net"
+    endpoint = f"{origin}/api/apply/v2/jobs"
+    jobs: dict[str, dict] = {}
+    page_size = 10  # Eightfold currently caps this endpoint at ten results.
+    max_pages = int(company.get("max_pages", 5))
+
+    for term in terms or [""]:
+        for page in range(max_pages):
+            params = {
+                "domain": "netflix.com",
+                "query": term,
+                "start": page * page_size,
+                "num": page_size,
+            }
+            payload = json.loads(
+                _http_request(
+                    f"{endpoint}?{urllib.parse.urlencode(params)}",
+                    headers={"Accept": "application/json"},
+                )
+            )
+            results = payload.get("positions", []) or []
+            for item in results:
+                job_id = str(item.get("id") or "")
+                if not job_id:
+                    continue
+                locations = item.get("locations") or []
+                location = "; ".join(str(value) for value in locations if value)
+                if not location:
+                    location = str(item.get("location") or "")
+                posted_at = None
+                if item.get("t_create"):
+                    try:
+                        posted_at = datetime.fromtimestamp(
+                            int(item["t_create"]), UTC
+                        ).date().isoformat()
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                url = (
+                    item.get("canonicalPositionUrl")
+                    or f"{origin}/careers/job/{job_id}"
+                )
+                jobs[job_id] = {
+                    "title": item.get("name") or item.get("posting_name"),
+                    "location": location,
+                    "url": url,
+                    # Eightfold search results omit the full job description;
+                    # leave the posting queued for normal detail enrichment.
+                    "content": "",
+                    "content_is_full": False,
+                    "posted_at": posted_at,
+                    "application_url": url,
+                }
+
+            total = int(payload.get("count") or len(results))
+            if len(results) < page_size or (page + 1) * page_size >= total:
+                break
+
+    return list(jobs.values())
+
+
+def _fetch_ibm_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch jobs from IBM's public careers search index."""
+    endpoint = "https://www-api.ibm.com/search/api/v2"
+    jobs: dict[str, dict] = {}
+    page_size = max(1, int(company.get("page_size", 30)))
+    max_pages = int(company.get("max_pages", 5))
+    source_fields = [
+        "_id",
+        "title",
+        "url",
+        "description",
+        "language",
+        "field_keyword_17",
+        "field_keyword_08",
+        "field_keyword_18",
+        "field_keyword_19",
+    ]
+
+    for term in terms or [""]:
+        for page in range(max_pages):
+            query: dict = {"match_all": {}}
+            if term:
+                query = {
+                    "bool": {
+                        "must": [
+                            {
+                                "simple_query_string": {
+                                    "query": term,
+                                    "fields": [
+                                        "keywords^1",
+                                        "body^1",
+                                        "url^2",
+                                        "description^2",
+                                        "h1s_content^2",
+                                        "title^3",
+                                        "field_text_01",
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                }
+            body = {
+                "appId": "careers",
+                "scopes": ["careers2"],
+                "query": query,
+                "from": page * page_size,
+                "size": page_size,
+                "sort": [{"_score": "desc"}, {"pageviews": "desc"}],
+                "lang": "zz",
+                "_source": source_fields,
+            }
+            payload = json.loads(
+                _http_request(
+                    endpoint,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                )
+            )
+            hits = payload.get("hits", {}) or {}
+            results = hits.get("hits", []) or []
+            for item in results:
+                source = item.get("_source", {}) or {}
+                url = str(source.get("url") or "").strip()
+                job_id_match = re.search(r"[?&]jobId=([^&]+)", url)
+                job_id = (
+                    urllib.parse.unquote(job_id_match.group(1))
+                    if job_id_match
+                    else str(item.get("_id") or url)
+                )
+                if not job_id or not url:
+                    continue
+                location = source.get("field_keyword_19") or ""
+                if isinstance(location, list):
+                    location = "; ".join(str(value) for value in location if value)
+                jobs[job_id] = {
+                    "title": source.get("title"),
+                    "location": str(location),
+                    "url": url,
+                    # Search results contain an excerpt, not the authoritative
+                    # full posting. Leave the row queued for detail enrichment.
+                    "content": source.get("description") or "",
+                    "content_is_full": False,
+                    "posted_at": None,
+                    "application_url": url,
+                }
+
+            total_value = hits.get("total", len(results))
+            if isinstance(total_value, dict):
+                total = int(total_value.get("value") or 0)
+            else:
+                total = int(total_value or 0)
+            if len(results) < page_size or (page + 1) * page_size >= total:
+                break
+
     return list(jobs.values())
 
 
@@ -535,6 +765,8 @@ BIGTECH_FETCHERS = {
     "apple": _fetch_apple_jobs,
     "meta": _fetch_meta_jobs,
     "microsoft": _fetch_microsoft_jobs,
+    "netflix": _fetch_netflix_jobs,
+    "ibm": _fetch_ibm_jobs,
 }
 
 
@@ -690,6 +922,12 @@ def _process_bigtech_company(
         if not url:
             continue
 
+        # Microsoft's JobPosting JSON-LD omits Overview. Fetch the complete
+        # structured HTML only after filtering, so rejected search results do
+        # not incur an unnecessary detail request.
+        if provider == "microsoft" and not job.get("content_is_full"):
+            _fetch_microsoft_job_details(job)
+
         description = _normalize_description(job.get("content"))
         content_is_full = job.get("content_is_full", True)
         full_description = description if content_is_full else ""
@@ -732,10 +970,10 @@ def _process_bigtech_company(
                     "WHERE url = ? AND full_description = ?",
                     (row[0], description),
                 )
-            elif provider == "amazon":
-                # Amazon's API supplies a complete, authoritative description.
-                # Refresh rows created by older versions, which stored only the
-                # first `description` field and therefore skipped enrichment.
+            elif provider in {"amazon", "microsoft"}:
+                # These APIs supply complete, authoritative descriptions.
+                # Refresh rows created by older versions that stored only a
+                # partial description and therefore skipped enrichment.
                 conn.execute(
                     "UPDATE jobs SET salary = COALESCE(?, salary), description = ?, "
                     "full_description = ?, application_url = COALESCE(?, application_url), "

@@ -29,6 +29,22 @@ def test_company_logo_candidates_prefer_stored_url() -> None:
     assert candidates[0] == "https://cdn.example.com/openai.png"
 
 
+def test_company_logo_candidates_prefer_normalized_png_for_unreliable_favicons() -> None:
+    for company, domain in (
+        ("Stripe", "stripe.com"),
+        ("Pinterest", "pinterest.com"),
+        ("Discord", "discord.com"),
+    ):
+        candidates = company_logos.company_logo_candidates(
+            company, f"https://{domain}/favicon.ico"
+        )
+
+        assert candidates[0] == (
+            f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+        )
+        assert candidates.count(candidates[0]) == 1
+
+
 def test_company_logo_is_downloaded_once_and_cached(tmp_path, monkeypatch) -> None:
     requests = []
 

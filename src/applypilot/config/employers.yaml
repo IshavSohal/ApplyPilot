@@ -84,6 +84,12 @@ employers:
     site_id: "CorporateCareers"
     base_url: "https://mastercard.wd1.myworkdayjobs.com"
 
+  visa:
+    name: "Visa"
+    tenant: "visa"
+    site_id: "Visa"
+    base_url: "https://visa.wd5.myworkdayjobs.com"
+
   paypal:
     name: "PayPal"
     tenant: "paypal"

@@ -59,6 +59,33 @@ def test_amazon_fetch_assembles_qualifications_and_salary(monkeypatch):
     assert job["application_url"] == "https://account.amazon.jobs/jobs/1234567/apply"
 
 
+def test_fetch_amazon_job_requires_an_exact_job_id(monkeypatch):
+    payload = _amazon_payload()
+    payload["jobs"].insert(
+        0,
+        {
+            **payload["jobs"][0],
+            "id_icims": "7654321",
+            "job_path": "/en/jobs/7654321/different-job",
+        },
+    )
+    requested_urls = []
+
+    def fake_request(url, **_kwargs):
+        requested_urls.append(url)
+        return json.dumps(payload).encode()
+
+    monkeypatch.setattr(greenhouse, "_http_request", fake_request)
+
+    job = greenhouse.fetch_amazon_job("1234567")
+
+    assert job is not None
+    assert job["id"] == "1234567"
+    assert job["company"] == "Amazon"
+    assert job["content_is_full"] is True
+    assert "base_query=1234567" in requested_urls[0]
+
+
 def test_existing_amazon_row_is_refreshed_with_complete_api_description(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.execute(

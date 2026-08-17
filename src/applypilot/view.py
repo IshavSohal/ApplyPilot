@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import re
 import webbrowser
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
@@ -96,6 +96,47 @@ def format_applied_at(value: str | None) -> str:
     return posted_label.replace("Posted", "Applied", 1) if posted_label else ""
 
 
+def posted_at_sort_key(value: str | None) -> float:
+    """Return a sortable timestamp for source dates, including relative labels."""
+    if not value:
+        return float("-inf")
+    text = str(value).strip()
+    if not text:
+        return float("-inf")
+
+    normalized = re.sub(r"^posted\s+", "", text, flags=re.IGNORECASE).strip()
+    now = datetime.now(UTC)
+    relative = re.fullmatch(
+        r"(?:(\d+)\+?\s+)?(hour|day|week|month)s?\s+ago",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if relative:
+        amount = int(relative.group(1) or 1)
+        unit_days = {"hour": 1 / 24, "day": 1, "week": 7, "month": 30}
+        return (now - timedelta(days=amount * unit_days[relative.group(2).lower()])).timestamp()
+    if normalized.lower() == "today":
+        return now.timestamp()
+    if normalized.lower() == "yesterday":
+        return (now - timedelta(days=1)).timestamp()
+
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+        for pattern in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(normalized, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
 def generate_dashboard(output_path: str | None = None) -> str:
     """Generate an HTML dashboard of all jobs with fit scores.
 
@@ -165,7 +206,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     jobs = conn.execute(
         """
         SELECT url, title, company, company_logo, salary, description, location, site, strategy,
-               full_description, application_url, detail_error, posted_at,
+               full_description, application_url, detail_error, posted_at, discovered_at,
                fit_score, score_reasoning, applied_at, tailored_resume_path,
                COALESCE(tailor_attempts, 0) AS tailor_attempts
         FROM jobs
@@ -191,6 +232,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         key=lambda job: (
             job["fit_score"] is None,
             -(job["fit_score"] or 0),
+            -posted_at_sort_key(job["posted_at"] or job["discovered_at"]),
             not is_priority_job(job),
             job["site"] or "",
             job["title"] or "",
@@ -222,6 +264,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
             "location": job["location"] or "Location unavailable",
             "site": job["site"] or "Unknown",
             "salary": job["salary"] or "",
+            # Older records may predate source-date capture. Their discovery
+            # timestamp keeps every existing card dated and provides a stable
+            # recency fallback.
+            "posted_at": job["posted_at"] or job["discovered_at"] or "",
+            "posted_label": format_posted_at(job["posted_at"] or job["discovered_at"]),
             "score": job["fit_score"],
             "reasoning": job["score_reasoning"] or "",
             "description": job["full_description"] or job["description"] or "",
@@ -249,7 +296,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         <button class="inbox-job{' selected' if index == 0 else ''}" type="button" data-workspace-index="{index}"
                 data-status="{escape(status.lower())}" data-score="{job['fit_score'] or 0}">
           <span class="company-avatar" title="{escape(payload['company'])}">{logo_html}</span>
-          <span class="inbox-job-copy"><strong>{escape(payload['title'])}</strong><small>{escape(payload['company'])}</small></span>
+          <span class="inbox-job-copy"><strong>{escape(payload['title'])}</strong><small>{escape(payload['company'])}</small><small class="inbox-job-posted">{escape(payload['posted_label'])}</small></span>
           <span class="inbox-job-meta"><strong>{escape(score_text)}</strong><small>{escape(status)}</small></span>
         </button>"""
     workspace_jobs_json = json.dumps(workspace_jobs).replace("<", "\\u003c")
@@ -355,7 +402,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         full_desc_html = format_job_description_html(j["full_description"])
         desc_len = len(j["full_description"] or "")
         detail_error = escape(j["detail_error"] or "")
-        posted_label = escape(format_posted_at(j["posted_at"]))
+        posted_label = escape(format_posted_at(j["posted_at"] or j["discovered_at"]))
         applied_label = escape(format_applied_at(j["applied_at"]))
         is_applied = bool(j["applied_at"])
 
@@ -378,12 +425,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
         apply_html = ""
         if apply_url:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
-        mark_applied_html = ""
-        if not is_applied:
-            mark_applied_html = (
-                f'<button class="mark-applied-btn" data-job-url="{url}" '
-                'type="button">Mark as applied</button>'
-            )
+        mark_applied_html = (
+            f'<button class="mark-applied-btn" data-job-url="{url}" '
+            f'data-applied="{str(is_applied).lower()}" type="button">'
+            f'{"Unmark as applied" if is_applied else "Mark as applied"}</button>'
+        )
         tailor_html = ""
         if (
             not is_applied
@@ -709,6 +755,25 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .inbox-filters {{ display: flex; gap: .4rem; margin-top: .7rem; overflow-x: auto; }}
   .inbox-filter {{ white-space: nowrap; border: 1px solid #d8deea; background: white; border-radius: 7px; padding: .4rem .65rem; color: #667085; cursor: pointer; }}
   .inbox-filter.active {{ color: #1d4ed8; border-color: #7694ff; background: #f3f6ff; }}
+  .company-filter {{ position: relative; margin-top: .65rem; }}
+  .company-filter-toggle {{ width: 100%; display: flex; align-items: center; justify-content: space-between; gap: .7rem; border: 1px solid #d8deea; background: white; border-radius: 8px; padding: .55rem .7rem; color: #344054; cursor: pointer; font: inherit; font-size: .82rem; text-align: left; }}
+  .company-filter-toggle.active {{ color: #1d4ed8; border-color: #7694ff; background: #f8faff; }}
+  .company-filter-chevron {{ color: #7c879b; transition: transform .15s ease; }}
+  .company-filter-toggle[aria-expanded="true"] .company-filter-chevron {{ transform: rotate(180deg); }}
+  .company-filter-menu {{ position: absolute; z-index: 20; top: calc(100% + .35rem); left: 0; right: 0; border: 1px solid #d8deea; border-radius: 10px; background: white; box-shadow: 0 12px 30px #10182824; padding: .65rem; }}
+  .company-filter-menu[hidden] {{ display: none; }}
+  .company-filter-actions {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: .55rem; }}
+  .company-filter-actions strong {{ color: #344054; font-size: .78rem; }}
+  .company-filter-actions div {{ display: flex; gap: .25rem; }}
+  .company-filter-action {{ border: 0; background: transparent; color: #2452e6; padding: .25rem; cursor: pointer; font: inherit; font-size: .72rem; }}
+  .company-filter-search {{ width: 100%; border: 1px solid #d8deea; border-radius: 7px; background: white; color: #172033; padding: .48rem .55rem; font: inherit; font-size: .78rem; }}
+  .company-filter-options {{ max-height: 230px; overflow-y: auto; margin-top: .45rem; }}
+  .company-filter-option {{ display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .5rem; padding: .42rem .3rem; color: #344054; cursor: pointer; font-size: .78rem; }}
+  .company-filter-option:hover {{ background: #f5f7fb; border-radius: 6px; }}
+  .company-filter-option input {{ accent-color: #315efb; }}
+  .company-filter-option span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .company-filter-option small, .company-filter-empty {{ color: #7c879b; font-size: .72rem; }}
+  .company-filter-empty {{ padding: .7rem .3rem; }}
   .inbox-list {{ overflow: auto; flex: 1; }}
   .inbox-job {{ width: 100%; display: grid; grid-template-columns: 40px minmax(0,1fr) auto; gap: .7rem; align-items: center; text-align: left; border: 0; border-bottom: 1px solid #eef0f4; background: white; padding: .85rem 1rem; cursor: pointer; color: #172033; }}
   .inbox-job:hover, .inbox-job.selected {{ background: #f1f5ff; }}
@@ -728,6 +793,26 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .job-heading p {{ color: #667085; margin: 0; font-size: .85rem; }}
   .toolbar-actions {{ display: flex; gap: .55rem; align-items: center; }}
   .primary-button, .secondary-button, .danger-button {{ border-radius: 8px; padding: .58rem .85rem; font-weight: 650; cursor: pointer; font: inherit; }}
+  .action-icon-button {{
+    position: relative; width: 40px; height: 40px; padding: 0; display: inline-grid; place-items: center;
+    flex: 0 0 40px; text-decoration: none;
+  }}
+  .action-icon-button svg {{
+    width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.9;
+    stroke-linecap: round; stroke-linejoin: round;
+  }}
+  #workspace-mark-applied svg {{ stroke: #16a34a; }}
+  .action-icon-button::after {{
+    content: attr(data-tooltip); position: absolute; z-index: 30; top: calc(100% + .45rem); right: 0;
+    width: max-content; max-width: 180px; padding: .38rem .55rem; border-radius: 6px;
+    background: #172033; color: white; box-shadow: 0 4px 12px #1018282e;
+    font-size: .72rem; font-weight: 600; line-height: 1.2; white-space: nowrap;
+    opacity: 0; visibility: hidden; pointer-events: none; transform: translateY(-2px);
+    transition: opacity .12s ease, transform .12s ease, visibility .12s ease;
+  }}
+  .action-icon-button:hover::after,
+  .action-icon-button:focus-visible::after {{ opacity: 1; visibility: visible; transform: translateY(0); }}
+  .action-icon-button:focus-visible {{ outline: 2px solid #315efb; outline-offset: 2px; }}
   .primary-button {{ border: 1px solid #2452e6; background: #315efb; color: white; }}
   .secondary-button {{ border: 1px solid #d8deea; background: white; color: #344054; }}
   .danger-button {{ border: 1px solid #fda29b; background: white; color: #b42318; }}
@@ -760,10 +845,30 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .artifact-sidebar .secondary-button:hover:not(:disabled):not(.tailoring-disabled) {{ border-radius: 999px; transform: translateY(-1px); }}
   .artifact-sidebar .tailoring-disabled {{ opacity: .5; cursor: wait; pointer-events: none; }}
   .report-section {{ margin-bottom: 1rem; }}
+  .report-section > h2 {{ margin-bottom: .75rem; }}
   .report-section ul {{ padding-left: 1.25rem; color: #475467; line-height: 1.55; }}
   .report-kpis {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; margin-bottom: 1rem; }}
   .report-kpi {{ padding: .8rem; border: 1px solid #e1e6ef; border-radius: 9px; }}
   .report-kpi small {{ color: #667085; display: block; }}
+  .report-complete {{ display: grid; gap: .8rem; }}
+  .report-block {{ border: 1px solid #e1e6ef; border-radius: 10px; padding: .9rem; min-width: 0; }}
+  .report-block > h3 {{ margin: 0 0 .7rem; font-size: .92rem; color: #344054; }}
+  .report-fields {{ display: grid; gap: .65rem; margin: 0; }}
+  .report-field {{ display: grid; grid-template-columns: minmax(130px, 26%) minmax(0, 1fr); gap: .75rem; align-items: start; }}
+  .report-field + .report-field {{ border-top: 1px solid #eef0f4; padding-top: .65rem; }}
+  .report-field dt {{ color: #667085; font-size: .78rem; font-weight: 700; }}
+  .report-field dd {{ margin: 0; min-width: 0; color: #344054; }}
+  .report-list {{ margin: 0; padding-left: 1.2rem; }}
+  .report-list li + li {{ margin-top: .35rem; }}
+  .report-cards {{ display: grid; gap: .55rem; }}
+  .report-item-card {{ border: 1px solid #e7eaf0; border-radius: 8px; padding: .7rem; min-width: 0; }}
+  .report-value {{ white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }}
+  .report-empty {{ color: #98a2b3; font-style: italic; }}
+  .report-boolean {{ display: inline-flex; align-items: center; border-radius: 999px; padding: .15rem .48rem; font-size: .75rem; font-weight: 700; }}
+  .report-boolean.yes {{ color: #067647; background: #ecfdf3; }}
+  .report-boolean.no {{ color: #b42318; background: #fef3f2; }}
+  .report-raw {{ margin-top: 1rem; }}
+  .report-raw summary {{ cursor: pointer; color: #475467; font-weight: 650; }}
   .raw-json {{ white-space: pre-wrap; overflow-wrap: anywhere; max-height: 380px; overflow: auto; background: #111827; color: #d1fae5; padding: 1rem; border-radius: 8px; font-size: .76rem; }}
   .usage-backdrop {{ position: fixed; inset: 0; background: #10182855; z-index: 50; display: none; }}
   .usage-backdrop.open {{ display: block; }}
@@ -852,12 +957,24 @@ def generate_dashboard(output_path: str | None = None) -> str:
   html[data-theme="dark"] .inbox-job {{ border-color: #27313d; }}
   html[data-theme="dark"] .workspace-search,
   html[data-theme="dark"] .inbox-filter,
+  html[data-theme="dark"] .company-filter-toggle,
+  html[data-theme="dark"] .company-filter-menu,
+  html[data-theme="dark"] .company-filter-search,
   html[data-theme="dark"] .icon-button,
   html[data-theme="dark"] .secondary-button {{ background: #151e28; border-color: #354150; color: #d7dee7; }}
   html[data-theme="dark"] .danger-button {{ background: #2a1719; border-color: #7a3030; color: #fda29b; }}
   html[data-theme="dark"] .danger-button:hover {{ background: #3a1d20; }}
+  html[data-theme="dark"] .action-icon-button::after {{ background: #e6edf3; color: #172033; box-shadow: 0 4px 12px #0008; }}
   html[data-theme="dark"] .workspace-search::placeholder {{ color: #708090; }}
   html[data-theme="dark"] .inbox-filter.active {{ color: #a9c1ff; border-color: #5878d8; background: #172644; }}
+  html[data-theme="dark"] .company-filter-toggle.active {{ color: #a9c1ff; border-color: #5878d8; background: #172644; }}
+  html[data-theme="dark"] .company-filter-menu {{ box-shadow: 0 12px 30px #0008; }}
+  html[data-theme="dark"] .company-filter-actions strong,
+  html[data-theme="dark"] .company-filter-option {{ color: #d7dee7; }}
+  html[data-theme="dark"] .company-filter-option:hover {{ background: #202b38; }}
+  html[data-theme="dark"] .company-filter-action {{ color: #8eb0ff; }}
+  html[data-theme="dark"] .company-filter-option small,
+  html[data-theme="dark"] .company-filter-empty {{ color: #8f9cab; }}
   html[data-theme="dark"] .inbox-job {{ background: #111821; color: #e6edf3; }}
   html[data-theme="dark"] .inbox-job:hover,
   html[data-theme="dark"] .inbox-job.selected {{ background: #172131; }}
@@ -874,9 +991,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
   html[data-theme="dark"] .usage-row {{ color: #aeb9c6; }}
   html[data-theme="dark"] .description-section-heading {{ color: #f0f6fc; }}
   html[data-theme="dark"] .report-kpi,
+  html[data-theme="dark"] .report-block,
+  html[data-theme="dark"] .report-item-card,
   html[data-theme="dark"] .usage-card {{ border-color: #303b48; background: #151e28; }}
   html[data-theme="dark"] .report-kpi small,
+  html[data-theme="dark"] .report-field dt,
   html[data-theme="dark"] .usage-card small {{ color: #8f9cab; }}
+  html[data-theme="dark"] .report-block > h3,
+  html[data-theme="dark"] .report-field dd {{ color: #d7dee7; }}
+  html[data-theme="dark"] .report-field + .report-field {{ border-color: #293440; }}
+  html[data-theme="dark"] .report-boolean.yes {{ color: #75e0a7; background: #123524; }}
+  html[data-theme="dark"] .report-boolean.no {{ color: #fda29b; background: #3a1d20; }}
+  html[data-theme="dark"] .report-raw summary {{ color: #aeb9c6; }}
   html[data-theme="dark"] .usage-row {{ border-color: #293440; }}
   html[data-theme="dark"] .artifact-sidebar {{ background: #111821; }}
   html[data-theme="dark"] .pdf-toolbar {{ background: #151e28; border-color: #354150; color: #d7dee7; }}
@@ -932,6 +1058,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
     .workspace-resizer {{ display: none; }}
     .job-workspace {{ min-height: 100vh; }}
     .artifact-layout, .detail-grid {{ grid-template-columns: 1fr; }}
+    .report-kpis {{ grid-template-columns: 1fr; }}
+    .report-field {{ grid-template-columns: 1fr; gap: .25rem; }}
     .toolbar-actions {{ flex-wrap: wrap; }}
     .usage-panel {{ left: 1rem; width: calc(100vw - 2rem); }}
     .usage-cards {{ grid-template-columns: repeat(2,1fr); }}
@@ -974,6 +1102,25 @@ def generate_dashboard(output_path: str | None = None) -> str:
         <button class="inbox-filter" type="button" data-workspace-filter="tailored">Tailored ({workspace_filter_counts['tailored']})</button>
         <button class="inbox-filter" type="button" data-workspace-filter="applied">Applied ({workspace_filter_counts['applied']})</button>
       </div>
+      <div id="company-filter" class="company-filter">
+        <button id="company-filter-toggle" class="company-filter-toggle" type="button"
+                aria-haspopup="true" aria-expanded="false" aria-controls="company-filter-menu">
+          <span id="company-filter-summary">Companies · All</span>
+          <span class="company-filter-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div id="company-filter-menu" class="company-filter-menu" hidden>
+          <div class="company-filter-actions">
+            <strong>Filter companies</strong>
+            <div>
+              <button id="company-filter-select-all" class="company-filter-action" type="button">Select all</button>
+              <button id="company-filter-clear" class="company-filter-action" type="button">Clear</button>
+            </div>
+          </div>
+          <input id="company-filter-search" class="company-filter-search" type="search"
+                 placeholder="Search companies" aria-label="Search companies">
+          <div id="company-filter-options" class="company-filter-options" role="group" aria-label="Companies"></div>
+        </div>
+      </div>
     </div>
     <div id="workspace-inbox-list" class="inbox-list">{inbox_rows or '<div class="empty-state">No jobs yet. Run the pipeline or add a job URL.</div>'}</div>
   </aside>
@@ -982,10 +1129,22 @@ def generate_dashboard(output_path: str | None = None) -> str:
     <header class="workspace-toolbar">
       <div class="job-heading"><h1 id="workspace-job-title">Select a job</h1><p id="workspace-job-meta">Choose a job from the inbox</p></div>
       <div class="toolbar-actions">
-        <a id="workspace-open-posting" class="secondary-button" target="_blank" rel="noopener">Open posting</a>
-        <button id="workspace-mark-applied" class="secondary-button" type="button">Mark applied</button>
-        <button id="workspace-delete-job" class="danger-button" type="button">Delete job</button>
-        <button id="run-pipeline-button" class="primary-button" type="button">Run pipeline</button>
+        <a id="workspace-open-posting" class="secondary-button action-icon-button" target="_blank" rel="noopener"
+           aria-label="Open posting" data-tooltip="Open posting">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 5h5v5M19 5l-9 9"/><path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg>
+        </a>
+        <button id="workspace-mark-applied" class="secondary-button action-icon-button" type="button"
+                aria-label="Mark applied" data-tooltip="Mark applied">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 12 2.5 2.5L16 9"/></svg>
+        </button>
+        <button id="workspace-delete-job" class="danger-button action-icon-button" type="button"
+                aria-label="Delete job" data-tooltip="Delete job">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM6 7l1 14h10l1-14M10 11v6M14 11v6"/></svg>
+        </button>
+        <button id="run-pipeline-button" class="primary-button action-icon-button" type="button"
+                aria-label="Run pipeline" data-tooltip="Run pipeline">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m8 5 11 7-11 7V5Z"/></svg>
+        </button>
       </div>
     </header>
     <div id="pipeline-strip" class="pipeline-strip" role="status"><span id="pipeline-message"></span><span id="pipeline-cost"></span></div>
@@ -1501,7 +1660,8 @@ const discoveryStatus = document.getElementById('discovery-status');
 const tailoringButton = document.getElementById('tailoring-button');
 const tailoringStatus = document.getElementById('tailoring-status');
 let tailoringPollTimer = null;
-let tailoringInProgress = false;
+let tailoringJobUrls = new Set();
+let bulkTailoringInProgress = false;
 
 const conceptWorkspace = document.querySelector('.concept-workspace');
 const workspaceResizer = document.getElementById('workspace-resizer');
@@ -1702,10 +1862,12 @@ function renderTailoringStatus(state) {{
   const current = state.current || null;
   const queued = Array.isArray(state.queued) ? state.queued : [];
   const recent = Array.isArray(state.recent) ? state.recent : [];
-  tailoringInProgress = Boolean(current || queued.length);
+  const outstanding = [current, ...queued].filter(Boolean);
+  tailoringJobUrls = new Set(
+    outstanding.filter(request => request.kind === 'job').map(request => request.target_url)
+  );
+  bulkTailoringInProgress = outstanding.some(request => request.kind === 'batch');
   syncWorkspaceTailoringControls();
-  const bulkOutstanding =
-    (current && current.kind === 'batch') || queued.some(request => request.kind === 'batch');
   const jobButtons = document.querySelectorAll('.tailor-job-btn');
   if (!current && !queued.length && tailoringPollTimer !== null) {{
     window.clearTimeout(tailoringPollTimer);
@@ -1713,8 +1875,8 @@ function renderTailoringStatus(state) {{
   }}
   tailoringStatus.classList.remove('error');
 
-  tailoringButton.disabled = Boolean(bulkOutstanding);
-  tailoringButton.textContent = bulkOutstanding ? 'Bulk tailoring queued...' : 'Run Tailoring';
+  tailoringButton.disabled = bulkTailoringInProgress;
+  tailoringButton.textContent = bulkTailoringInProgress ? 'Bulk tailoring queued...' : 'Run Tailoring';
   jobButtons.forEach(button => {{
     const active = current && current.target_url === button.dataset.jobUrl;
     const pending = queued.find(request => request.target_url === button.dataset.jobUrl);
@@ -1938,22 +2100,27 @@ document.addEventListener('click', async event => {{
   const button = event.target.closest('.mark-applied-btn');
   if (!button) return;
   const card = button.closest('.job-card');
+  const wasApplied = button.dataset.applied === 'true';
   button.disabled = true;
   button.textContent = 'Saving...';
   try {{
     const response = await fetch('/api/jobs/applied', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url: button.dataset.jobUrl}})
+      body: JSON.stringify({{url: button.dataset.jobUrl, applied: !wasApplied}})
     }});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not update job');
-    if (card) card.dataset.applied = 'true';
-    button.remove();
-    applyFilters();
+    if (wasApplied) {{
+      window.location.reload();
+    }} else {{
+      if (card) card.dataset.applied = 'true';
+      button.remove();
+      applyFilters();
+    }}
   }} catch (error) {{
     button.disabled = false;
-    button.textContent = 'Mark as applied';
+    button.textContent = wasApplied ? 'Unmark as applied' : 'Mark as applied';
     window.alert(error.message);
   }}
 }});
@@ -2574,6 +2741,7 @@ syncThemeToggle();
 const workspaceJobs = JSON.parse(document.getElementById('workspace-jobs-data').textContent);
 let workspaceJob = workspaceJobs.find(job => !job.applied) || null;
 let workspaceFilter = 'all';
+const workspaceCompanySelections = {{all: null, strong: null, tailored: null, applied: null}};
 let workspacePdfScale = 1.2;
 let workspacePdfGeneration = 0;
 
@@ -2581,6 +2749,11 @@ function safeHtml(value) {{
   return String(value ?? '').replace(/[&<>"']/g, character => ({{
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }})[character]);
+}}
+
+function setActionButtonLabel(element, label) {{
+  element.setAttribute('aria-label', label);
+  element.dataset.tooltip = label;
 }}
 
 const jobSectionHeadingPattern = /^(?:summary|job summary|description|role overview|position overview|overview|about (?:this|the) (?:role|job|position|team|company)|about us|about the team|key job responsibilities|job responsibilities|key responsibilities|responsibilities|duties|duties and responsibilities|what you(?:'|’)ll do|what you will do|minimum qualifications|basic qualifications|required qualifications|preferred qualifications|desired qualifications|qualifications|minimum requirements|required skills|preferred skills|skills and experience|education|experience|who you are|what we(?:'|’)re looking for|what we are looking for|what we offer|benefits|compensation|salary|salary range|pay range|pay transparency|work\\/life balance|work-life balance|diverse experiences|inclusive team culture|mentorship and career growth|mentorship & career growth|why aws|why join us)\\s*[:?]?\\s*$/i;
@@ -2624,8 +2797,8 @@ function renderWorkspaceJob(job) {{
   );
   document.getElementById('workspace-reasoning').textContent = job?.reasoning || 'This job has not been scored yet.';
   const applied = document.getElementById('workspace-mark-applied');
-  applied.disabled = !job || job.applied;
-  applied.textContent = job?.applied ? 'Applied' : 'Mark applied';
+  applied.disabled = !job;
+  setActionButtonLabel(applied, job?.applied ? 'Unmark as applied' : 'Mark applied');
   document.getElementById('workspace-delete-job').disabled = !job;
   syncWorkspaceTailoringControls();
   document.querySelectorAll('.inbox-job').forEach(row => {{
@@ -2637,22 +2810,24 @@ function renderWorkspaceJob(job) {{
 }}
 
 function syncWorkspaceTailoringControls() {{
+  const selectedJobTailoring = Boolean(workspaceJob && tailoringJobUrls.has(workspaceJob.url));
+  const tailoringUnavailable = bulkTailoringInProgress || selectedJobTailoring;
   const tailor = document.getElementById('workspace-tailor');
   if (tailor) {{
-    tailor.disabled = tailoringInProgress || !(workspaceJob?.can_tailor || workspaceJob?.can_retailor);
-    tailor.textContent = tailoringInProgress
+    tailor.disabled = tailoringUnavailable || !(workspaceJob?.can_tailor || workspaceJob?.can_retailor);
+    tailor.textContent = tailoringUnavailable
       ? 'Tailoring…'
       : (workspaceJob?.can_retailor
           ? 'Tailor again'
           : (workspaceJob?.has_tailored ? 'Tailoring limit reached' : 'Tailor resume'));
   }}
   document.querySelectorAll('.artifact-sidebar button').forEach(button => {{
-    button.disabled = tailoringInProgress;
+    button.disabled = tailoringUnavailable;
   }});
   document.querySelectorAll('.artifact-sidebar a').forEach(link => {{
-    link.classList.toggle('tailoring-disabled', tailoringInProgress);
-    link.setAttribute('aria-disabled', String(tailoringInProgress));
-    link.tabIndex = tailoringInProgress ? -1 : 0;
+    link.classList.toggle('tailoring-disabled', tailoringUnavailable);
+    link.setAttribute('aria-disabled', String(tailoringUnavailable));
+    link.tabIndex = tailoringUnavailable ? -1 : 0;
   }});
 }}
 
@@ -2719,9 +2894,49 @@ function zoomWorkspacePdf(delta) {{
   renderTailoredPdf();
 }}
 
-function reportList(value) {{
-  const items = Array.isArray(value) ? value : [];
-  return items.length ? `<ul>${{items.map(item => `<li>${{safeHtml(typeof item === 'string' ? item : JSON.stringify(item))}}</li>`).join('')}}</ul>` : '<p class="resume-meta">Unavailable</p>';
+function reportLabel(key) {{
+  const knownLabels = {{
+    id: 'ID', entity_id: 'Entity ID', validation_mode: 'Validation mode',
+    structured_data: 'Tailored resume content', decision_summary: 'Decision summary',
+    fit_to_one_page: 'Fit to one page', visual_line_audit: 'Visual line audit',
+    keyword_usage: 'Keyword usage', unsupported_skills_added: 'Unsupported skills added'
+  }};
+  if (knownLabels[key]) return knownLabels[key];
+  return String(key)
+    .replace(/[_-]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/^\\w|\\s\\w/g, character => character.toUpperCase());
+}}
+
+function renderReportValue(value, depth = 0) {{
+  if (value === null || value === undefined || value === '') {{
+    return '<span class="report-empty">Not provided</span>';
+  }}
+  if (typeof value === 'boolean') {{
+    return `<span class="report-boolean ${{value ? 'yes' : 'no'}}">${{value ? 'Yes' : 'No'}}</span>`;
+  }}
+  if (typeof value !== 'object') {{
+    return `<span class="report-value">${{safeHtml(value)}}</span>`;
+  }}
+  if (Array.isArray(value)) {{
+    if (!value.length) return '<span class="report-empty">None</span>';
+    const containsObjects = value.some(item => item !== null && typeof item === 'object');
+    if (!containsObjects) {{
+      return `<ul class="report-list">${{value.map(item => `<li>${{renderReportValue(item, depth + 1)}}</li>`).join('')}}</ul>`;
+    }}
+    return `<div class="report-cards">${{value.map((item, index) => `<div class="report-item-card" aria-label="Item ${{index + 1}}">${{renderReportValue(item, depth + 1)}}</div>`).join('')}}</div>`;
+  }}
+  const entries = Object.entries(value);
+  if (!entries.length) return '<span class="report-empty">None</span>';
+  return `<dl class="report-fields">${{entries.map(([key, item]) => `<div class="report-field"><dt>${{safeHtml(reportLabel(key))}}</dt><dd>${{renderReportValue(item, depth + 1)}}</dd></div>`).join('')}}</dl>`;
+}}
+
+function renderCompleteReport(report) {{
+  return Object.entries(report).map(([key, value]) => `
+    <section class="report-block">
+      <h3>${{safeHtml(reportLabel(key))}}</h3>
+      ${{renderReportValue(value)}}
+    </section>`).join('');
 }}
 
 async function loadWorkspaceReport() {{
@@ -2735,18 +2950,13 @@ async function loadWorkspaceReport() {{
     const response = await fetch(artifactUrl('report'));
     const report = await response.json();
     if (!response.ok) throw new Error(report.error || 'Could not load report');
-    const validator = report.validator || {{}};
-    const summary = report.decision_summary || {{}};
-    const changes = report.fit_to_one_page?.changes || summary['Fit-to-One-Page Changes']?.changes || [];
-    const keywords = report.structured_data?.keywords || summary['Job Keywords'] || {{}};
-    const keywordItems = Object.entries(keywords).flatMap(([key, value]) => Array.isArray(value) ? value.map(item => `${{key}}: ${{item}}`) : [`${{key}}: ${{value}}`]);
     target.innerHTML = `<article class="content-card">
       <div class="report-kpis"><div class="report-kpi"><small>Status</small><strong>${{safeHtml(report.status || 'Unknown')}}</strong></div><div class="report-kpi"><small>Attempts</small><strong>${{safeHtml(report.attempts ?? '—')}}</strong></div><div class="report-kpi"><small>Validation</small><strong>${{safeHtml(report.validation_mode || '—')}}</strong></div></div>
-      <section class="report-section"><h2>Validation checks</h2><p>${{validator.passed === true ? '✓ Passed' : validator.passed === false ? 'Needs attention' : 'Unavailable'}}</p>${{reportList([...(validator.errors || []), ...(validator.warnings || [])])}}</section>
-      <section class="report-section"><h2>Matched keywords</h2>${{reportList(keywordItems)}}</section>
-      <section class="report-section"><h2>Fit-to-one-page changes</h2>${{reportList(changes)}}</section>
-      <section class="report-section"><h2>Attempt history</h2>${{reportList(report.attempt_history)}}</section>
-      <details><summary>Raw JSON</summary><pre class="raw-json">${{safeHtml(JSON.stringify(report, null, 2))}}</pre></details>
+      <section class="report-section">
+        <h2>Complete report</h2>
+        <div class="report-complete">${{renderCompleteReport(report)}}</div>
+      </section>
+      <details class="report-raw"><summary>View raw JSON</summary><pre class="raw-json">${{safeHtml(JSON.stringify(report, null, 2))}}</pre></details>
       <p><a class="secondary-button" href="${{artifactUrl('report', 'download')}}">Download JSON</a></p>
     </article>`;
   }} catch (error) {{
@@ -2763,19 +2973,77 @@ function openWorkspaceTab(tab) {{
 document.querySelectorAll('.workspace-tab').forEach(button => button.addEventListener('click', () => openWorkspaceTab(button.dataset.workspaceTab)));
 document.querySelectorAll('.inbox-job').forEach(row => row.addEventListener('click', () => renderWorkspaceJob(workspaceJobs[Number(row.dataset.workspaceIndex)])));
 
+function jobMatchesWorkspaceView(job, filter = workspaceFilter) {{
+  return filter === 'applied'
+    ? job.applied
+    : !job.applied && (
+        filter === 'all' ||
+        (filter === 'strong' && Number(job.score || 0) >= 7) ||
+        (filter === 'tailored' && job.has_pdf)
+      );
+}}
+
+function workspaceCompanyChoices() {{
+  const counts = new Map();
+  workspaceJobs.filter(job => jobMatchesWorkspaceView(job)).forEach(job => {{
+    counts.set(job.company, (counts.get(job.company) || 0) + 1);
+  }});
+  return [...counts.entries()].sort(([left], [right]) => left.localeCompare(right));
+}}
+
+function renderWorkspaceCompanyFilter() {{
+  const choices = workspaceCompanyChoices();
+  const available = new Set(choices.map(([company]) => company));
+  const selection = workspaceCompanySelections[workspaceFilter];
+  const selectedCount = selection === null
+    ? choices.length
+    : choices.filter(([company]) => selection.has(company)).length;
+  const allSelected = selectedCount === choices.length;
+  const summary = document.getElementById('company-filter-summary');
+  summary.textContent = allSelected ? 'Companies · All' : `Companies · ${{selectedCount}}`;
+  document.getElementById('company-filter-toggle').classList.toggle('active', !allSelected);
+
+  const query = document.getElementById('company-filter-search').value.trim().toLowerCase();
+  const options = document.getElementById('company-filter-options');
+  options.replaceChildren();
+  choices.filter(([company]) => !query || company.toLowerCase().includes(query)).forEach(([company, count]) => {{
+    const label = document.createElement('label');
+    label.className = 'company-filter-option';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selection === null || selection.has(company);
+    checkbox.addEventListener('change', () => {{
+      let next = workspaceCompanySelections[workspaceFilter];
+      if (next === null) next = new Set(available);
+      if (checkbox.checked) next.add(company);
+      else next.delete(company);
+      workspaceCompanySelections[workspaceFilter] = [...available].every(item => next.has(item)) ? null : next;
+      renderWorkspaceCompanyFilter();
+      applyWorkspaceFilters();
+    }});
+    const name = document.createElement('span');
+    name.textContent = company;
+    const jobCount = document.createElement('small');
+    jobCount.textContent = String(count);
+    label.append(checkbox, name, jobCount);
+    options.appendChild(label);
+  }});
+  if (!options.children.length) {{
+    const empty = document.createElement('div');
+    empty.className = 'company-filter-empty';
+    empty.textContent = choices.length ? 'No companies match your search.' : 'No companies in this view.';
+    options.appendChild(empty);
+  }}
+}}
+
 function applyWorkspaceFilters() {{
   const query = document.getElementById('workspace-search').value.trim().toLowerCase();
+  const companySelection = workspaceCompanySelections[workspaceFilter];
   document.querySelectorAll('.inbox-job').forEach((row, index) => {{
     const job = workspaceJobs[index];
     const textMatch = !query || `${{job.title}} ${{job.company}} ${{job.location}}`.toLowerCase().includes(query);
-    const filterMatch = workspaceFilter === 'applied'
-      ? job.applied
-      : !job.applied && (
-          workspaceFilter === 'all' ||
-          (workspaceFilter === 'strong' && Number(job.score || 0) >= 7) ||
-          (workspaceFilter === 'tailored' && job.has_pdf)
-        );
-    row.classList.toggle('hidden', !(textMatch && filterMatch));
+    const companyMatch = companySelection === null || companySelection.has(job.company);
+    row.classList.toggle('hidden', !(textMatch && companyMatch && jobMatchesWorkspaceView(job)));
   }});
 }}
 
@@ -2796,8 +3064,47 @@ document.getElementById('workspace-search').addEventListener('input', applyWorks
 document.querySelectorAll('.inbox-filter').forEach(button => button.addEventListener('click', () => {{
   workspaceFilter = button.dataset.workspaceFilter;
   document.querySelectorAll('.inbox-filter').forEach(item => item.classList.toggle('active', item === button));
+  document.getElementById('company-filter-search').value = '';
+  renderWorkspaceCompanyFilter();
   applyWorkspaceFilters();
 }}));
+
+const companyFilterToggle = document.getElementById('company-filter-toggle');
+const companyFilterMenu = document.getElementById('company-filter-menu');
+function closeWorkspaceCompanyFilter() {{
+  companyFilterMenu.hidden = true;
+  companyFilterToggle.setAttribute('aria-expanded', 'false');
+}}
+companyFilterToggle.addEventListener('click', () => {{
+  const opening = companyFilterMenu.hidden;
+  companyFilterMenu.hidden = !opening;
+  companyFilterToggle.setAttribute('aria-expanded', String(opening));
+  if (opening) {{
+    renderWorkspaceCompanyFilter();
+    document.getElementById('company-filter-search').focus();
+  }}
+}});
+document.getElementById('company-filter-search').addEventListener('input', renderWorkspaceCompanyFilter);
+document.getElementById('company-filter-select-all').addEventListener('click', () => {{
+  workspaceCompanySelections[workspaceFilter] = null;
+  renderWorkspaceCompanyFilter();
+  applyWorkspaceFilters();
+}});
+document.getElementById('company-filter-clear').addEventListener('click', () => {{
+  workspaceCompanySelections[workspaceFilter] = new Set();
+  renderWorkspaceCompanyFilter();
+  applyWorkspaceFilters();
+}});
+document.addEventListener('click', event => {{
+  if (!document.getElementById('company-filter').contains(event.target)) closeWorkspaceCompanyFilter();
+}});
+document.getElementById('company-filter').addEventListener('keydown', event => {{
+  if (event.key === 'Escape') {{
+    closeWorkspaceCompanyFilter();
+    companyFilterToggle.focus();
+  }}
+}});
+renderWorkspaceCompanyFilter();
 
 document.getElementById('show-import').addEventListener('click', async () => {{
   const url = window.prompt('Paste a public job-posting URL');
@@ -2812,18 +3119,19 @@ document.getElementById('show-import').addEventListener('click', async () => {{
 
 async function queueWorkspaceTailoring() {{
   if (!workspaceJob) return;
-  tailoringInProgress = true;
+  const targetJob = workspaceJob;
+  tailoringJobUrls.add(targetJob.url);
   syncWorkspaceTailoringControls();
   document.getElementById('workspace-action-status').textContent = 'Tailoring queued…';
   try {{
-    const response = await fetch('/api/tailoring/job', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{url: workspaceJob.url, validation_mode: 'normal', replace_existing: workspaceJob.has_tailored}})}});
+    const response = await fetch('/api/tailoring/job', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{url: targetJob.url, validation_mode: 'normal', replace_existing: targetJob.has_tailored}})}});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not tailor this job');
     sessionStorage.setItem('applypilotTailoringPending', 'true');
     document.getElementById('workspace-action-status').textContent = 'Tailoring in progress. This view will refresh when complete.';
     refreshTailoringStatus();
   }} catch (error) {{
-    tailoringInProgress = false;
+    tailoringJobUrls.delete(targetJob.url);
     syncWorkspaceTailoringControls();
     document.getElementById('workspace-action-status').textContent = error.message;
   }}
@@ -2868,7 +3176,7 @@ async function deleteWorkspaceJob() {{
   if (!workspaceJob || !window.confirm(`Delete "${{workspaceJob.title}}" from ApplyPilot? This cannot be undone.`)) return;
   const button = document.getElementById('workspace-delete-job');
   button.disabled = true;
-  button.textContent = 'Deleting…';
+  setActionButtonLabel(button, 'Deleting…');
   try {{
     const response = await fetch('/api/jobs/delete', {{
       method: 'POST',
@@ -2880,7 +3188,7 @@ async function deleteWorkspaceJob() {{
     window.location.reload();
   }} catch (error) {{
     button.disabled = false;
-    button.textContent = 'Delete job';
+    setActionButtonLabel(button, 'Delete job');
     window.alert(error.message);
   }}
 }}
@@ -2889,19 +3197,27 @@ document.getElementById('workspace-delete-job').addEventListener('click', delete
 
 document.getElementById('workspace-mark-applied').addEventListener('click', async event => {{
   if (!workspaceJob) return;
+  const applied = !workspaceJob.applied;
   event.currentTarget.disabled = true;
   try {{
-    const response = await fetch('/api/jobs/applied', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{url: workspaceJob.url}})}});
+    const response = await fetch('/api/jobs/applied', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{url: workspaceJob.url, applied}})}});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not update job');
-    workspaceJob.applied = true;
-    workspaceJob.status = 'Applied';
-    workspaceFilter = 'applied';
+    if (!applied) {{
+      window.location.reload();
+      return;
+    }}
+    workspaceJob.applied = applied;
+    workspaceJob.status = applied
+      ? 'Applied'
+      : (workspaceJob.has_tailored ? 'Tailored' : (workspaceJob.score == null ? 'Discovered' : 'Scored'));
+    workspaceFilter = applied ? 'applied' : 'all';
     document.querySelectorAll('.inbox-filter').forEach(item => {{
-      item.classList.toggle('active', item.dataset.workspaceFilter === 'applied');
+      item.classList.toggle('active', item.dataset.workspaceFilter === workspaceFilter);
     }});
     renderWorkspaceJob(workspaceJob);
     updateWorkspaceFilterCounts();
+    renderWorkspaceCompanyFilter();
     applyWorkspaceFilters();
   }} catch (error) {{ event.currentTarget.disabled = false; window.alert(error.message); }}
 }});
@@ -2915,8 +3231,9 @@ async function refreshPipelineRun() {{
     if (!run) return;
     activePipelineRun = run.id;
     const running = run.status === 'running';
-    document.getElementById('run-pipeline-button').disabled = running;
-    document.getElementById('run-pipeline-button').textContent = running ? 'Pipeline running…' : 'Run pipeline';
+    const pipelineButton = document.getElementById('run-pipeline-button');
+    pipelineButton.disabled = running;
+    setActionButtonLabel(pipelineButton, running ? 'Pipeline running…' : 'Run pipeline');
     const strip = document.getElementById('pipeline-strip');
     strip.classList.toggle('visible', running || run.status === 'error' || run.status === 'partial');
     document.getElementById('pipeline-message').textContent = running ? `Running ${{run.current_stage || 'pipeline'}}…` : `Last run: ${{run.status}}`;

@@ -320,14 +320,22 @@ class LLMClient:
         text, usage = self._handle_compat_response(resp)
         from applypilot.usage import record_usage
         prompt_details = usage.get("prompt_tokens_details") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
+        cache_write_tokens = prompt_details.get("cache_write_tokens", 0) or 0
+        uncached_input_tokens = (
+            None
+            if prompt_tokens is None
+            else max(0, int(prompt_tokens) - int(cache_read_tokens) - int(cache_write_tokens))
+        )
         record_usage(
             provider=self.provider,
             model=self.model,
             tokens={
-                "input": usage.get("prompt_tokens"),
+                "input": uncached_input_tokens,
                 "output": usage.get("completion_tokens"),
-                "cache_read": prompt_details.get("cached_tokens", 0),
-                "cache_write": 0,
+                "cache_read": cache_read_tokens,
+                "cache_write": cache_write_tokens,
             },
         )
         return text

@@ -31,3 +31,14 @@ companies:
     name: "Microsoft"
     provider: "microsoft"
     max_pages: 5
+
+  netflix:
+    name: "Netflix"
+    provider: "netflix"
+    max_pages: 5
+
+  ibm:
+    name: "IBM"
+    provider: "ibm"
+    max_pages: 5
+    page_size: 30

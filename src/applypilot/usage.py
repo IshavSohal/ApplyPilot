@@ -13,10 +13,11 @@ from datetime import UTC, datetime
 from applypilot import config
 from applypilot.database import get_connection, init_db
 
-PRICING_VERSION = "2026-08-12"
+PRICING_VERSION = "2026-08-15"
 PRICING_PATH = config.APP_DIR / "llm_pricing.json"
 DEFAULT_RATES: dict[str, dict[str, float]] = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075, "cache_write": 0.0},
+    "gpt-5.6-luna": {"input": 0.20, "output": 1.20, "cache_read": 0.02, "cache_write": 0.25},
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40, "cache_read": 0.025, "cache_write": 0.0},
 }
 
@@ -96,6 +97,7 @@ def rates_for(provider: str, model: str) -> dict[str, float] | None:
 
 
 def _estimate(tokens: dict[str, int | None], rates: dict[str, float] | None) -> int | None:
+    """Estimate cost from mutually exclusive token categories."""
     if rates is None or tokens.get("input") is None or tokens.get("output") is None:
         return None
     dollars = sum(
@@ -103,6 +105,54 @@ def _estimate(tokens: dict[str, int | None], rates: dict[str, float] | None) -> 
         for kind in ("input", "output", "cache_read", "cache_write")
     )
     return round(dollars * 1_000_000)
+
+
+def _backfill_new_default_rates() -> int:
+    """Price old unavailable rows when support for their model is added.
+
+    User overrides intentionally remain future-only. Older OpenAI rows stored
+    total prompt tokens in ``input_tokens``, so cached tokens must be removed
+    before applying the mutually exclusive rate categories.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, provider, model, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens
+           FROM llm_usage WHERE cost_kind = 'unavailable'"""
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        rates = DEFAULT_RATES.get(row["model"])
+        if rates is None:
+            continue
+        tokens = {
+            "input": row["input_tokens"],
+            "output": row["output_tokens"],
+            "cache_read": row["cache_read_tokens"],
+            "cache_write": row["cache_write_tokens"],
+        }
+        if row["provider"] == "openai" and tokens["input"] is not None:
+            tokens["input"] = max(
+                0,
+                tokens["input"]
+                - int(tokens["cache_read"] or 0)
+                - int(tokens["cache_write"] or 0),
+            )
+        estimated = _estimate(tokens, rates)
+        if estimated is None:
+            continue
+        snapshot = {"version": PRICING_VERSION, "rates_per_million_usd": rates}
+        cursor = conn.execute(
+            """UPDATE llm_usage
+               SET input_tokens = ?, estimated_cost_microusd = ?,
+                   cost_kind = 'estimated', pricing_json = ?
+               WHERE id = ? AND cost_kind = 'unavailable'""",
+            (tokens["input"], estimated, json.dumps(snapshot, separators=(",", ":")), row["id"]),
+        )
+        updated += cursor.rowcount
+    if updated:
+        conn.commit()
+    return updated
 
 
 def record_usage(
@@ -264,6 +314,7 @@ def _aggregate(run_id: str | None = None, since: str | None = None, *,
 def usage_summary(run_id: str | None = None, *, stage: str | None = None,
                   provider: str | None = None, model: str | None = None) -> dict:
     init_db()
+    _backfill_new_default_rates()
     now = datetime.now(UTC)
     day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()

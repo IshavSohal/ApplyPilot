@@ -75,6 +75,34 @@ def test_pricing_override_validation_and_future_only_costs(tmp_path, monkeypatch
     assert costs == [1_000_000, 3_000_000]
 
 
+def test_new_default_rate_backfills_unavailable_openai_usage(tmp_path, monkeypatch):
+    conn = _isolated_usage(tmp_path, monkeypatch)
+    monkeypatch.setattr(usage, "DEFAULT_RATES", {})
+    usage.record_usage(
+        provider="openai",
+        model="new-model",
+        tokens={
+            "input": 1_000_000,
+            "output": 100_000,
+            "cache_read": 200_000,
+            "cache_write": 0,
+        },
+    )
+
+    monkeypatch.setattr(
+        usage,
+        "DEFAULT_RATES",
+        {"new-model": {"input": 1.0, "output": 2.0, "cache_read": 0.1, "cache_write": 1.25}},
+    )
+    summary = usage.usage_summary()
+
+    row = conn.execute("SELECT * FROM llm_usage").fetchone()
+    assert row["input_tokens"] == 800_000
+    assert row["estimated_cost_microusd"] == 1_020_000
+    assert row["cost_kind"] == "estimated"
+    assert summary["all_time"]["cost_usd"] == 1.02
+
+
 def test_recover_interrupted_runs(tmp_path, monkeypatch):
     _isolated_usage(tmp_path, monkeypatch)
     run = usage.create_run(["discover", "enrich", "score"])
