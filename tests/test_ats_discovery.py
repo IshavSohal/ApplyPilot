@@ -73,6 +73,16 @@ def test_fetch_lever_jobs_paginates_and_supports_eu(monkeypatch):
                     "hostedUrl": "https://jobs.eu.lever.co/example/one",
                     "applyUrl": "https://jobs.eu.lever.co/example/one/apply",
                     "descriptionPlain": "Build the product. " * 20,
+                    "lists": [
+                        {
+                            "text": "Requirements",
+                            "content": "<li>Write reliable code</li><li>Review changes</li>",
+                        },
+                        {
+                            "text": "Compensation",
+                            "content": "<li>EUR 100,000 - 130,000</li>",
+                        },
+                    ],
                     "additionalPlain": "Benefits and equal opportunity information.",
                     "createdAt": 1_722_470_400_000,
                     "salaryRange": {
@@ -98,6 +108,11 @@ def test_fetch_lever_jobs_paginates_and_supports_eu(monkeypatch):
     assert jobs[0]["location"] == "Paris; Remote - EU"
     assert jobs[0]["salary"] == "EUR 100,000 - 130,000 year"
     assert jobs[0]["posted_at"] == "2024-08-01T00:00:00+00:00"
+    assert "Requirements" in jobs[0]["content"]
+    assert "Write reliable code" in jobs[0]["content"]
+    assert "Review changes" in jobs[0]["content"]
+    assert "Compensation" in jobs[0]["content"]
+    assert "EUR 100,000 - 130,000" in jobs[0]["content"]
     assert "Benefits and equal opportunity" in jobs[0]["content"]
 
 
@@ -151,7 +166,7 @@ def test_process_ats_company_filters_and_persists_full_description(monkeypatch):
     assert row[4]
 
 
-def test_process_ats_company_backfills_posted_date_for_existing_job(monkeypatch):
+def test_process_ats_company_refreshes_existing_job(monkeypatch):
     conn = _jobs_connection()
     url = "https://jobs.ashbyhq.com/example/one"
     conn.execute(
@@ -166,6 +181,8 @@ def test_process_ats_company_backfills_posted_date_for_existing_job(monkeypatch)
             "title": "Software Engineer",
             "location": "Toronto, Canada",
             "url": url,
+            "application_url": f"{url}/apply",
+            "content": "A newly complete description. " * 20,
             "posted_at": "2026-08-14T12:00:00Z",
         }],
     )
@@ -179,11 +196,17 @@ def test_process_ats_company_backfills_posted_date_for_existing_job(monkeypatch)
     )
 
     assert result["existing"] == 1
-    assert conn.execute(
-        "SELECT posted_at FROM jobs WHERE url = ?", (url,)
-    ).fetchone()[0] == "2026-08-14T12:00:00Z"
+    row = conn.execute(
+        "SELECT posted_at, full_description, application_url FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    assert row[0] == "2026-08-14T12:00:00Z"
+    assert row[1] == ("A newly complete description. " * 20).strip()
+    assert row[2] == f"{url}/apply"
 
 
 def test_default_ats_registries_have_required_slugs():
     assert all(company.get("board") for company in ats.load_ashby_companies().values())
-    assert all(company.get("site") for company in ats.load_lever_companies().values())
+    lever_companies = ats.load_lever_companies()
+    assert all(company.get("site") for company in lever_companies.values())
+    assert lever_companies["veeva"] == {"name": "Veeva Systems", "site": "veeva"}

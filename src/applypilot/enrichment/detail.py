@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
+from applypilot import config
 from applypilot.database import init_db
 from applypilot.discovery.filters import reconcile_unscored_jobs
 from applypilot.llm import get_client
@@ -966,6 +967,15 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
+                    enriched_location = result.get("location")
+                    existing_location = conn.execute(
+                        "SELECT location FROM jobs WHERE url = ?",
+                        (url,),
+                    ).fetchone()
+                    effective_location = enriched_location or (
+                        existing_location[0] if existing_location else None
+                    )
+                    location_allowed = config.location_is_allowed(effective_location)
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
                         "detail_scraped_at = ?, detail_error = NULL, "
@@ -975,7 +985,14 @@ def scrape_site_batch(
                         "company_logo = COALESCE(company_logo, ?), "
                         "location = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, location) ELSE location END, "
-                        "posted_at = COALESCE(posted_at, ?) "
+                        "posted_at = COALESCE(posted_at, ?), "
+                        "discovery_status = CASE WHEN strategy = 'external_upload' AND ? = 0 "
+                        "THEN 'rejected' ELSE discovery_status END, "
+                        "discovery_rejection_reason = CASE "
+                        "WHEN strategy = 'external_upload' AND ? = 0 THEN 'outside_allowed_countries' "
+                        "ELSE discovery_rejection_reason END, "
+                        "discovery_checked_at = CASE WHEN strategy = 'external_upload' "
+                        "THEN ? ELSE discovery_checked_at END "
                         "WHERE url = ?",
                         (
                             result.get("full_description"),
@@ -986,6 +1003,9 @@ def scrape_site_batch(
                             result.get("company_logo"),
                             result.get("location"),
                             result.get("posted_at"),
+                            location_allowed,
+                            location_allowed,
+                            now,
                             url,
                         ),
                     )

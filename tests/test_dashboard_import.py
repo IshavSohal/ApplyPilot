@@ -128,6 +128,7 @@ def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) 
 
     monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
     monkeypatch.setattr(config, "get_tier", lambda: 2)
+    monkeypatch.setattr(config, "location_is_allowed", lambda _location: True)
     monkeypatch.setattr("applypilot.enrichment.detail.scrape_site_batch", fake_scrape)
     monkeypatch.setattr(
         "applypilot.scoring.scorer.run_scoring",
@@ -860,12 +861,13 @@ def test_load_dashboard_company_logo_backfills_existing_company(db, monkeypatch)
         ("2026-07-20", "Posted Jul 20, 2026"),
         ("2026-07-20T14:30:00Z", "Posted Jul 20, 2026"),
         ("April  9, 2026", "Posted Apr 9, 2026"),
-        ("Posted 2 Days Ago", "Posted 2 Days Ago"),
+        ("Posted 2 Days Ago", "Posted Aug 15, 2026"),
         (None, ""),
     ],
 )
 def test_format_posted_at(value, expected) -> None:
-    assert format_posted_at(value) == expected
+    reference = "2026-08-17T12:00:00+00:00" if value == "Posted 2 Days Ago" else None
+    assert format_posted_at(value, reference) == expected
 
 
 def test_format_applied_at() -> None:
@@ -908,6 +910,23 @@ def test_country_location_policy_rejects_other_or_unknown_regions(location: str)
         "accept_unknown_locations": False,
     }
     assert not location_is_allowed(location, config)
+
+
+@pytest.mark.parametrize("location", ["Bangalore, IN", "Pune, IN", "Kochi, IN"])
+def test_country_location_policy_does_not_treat_india_code_as_indiana(location: str) -> None:
+    config = {
+        "allowed_countries": ["Canada", "United States"],
+        "accept_unknown_locations": False,
+    }
+    assert not location_is_allowed(location, config)
+
+
+def test_country_allowlist_rejects_unscoped_remote_by_default() -> None:
+    config = {
+        "allowed_countries": ["Canada", "United States"],
+        "accept_unknown_locations": False,
+    }
+    assert not location_is_allowed("Remote - Europe", config)
 
 
 def test_country_allowlist_makes_discovery_filter_mandatory() -> None:

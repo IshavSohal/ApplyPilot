@@ -5,9 +5,10 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from applypilot.config import DB_PATH
@@ -181,6 +182,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    normalize_relative_posted_dates(conn)
 
     return conn
 
@@ -268,6 +270,137 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
         conn.commit()
 
     return added
+
+
+_RELATIVE_POSTED_RE = re.compile(
+    r"^(?:posted\s+)?(?:(\d+)\+?\s+)?(hour|day|week|month)s?\s+ago$",
+    re.IGNORECASE,
+)
+
+
+def normalize_posted_at(value: str | None, reference_at: str | None = None) -> str | None:
+    """Convert a relative posting label to an ISO date.
+
+    ``reference_at`` should be the timestamp at which the relative label was
+    captured. Using it instead of the current time keeps legacy conversions
+    accurate and idempotent.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = re.sub(r"^posted\s+", "", text, flags=re.IGNORECASE).strip()
+    lowered = normalized.lower()
+    relative_days: float | None = None
+    if lowered == "today":
+        relative_days = 0
+    elif lowered == "yesterday":
+        relative_days = 1
+    else:
+        match = _RELATIVE_POSTED_RE.fullmatch(text)
+        if match:
+            amount = int(match.group(1) or 1)
+            relative_days = amount * {
+                "hour": 1 / 24,
+                "day": 1,
+                "week": 7,
+                "month": 30,
+            }[match.group(2).lower()]
+
+    if relative_days is None:
+        return text
+
+    try:
+        reference = datetime.fromisoformat((reference_at or "").replace("Z", "+00:00"))
+    except ValueError:
+        reference = datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return (reference - timedelta(days=relative_days)).date().isoformat()
+
+
+def normalize_relative_posted_dates(conn: sqlite3.Connection) -> int:
+    """Replace relative posting labels in existing jobs with concrete dates."""
+    rows = conn.execute(
+        "SELECT url, posted_at, discovered_at FROM jobs "
+        "WHERE lower(posted_at) LIKE '%today%' "
+        "OR lower(posted_at) LIKE '%yesterday%' "
+        "OR lower(posted_at) LIKE '%ago%'"
+    ).fetchall()
+    updates = []
+    for row in rows:
+        normalized = normalize_posted_at(row[1], row[2])
+        if normalized and normalized != row[1]:
+            updates.append((normalized, row[0]))
+    if updates:
+        conn.executemany("UPDATE jobs SET posted_at = ? WHERE url = ?", updates)
+        conn.commit()
+    return len(updates)
+
+
+def _parse_job_date(value: str | None, reference_at: str | None = None) -> datetime | None:
+    """Parse a stored job date, including source-specific display formats."""
+    normalized = normalize_posted_at(value, reference_at)
+    if not normalized:
+        return None
+
+    text = normalized.strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        parsed = None
+        for pattern in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                parsed = datetime.strptime(text, pattern).replace(tzinfo=UTC)
+                break
+            except ValueError:
+                continue
+
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def delete_jobs_older_than(
+    conn: sqlite3.Connection | None = None,
+    *,
+    days: int = 30,
+    now: datetime | None = None,
+) -> int:
+    """Delete jobs whose posting date is older than the retention window.
+
+    Applied jobs are always retained. For unapplied jobs, ``posted_at`` is
+    authoritative when it can be parsed. Jobs without a usable posting date
+    fall back to ``discovered_at`` so legacy and imported rows are still
+    subject to retention.
+    """
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    if conn is None:
+        conn = get_connection()
+
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    cutoff = reference - timedelta(days=days)
+
+    urls: list[tuple[str]] = []
+    rows = conn.execute(
+        "SELECT url, posted_at, discovered_at FROM jobs WHERE applied_at IS NULL"
+    ).fetchall()
+    for row in rows:
+        job_date = _parse_job_date(row[1], row[2])
+        if job_date is None:
+            job_date = _parse_job_date(row[2])
+        if job_date is not None and job_date < cutoff:
+            urls.append((row[0],))
+
+    if urls:
+        conn.executemany("DELETE FROM jobs WHERE url = ?", urls)
+        conn.commit()
+    return len(urls)
 
 
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:

@@ -96,6 +96,41 @@ def _lever_salary(job: dict) -> str | None:
     return " ".join(part for part in (currency, amount, interval) if part)
 
 
+def _lever_description(job: dict) -> str:
+    """Assemble all text sections exposed by the Lever Postings API.
+
+    ``descriptionPlain`` only contains the opening/body. Lever publishes
+    requirements, responsibilities, benefits, compensation, and similar
+    sections separately in ``lists``.
+    """
+    parts: list[str] = []
+
+    description = job.get("descriptionPlain") or job.get("description")
+    if normalized := _normalize_description(description):
+        parts.append(normalized)
+
+    for section in job.get("lists") or []:
+        if not isinstance(section, dict):
+            continue
+        heading = _normalize_description(section.get("text"))
+        content = _normalize_description(section.get("content"))
+        section_text = "\n".join(part for part in (heading, content) if part)
+        if section_text:
+            parts.append(section_text)
+
+    salary_description = (
+        job.get("salaryDescriptionPlain") or job.get("salaryDescription")
+    )
+    if normalized := _normalize_description(salary_description):
+        parts.append(normalized)
+
+    additional = job.get("additionalPlain") or job.get("additional")
+    if normalized := _normalize_description(additional):
+        parts.append(normalized)
+
+    return "\n\n".join(parts)
+
+
 def fetch_ashby_jobs(company: dict) -> list[dict]:
     """Fetch and normalize all listed postings from one public Ashby board."""
     board = str(company.get("board") or company.get("board_name") or "").strip()
@@ -156,9 +191,7 @@ def fetch_lever_jobs(company: dict) -> list[dict]:
                     posted_at = datetime.fromtimestamp(int(created_at) / 1000, UTC).isoformat()
                 except (TypeError, ValueError, OverflowError):
                     pass
-            content = item.get("descriptionPlain") or item.get("description") or ""
-            if item.get("additionalPlain"):
-                content = f"{content}\n\n{item['additionalPlain']}"
+            content = _lever_description(item)
             jobs[job_id] = {
                 "title": item.get("text"),
                 "location": _join_locations(None, locations),
@@ -231,8 +264,17 @@ def _process_company(
             result["new"] += 1
         except sqlite3.IntegrityError:
             conn.execute(
-                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
-                (job.get("posted_at"), url),
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "
+                "salary = COALESCE(?, salary), description = COALESCE(?, description), "
+                "full_description = COALESCE(?, full_description), "
+                "application_url = COALESCE(?, application_url), "
+                "detail_scraped_at = COALESCE(?, detail_scraped_at) WHERE url = ?",
+                (
+                    job.get("posted_at"), job.get("salary"),
+                    description[:500] if description else None,
+                    description if detail_scraped_at else None,
+                    job.get("application_url"), detail_scraped_at, url,
+                ),
             )
             result["existing"] += 1
     conn.commit()

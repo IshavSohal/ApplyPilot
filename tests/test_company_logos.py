@@ -21,6 +21,20 @@ def test_amazon_logo_uses_customer_site_domain() -> None:
     ]
 
 
+def test_veeva_logo_uses_company_domain() -> None:
+    assert company_logos.company_logo_candidates("Veeva Systems") == [
+        "https://veeva.com/favicon.ico",
+        "https://www.google.com/s2/favicons?domain=veeva.com&sz=128",
+    ]
+
+
+def test_disney_logo_uses_company_domain() -> None:
+    assert company_logos.company_logo_candidates("The Walt Disney Company") == [
+        "https://disney.com/favicon.ico",
+        "https://www.google.com/s2/favicons?domain=disney.com&sz=128",
+    ]
+
+
 def test_company_logo_candidates_prefer_stored_url() -> None:
     candidates = company_logos.company_logo_candidates(
         "OpenAI", "https://cdn.example.com/openai.png"

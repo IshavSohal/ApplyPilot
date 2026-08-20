@@ -21,7 +21,7 @@ from urllib.parse import quote
 from rich.console import Console
 
 from applypilot.config import APP_DIR, load_search_config
-from applypilot.database import get_connection
+from applypilot.database import get_connection, normalize_posted_at
 
 console = Console()
 
@@ -62,18 +62,14 @@ def format_job_description_html(description: str | None) -> str:
     return "<br>".join(rendered)
 
 
-def format_posted_at(value: str | None) -> str:
+def format_posted_at(value: str | None, reference_at: str | None = None) -> str:
     """Format an available source posting date for a dashboard badge."""
+    value = normalize_posted_at(value, reference_at)
     if not value:
         return ""
     text = str(value).strip()
     if not text:
         return ""
-    if text.lower().startswith("posted"):
-        return text
-    if "ago" in text.lower():
-        return f"Posted {text}"
-
     parsed = None
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -268,7 +264,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
             # timestamp keeps every existing card dated and provides a stable
             # recency fallback.
             "posted_at": job["posted_at"] or job["discovered_at"] or "",
-            "posted_label": format_posted_at(job["posted_at"] or job["discovered_at"]),
+            "posted_label": format_posted_at(
+                job["posted_at"] or job["discovered_at"], job["discovered_at"]
+            ),
             "score": job["fit_score"],
             "reasoning": job["score_reasoning"] or "",
             "description": job["full_description"] or job["description"] or "",
@@ -402,7 +400,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
         full_desc_html = format_job_description_html(j["full_description"])
         desc_len = len(j["full_description"] or "")
         detail_error = escape(j["detail_error"] or "")
-        posted_label = escape(format_posted_at(j["posted_at"] or j["discovered_at"]))
+        posted_label = escape(format_posted_at(
+            j["posted_at"] or j["discovered_at"], j["discovered_at"]
+        ))
         applied_label = escape(format_applied_at(j["applied_at"]))
         is_applied = bool(j["applied_at"])
 

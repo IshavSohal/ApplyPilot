@@ -933,6 +933,21 @@ def enrich_external_job(url: str) -> None:
         conn.commit()
         return
 
+    location_row = conn.execute(
+        "SELECT location FROM jobs WHERE url = ? AND strategy = 'external_upload'",
+        (url,),
+    ).fetchone()
+    if location_row and not config.location_is_allowed(location_row["location"]):
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE jobs SET discovery_status = 'rejected', "
+            "discovery_rejection_reason = 'outside_allowed_countries', "
+            "discovery_checked_at = ? WHERE url = ?",
+            (now, url),
+        )
+        conn.commit()
+        return
+
     from applypilot.config import get_tier
 
     if get_tier() < 2:

@@ -21,7 +21,7 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, normalize_posted_at
 from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
@@ -333,6 +333,7 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
+        posted_at = normalize_posted_at(job.get("posted"), now)
 
         try:
             conn.execute(
@@ -340,16 +341,25 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
                 "discovered_at, posted_at, full_description, application_url, detail_scraped_at, detail_error) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), site, None, short_desc, job.get("location"),
-                 site, strategy, now, job.get("posted"), full_description, url,
+                 site, strategy, now, posted_at, full_description, url,
                  detail_scraped_at, detail_error),
             )
             new += 1
         except sqlite3.IntegrityError:
-            if job.get("posted"):
-                conn.execute(
-                    "UPDATE jobs SET posted_at = COALESCE(posted_at, ?) WHERE url = ?",
-                    (job["posted"], url),
-                )
+            conn.execute(
+                "UPDATE jobs SET title = COALESCE(?, title), company = ?, "
+                "description = COALESCE(?, description), location = COALESCE(?, location), "
+                "site = ?, strategy = ?, posted_at = COALESCE(posted_at, ?), "
+                "full_description = COALESCE(?, full_description), "
+                "application_url = COALESCE(application_url, ?), "
+                "detail_scraped_at = COALESCE(?, detail_scraped_at), detail_error = ? "
+                "WHERE url = ?",
+                (
+                    job.get("title"), site, short_desc, job.get("location"), site,
+                    strategy, posted_at, full_description, url, detail_scraped_at,
+                    detail_error, url,
+                ),
+            )
             existing += 1
 
     conn.commit()

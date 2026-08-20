@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timezone
 
 import yaml
+from bs4 import BeautifulSoup
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
@@ -759,6 +760,59 @@ def _fetch_ibm_jobs(company: dict, terms: list[str]) -> list[dict]:
     return list(jobs.values())
 
 
+def _fetch_linkedin_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch LinkedIn's own jobs from its public guest search endpoint."""
+    endpoint = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    jobs: dict[str, dict] = {}
+    page_size = max(1, int(company.get("page_size", 10)))
+    max_pages = int(company.get("max_pages", 5))
+    company_id = str(company.get("company_id", "1337"))
+
+    for term in terms or [""]:
+        for page in range(max_pages):
+            params = {
+                "f_C": company_id,
+                "keywords": term,
+                "sortBy": "DD",
+                "start": page * page_size,
+            }
+            markup = _http_request(
+                f"{endpoint}?{urllib.parse.urlencode(params)}",
+                headers={"Accept": "text/html"},
+            ).decode("utf-8")
+            soup = BeautifulSoup(markup, "html.parser")
+            cards = soup.select("[data-entity-urn^='urn:li:jobPosting:']")
+            for card in cards:
+                entity_urn = str(card.get("data-entity-urn") or "")
+                job_id = entity_urn.rpartition(":")[2]
+                title_node = card.select_one(".base-search-card__title")
+                location_node = card.select_one(".job-search-card__location")
+                posted_node = card.select_one("time[datetime]")
+                if not job_id or not title_node:
+                    continue
+                url = f"https://www.linkedin.com/jobs/view/{job_id}"
+                jobs[job_id] = {
+                    "title": title_node.get_text(" ", strip=True),
+                    "location": (
+                        location_node.get_text(" ", strip=True)
+                        if location_node
+                        else ""
+                    ),
+                    "url": url,
+                    # Guest search cards do not include the description. The
+                    # normal detail-enrichment cascade will fetch it later.
+                    "content": "",
+                    "content_is_full": False,
+                    "posted_at": posted_node.get("datetime") if posted_node else None,
+                    "application_url": url,
+                }
+
+            if len(cards) < page_size:
+                break
+
+    return list(jobs.values())
+
+
 BIGTECH_FETCHERS = {
     "google": _fetch_google_jobs,
     "amazon": _fetch_amazon_jobs,
@@ -767,6 +821,7 @@ BIGTECH_FETCHERS = {
     "microsoft": _fetch_microsoft_jobs,
     "netflix": _fetch_netflix_jobs,
     "ibm": _fetch_ibm_jobs,
+    "linkedin": _fetch_linkedin_jobs,
 }
 
 

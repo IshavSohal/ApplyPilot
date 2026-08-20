@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import inspect
+from datetime import UTC, datetime
 
 from applypilot import pipeline
-from applypilot.database import get_jobs_by_stage, get_stats, init_db
+from applypilot.database import delete_jobs_older_than, get_jobs_by_stage, get_stats, init_db
 from applypilot.pipeline import _PENDING_SQL, _resolve_stages
 
 
@@ -54,6 +55,71 @@ def test_pipeline_defaults_to_streaming() -> None:
 
 def test_pipeline_defaults_to_three_discovery_enrichment_workers() -> None:
     assert inspect.signature(pipeline.run_pipeline).parameters["workers"].default == 3
+
+
+def test_delete_jobs_older_than_uses_posted_date_then_discovered_date(tmp_path) -> None:
+    connection = init_db(tmp_path / "jobs.db")
+    connection.executemany(
+        "INSERT INTO jobs (url, posted_at, discovered_at) VALUES (?, ?, ?)",
+        [
+            ("old-iso", "2026-07-19T11:59:59+00:00", "2026-08-19T12:00:00+00:00"),
+            ("old-display", "July 18, 2026", "2026-08-19T12:00:00+00:00"),
+            ("old-fallback", None, "2026-07-01T12:00:00+00:00"),
+            ("old-applied", "2026-06-01", "2026-06-01T12:00:00+00:00"),
+            ("cutoff", "2026-07-20T12:00:00+00:00", "2026-07-20T12:00:00+00:00"),
+            ("recent", "2026-08-18", "2026-06-01T12:00:00+00:00"),
+        ],
+    )
+    connection.execute(
+        "UPDATE jobs SET applied_at = '2026-08-01T12:00:00+00:00' WHERE url = 'old-applied'"
+    )
+    connection.commit()
+
+    deleted = delete_jobs_older_than(
+        connection,
+        days=30,
+        now=datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
+    )
+
+    assert deleted == 3
+    remaining = connection.execute("SELECT url FROM jobs ORDER BY url").fetchall()
+    assert [row[0] for row in remaining] == ["cutoff", "old-applied", "recent"]
+
+
+def test_pipeline_cleans_old_jobs_before_running(monkeypatch) -> None:
+    calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(pipeline, "load_env", lambda: None)
+    monkeypatch.setattr(pipeline, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(pipeline, "init_db", lambda: None)
+    monkeypatch.setattr(
+        pipeline,
+        "delete_jobs_older_than",
+        lambda *, days: calls.append(("cleanup", days)) or 2,
+    )
+    monkeypatch.setattr(pipeline, "get_stats", lambda: {
+        "total": 0,
+        "pending_detail": 0,
+        "discovery_rejected": 0,
+        "with_description": 0,
+        "scored": 0,
+        "tailored": 0,
+        "with_cover_letter": 0,
+        "ready_to_apply": 0,
+        "applied": 0,
+    })
+    monkeypatch.setattr(
+        pipeline,
+        "_run_sequential",
+        lambda *args, **kwargs: {
+            "stages": [{"stage": "score", "status": "ok", "elapsed": 0.0}],
+            "errors": {},
+            "elapsed": 0.0,
+        },
+    )
+
+    pipeline.run_pipeline(["score"], stream=False)
+
+    assert calls == [("cleanup", 30)]
 
 
 def test_pending_tailoring_excludes_jobs_already_applied_to(tmp_path) -> None:

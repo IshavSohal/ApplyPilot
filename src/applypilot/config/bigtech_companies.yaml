@@ -42,3 +42,10 @@ companies:
     provider: "ibm"
     max_pages: 5
     page_size: 30
+
+  linkedin:
+    name: "LinkedIn"
+    provider: "linkedin"
+    company_id: "1337"
+    max_pages: 5
+    page_size: 10

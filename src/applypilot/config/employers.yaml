@@ -84,6 +84,12 @@ employers:
     site_id: "CorporateCareers"
     base_url: "https://mastercard.wd1.myworkdayjobs.com"
 
+  capital_one:
+    name: "Capital One"
+    tenant: "capitalone"
+    site_id: "Capital_One"
+    base_url: "https://capitalone.wd12.myworkdayjobs.com"
+
   visa:
     name: "Visa"
     tenant: "visa"
@@ -231,6 +237,12 @@ employers:
     tenant: "uber"
     site_id: "uberCareers"
     base_url: "https://uber.wd5.myworkdayjobs.com"
+
+  disney:
+    name: "The Walt Disney Company"
+    tenant: "disney"
+    site_id: "disneycareer"
+    base_url: "https://disney.wd5.myworkdayjobs.com"
 
   # ── Consulting ──────────────────────────────────────────────────────────
 

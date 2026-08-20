@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from applypilot.database import get_jobs_by_stage, init_db
+from applypilot.database import (
+    get_jobs_by_stage,
+    init_db,
+    normalize_posted_at,
+    normalize_relative_posted_dates,
+)
 from applypilot.discovery import workday
 from applypilot.discovery.filters import (
     classify_title,
@@ -26,6 +31,36 @@ APP_AI_CONFIG = {
     ],
     "exclude_titles": ["senior", "staff", "principal", "lead", "manager"],
 }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Posted Today", "2026-08-17"),
+        ("Posted Yesterday", "2026-08-16"),
+        ("Posted 2 Days Ago", "2026-08-15"),
+        ("Posted 30+ Days Ago", "2026-07-18"),
+    ],
+)
+def test_normalize_posted_at_converts_relative_labels(value, expected) -> None:
+    assert normalize_posted_at(value, "2026-08-17T12:00:00+00:00") == expected
+
+
+def test_normalize_relative_posted_dates_updates_existing_jobs(tmp_path) -> None:
+    conn = init_db(tmp_path / "relative-posted.db")
+    conn.execute(
+        "INSERT INTO jobs (url, discovered_at, posted_at) VALUES (?, ?, ?)",
+        (
+            "https://example.com/job",
+            "2026-08-17T12:00:00+00:00",
+            "Posted Yesterday",
+        ),
+    )
+    conn.commit()
+
+    assert normalize_relative_posted_dates(conn) == 1
+    assert conn.execute("SELECT posted_at FROM jobs").fetchone()[0] == "2026-08-16"
+    assert normalize_relative_posted_dates(conn) == 0
 
 
 @pytest.mark.parametrize(

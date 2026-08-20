@@ -69,6 +69,8 @@ COMPANY_DOMAINS = {
     "spacex": "spacex.com",
     "stripe": "stripe.com",
     "td bank": "td.com",
+    "the walt disney company": "disney.com",
+    "veeva systems": "veeva.com",
     "waabi": "waabi.ai",
     "workday": "workday.com",
 }

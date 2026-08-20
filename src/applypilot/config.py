@@ -177,6 +177,14 @@ DEFAULTS = {
 }
 
 REMOTE_LOCATION_TERMS = ("remote", "anywhere", "work from home", "wfh", "distributed")
+# ISO country codes that are also US state abbreviations need special care.  In
+# particular, several international job APIs return Indian locations as
+# ``City, IN``; treating that suffix as Indiana admitted those jobs through the
+# North American allowlist.  Prefer the country interpretation unless the text
+# also contains an explicit US marker or the full state name.
+AMBIGUOUS_COUNTRY_CODE_US_REGIONS = {
+    "IN": "indiana",
+}
 US_STATE_CODES = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
     "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
@@ -225,19 +233,35 @@ def location_is_allowed(location: str | None, search_cfg: dict | None = None) ->
     if any(str(pattern).lower() in lowered for pattern in reject):
         return False
 
-    is_remote = any(term in lowered for term in REMOTE_LOCATION_TERMS)
-    if is_remote and search_cfg.get("accept_remote_anywhere", True):
-        return True
-
     allowed_countries = {
         str(country).lower().strip()
         for country in search_cfg.get("allowed_countries", [])
     }
+    is_remote = any(term in lowered for term in REMOTE_LOCATION_TERMS)
+    # A country allowlist is a hard boundary.  Remote jobs with no eligible
+    # country signal must opt in explicitly instead of bypassing that boundary.
+    accept_remote_anywhere = search_cfg.get(
+        "accept_remote_anywhere",
+        not bool(allowed_countries),
+    )
+    if is_remote and accept_remote_anywhere:
+        return True
+
     if allowed_countries:
         allow_us = bool(allowed_countries & {"united states", "usa", "us", "u.s."})
         allow_canada = bool(allowed_countries & {"canada", "can"})
+        explicit_us = bool(
+            re.search(r"\b(?:united states(?: of america)?|usa|u\.s\.|us)\b", lowered)
+        )
+        for code, us_region in AMBIGUOUS_COUNTRY_CODE_US_REGIONS.items():
+            if (
+                re.search(rf"(?:^|,\s*){re.escape(code)}\s*$", text, re.IGNORECASE)
+                and us_region not in lowered
+                and not explicit_us
+            ):
+                return False
         if allow_us and (
-            re.search(r"\b(?:united states|usa|u\.s\.|us)\b", lowered)
+            explicit_us
             or _has_region_code(text, US_STATE_CODES)
             or any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in US_STATE_NAMES)
         ):
