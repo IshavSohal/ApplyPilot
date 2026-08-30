@@ -335,7 +335,10 @@ def _normalize_amazon_job(item: dict) -> dict | None:
             and item.get("preferred_qualifications")
         ),
         "salary": salary,
-        "application_url": item.get("url_next_step"),
+        # Amazon's search API has returned obsolete account hosts here. The
+        # public job page consistently links through this canonical route,
+        # which redirects into Amazon's authenticated passport flow.
+        "application_url": f"https://www.amazon.jobs/applicant/jobs/{job_id}/apply",
         "posted_at": item.get("posted_date"),
     }
 
@@ -813,6 +816,79 @@ def _fetch_linkedin_jobs(company: dict, terms: list[str]) -> list[dict]:
     return list(jobs.values())
 
 
+def _fetch_successfactors_jobs(company: dict, terms: list[str]) -> list[dict]:
+    """Fetch postings from a public SAP SuccessFactors category page.
+
+    SuccessFactors renders stable, server-side result tables. Category pages
+    are preferable to the global search endpoint because they keep discovery
+    scoped to the employer's relevant job family before ApplyPilot applies its
+    normal title and location filters.
+    """
+    del terms  # Category scope plus the shared title filter handles relevance.
+    base_url = str(company.get("base_url") or "").rstrip("/")
+    category_path = str(company.get("category_path") or "").strip()
+    if not base_url or not category_path:
+        raise ValueError(
+            "SuccessFactors company requires base_url and category_path"
+        )
+
+    page_size = max(1, int(company.get("page_size", 25)))
+    max_pages = max(1, int(company.get("max_pages", 20)))
+    jobs: dict[str, dict] = {}
+
+    for page in range(max_pages):
+        offset = page * page_size
+        path = category_path.rstrip("/") + "/"
+        if offset:
+            path += f"{offset}/"
+        params = urllib.parse.urlencode({
+            "q": "",
+            "sortColumn": "referencedate",
+            "sortDirection": "desc",
+        })
+        url = f"{urllib.parse.urljoin(base_url + '/', path.lstrip('/'))}?{params}"
+        markup = _http_request(
+            url,
+            headers={"Accept": "text/html"},
+        ).decode("utf-8")
+        soup = BeautifulSoup(markup, "html.parser")
+        cards = soup.select("tr.data-row")
+
+        for card in cards:
+            title_node = card.select_one(".colTitle .jobTitle-link")
+            location_node = card.select_one(".colLocation .jobLocation")
+            posted_node = card.select_one(".colDate .jobDate")
+            if not title_node or not title_node.get("href"):
+                continue
+            job_url = urllib.parse.urljoin(base_url + "/", title_node["href"])
+            posted_at = None
+            if posted_node:
+                try:
+                    posted_at = datetime.strptime(
+                        posted_node.get_text(" ", strip=True), "%b %d, %Y"
+                    ).replace(tzinfo=UTC).date().isoformat()
+                except ValueError:
+                    pass
+            jobs[job_url] = {
+                "title": title_node.get_text(" ", strip=True),
+                "location": (
+                    location_node.get_text(" ", strip=True)
+                    if location_node
+                    else ""
+                ),
+                "url": job_url,
+                "content": "",
+                "content_is_full": False,
+                "posted_at": posted_at,
+                "application_url": job_url,
+            }
+
+        if len(cards) < page_size:
+            break
+
+    return list(jobs.values())
+
+
 BIGTECH_FETCHERS = {
     "google": _fetch_google_jobs,
     "amazon": _fetch_amazon_jobs,
@@ -822,6 +898,7 @@ BIGTECH_FETCHERS = {
     "netflix": _fetch_netflix_jobs,
     "ibm": _fetch_ibm_jobs,
     "linkedin": _fetch_linkedin_jobs,
+    "successfactors": _fetch_successfactors_jobs,
 }
 
 
@@ -1034,6 +1111,21 @@ def _process_bigtech_company(
                     "full_description = ?, application_url = COALESCE(?, application_url), "
                     "detail_scraped_at = ? WHERE url = ?",
                     (row[3], row[4], row[10], row[11], row[12], row[0]),
+                )
+            elif provider == "successfactors":
+                # A dashboard upload may have enriched the posting before the
+                # employer adapter sees it. Preserve that enrichment and score,
+                # but replace generic upload metadata with authoritative fields
+                # from the SuccessFactors result row.
+                conn.execute(
+                    "UPDATE jobs SET title = ?, company = ?, site = ?, strategy = ?, "
+                    "description = COALESCE(description, ?), "
+                    "posted_at = COALESCE(posted_at, ?), "
+                    "location = COALESCE(?, location) WHERE url = ?",
+                    (
+                        row[1], row[2], row[6], row[7], row[4], row[9],
+                        row[5], row[0],
+                    ),
                 )
             conn.execute(
                 "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "

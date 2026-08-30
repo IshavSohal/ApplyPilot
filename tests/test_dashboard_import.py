@@ -19,6 +19,7 @@ from applypilot.config import location_filter_is_mandatory, location_is_allowed
 from applypilot.dashboard_server import (
     DashboardHTTPServer,
     DashboardRequestHandler,
+    cancel_tailoring,
     clear_tailored_resume,
     delete_job,
     import_external_job,
@@ -36,7 +37,7 @@ from applypilot.dashboard_server import (
     unmark_job_applied,
 )
 from applypilot.database import get_connection, init_db
-from applypilot.enrichment.detail import extract_job_metadata
+from applypilot.enrichment.detail import extract_job_metadata, scrape_detail_page
 from applypilot.view import format_applied_at, format_posted_at, generate_dashboard
 
 
@@ -81,6 +82,64 @@ def test_import_external_job_and_duplicate(db) -> None:
     assert job_import_status(first["url"], db)["status"] == "pending"
 
 
+def test_import_external_konrad_job_uses_canonical_source(db) -> None:
+    imported = import_external_job(
+        "https://www.konrad.com/careers/job/full-stack-developer_7860136003",
+        db,
+    )
+
+    row = db.execute(
+        "SELECT company, site FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == ("Konrad", "Konrad")
+
+
+def test_import_external_salesforce_job_uses_canonical_source(db) -> None:
+    imported = import_external_job(
+        "https://www.salesforce.com/company/careers/jobs/JR356939/ai-builder/",
+        db,
+    )
+
+    row = db.execute(
+        "SELECT company, site FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == ("Salesforce", "Salesforce")
+
+
+def test_backfill_konrad_metadata_uses_greenhouse_location(db, monkeypatch) -> None:
+    imported = import_external_job(
+        "https://www.konrad.com/careers/job/full-stack-developer_7860136003",
+        db,
+    )
+    monkeypatch.setattr(
+        "applypilot.discovery.greenhouse.fetch_company_jobs",
+        lambda board: [
+            {
+                "id": 7860136003,
+                "title": "Full Stack Developer",
+                "location": {"name": "Toronto"},
+            }
+        ]
+        if board == "konradgroup"
+        else [],
+    )
+
+    dashboard_server._backfill_external_employer_metadata(db, imported["url"])
+
+    row = db.execute(
+        "SELECT title, company, site, location FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == (
+        "Full Stack Developer",
+        "Konrad",
+        "Konrad",
+        "Toronto",
+    )
+
+
 def test_duplicate_incomplete_import_is_requeued(db) -> None:
     imported = import_external_job("https://example.com/jobs/retry", db)
     db.execute(
@@ -108,6 +167,39 @@ def test_duplicate_incomplete_import_is_requeued(db) -> None:
         (imported["url"],),
     ).fetchone()
     assert tuple(row) == (None, None, None, None, None)
+
+
+def test_duplicate_failed_score_is_requeued_without_rescraping(db) -> None:
+    imported = import_external_job("https://example.com/jobs/retry-score", db)
+    db.execute(
+        "UPDATE jobs SET full_description = ?, detail_scraped_at = ?, fit_score = 0, "
+        "score_reasoning = ?, scored_at = ? WHERE url = ?",
+        (
+            "Python API role",
+            "2026-08-01T12:00:00+00:00",
+            "LLM error: unable to open database file",
+            "2026-08-01T12:01:00+00:00",
+            imported["url"],
+        ),
+    )
+    db.commit()
+
+    retried = import_external_job(imported["url"], db)
+
+    assert retried["status"] == "scoring"
+    assert retried["enrichment_pending"] is True
+    row = db.execute(
+        "SELECT full_description, detail_scraped_at, fit_score, score_reasoning, scored_at "
+        "FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == (
+        "Python API role",
+        "2026-08-01T12:00:00+00:00",
+        None,
+        None,
+        None,
+    )
 
 
 def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) -> None:
@@ -138,6 +230,46 @@ def test_enrich_external_job_automatically_scores_import(monkeypatch, tmp_path) 
     dashboard_server.enrich_external_job(imported["url"])
 
     assert calls == [{"target_url": imported["url"], "workers": 1}]
+
+
+def test_enrich_external_job_scores_when_location_is_unknown(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "unknown-location.db"
+    connection = init_db(db_path)
+    imported = import_external_job("https://example.com/jobs/unknown-location", connection)
+    connection.execute(
+        "UPDATE jobs SET full_description = ?, detail_scraped_at = ?, "
+        "discovery_status = 'rejected', "
+        "discovery_rejection_reason = 'outside_allowed_countries' WHERE url = ?",
+        ("Python API role", "2026-08-09T12:00:00+00:00", imported["url"]),
+    )
+    connection.commit()
+    connection.close()
+    calls = []
+
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+    monkeypatch.setattr(config, "get_tier", lambda: 2)
+    monkeypatch.setattr(
+        config,
+        "location_is_allowed",
+        lambda _location: (_ for _ in ()).throw(AssertionError("unknown location was filtered")),
+    )
+    monkeypatch.setattr(
+        "applypilot.enrichment.detail.scrape_site_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("job was rescraped")),
+    )
+    monkeypatch.setattr(
+        "applypilot.scoring.scorer.run_scoring",
+        lambda **kwargs: calls.append(kwargs) or {"scored": 1},
+    )
+
+    dashboard_server.enrich_external_job(imported["url"])
+
+    assert calls == [{"target_url": imported["url"], "workers": 1}]
+    row = get_connection(db_path).execute(
+        "SELECT discovery_status, discovery_rejection_reason FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == ("accepted", None)
 
 
 def test_enrich_external_amazon_job_uses_exact_api_record(monkeypatch, tmp_path) -> None:
@@ -191,6 +323,84 @@ def test_enrich_external_amazon_job_uses_exact_api_record(monkeypatch, tmp_path)
     assert "Basic Qualifications" in row["full_description"]
     assert row["application_url"] == "https://account.amazon.jobs/jobs/10502743/apply"
     assert row["detail_error"] is None
+
+
+def test_enrich_external_salesforce_job_uses_workday_api(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "salesforce-import.db"
+    connection = init_db(db_path)
+    url = (
+        "https://www.salesforce.com/company/careers/jobs/JR356939/"
+        "ai-builder-emerging-talent/"
+    )
+    imported = import_external_job(url, connection)
+    connection.close()
+
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+    monkeypatch.setattr(config, "get_tier", lambda: 1)
+    monkeypatch.setattr(
+        "applypilot.discovery.workday.workday_search",
+        lambda employer, search_text, limit: {
+            "jobPostings": [{
+                "title": "AI Builder, Emerging Talent",
+                "externalPath": "/job/AI-Builder_JR356939-1",
+                "bulletFields": ["JR356939"],
+            }]
+        },
+    )
+    monkeypatch.setattr(
+        "applypilot.discovery.workday.workday_detail",
+        lambda employer, path: {
+            "jobPostingInfo": {
+                "title": "AI Builder, Emerging Talent",
+                "jobReqId": "JR356939",
+                "location": "California - San Francisco",
+                "additionalLocations": ["Illinois - Chicago", "New York - New York"],
+                "jobDescription": "<p>Build production AI agents for customers.</p>" * 20,
+                "externalUrl": "https://salesforce.wd12.myworkdayjobs.com/job/JR356939",
+                "startDate": "2026-08-24",
+            }
+        },
+    )
+
+    monkeypatch.setattr(
+        "applypilot.enrichment.detail.scrape_site_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generic scraper should not run for a Workday-backed URL")
+        ),
+    )
+
+    dashboard_server.enrich_external_job(imported["url"])
+
+    row = get_connection(db_path).execute(
+        "SELECT title, company, site, location, full_description, application_url, "
+        "posted_at, detail_error FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert row["title"] == "AI Builder, Emerging Talent"
+    assert row["company"] == "Salesforce"
+    assert row["site"] == "Salesforce"
+    assert row["location"] == (
+        "California - San Francisco; Illinois - Chicago; New York - New York"
+    )
+    assert "Build production AI agents" in row["full_description"]
+    assert row["application_url"].endswith("/JR356939")
+    assert row["posted_at"] == "2026-08-24"
+    assert row["detail_error"] is None
+
+
+def test_detail_scrape_preserves_http_403_error() -> None:
+    class Response:
+        status = 403
+
+    class Page:
+        def goto(self, _url, timeout):
+            assert timeout == 45000
+            return Response()
+
+    result = scrape_detail_page(Page(), "https://example.com/jobs/blocked")
+
+    assert result["status"] == "error"
+    assert result["error"] == "HTTP 403"
 
 
 def test_import_status_waits_for_automatic_score(db, monkeypatch) -> None:
@@ -1294,6 +1504,88 @@ def test_tailoring_queue_allows_only_one_outstanding_batch(monkeypatch) -> None:
         server.server_close()
 
 
+def test_cancel_tailoring_marks_running_job_and_worker_finishes_cancelled(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "tailoring-cancel.db"
+    conn = init_db(db_path)
+    url = "https://example.com/jobs/cancel"
+    conn.execute(
+        "INSERT INTO jobs (url, title, full_description, fit_score) "
+        "VALUES (?, 'Engineer', 'Complete description', 8)",
+        (url,),
+    )
+    conn.commit()
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+
+    started = threading.Event()
+
+    def execute(request):
+        started.set()
+        for _ in range(100):
+            if request["cancel_requested"]:
+                return "cancelled", None, None
+            time.sleep(0.01)
+        return "complete", {"approved": 1, "failed": 0, "errors": 0}, None
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        start_tailoring(server, min_score=1, limit=1, target_url=url)
+        assert started.wait(timeout=2)
+
+        result = cancel_tailoring(server, url)
+        assert result["status"] == "cancelling"
+        assert tailoring_status(server)["current"]["cancel_requested"] is True
+
+        for _ in range(100):
+            state = tailoring_status(server)
+            if state["status"] == "idle":
+                break
+            time.sleep(0.01)
+        assert state["recent"][0]["status"] == "cancelled"
+    finally:
+        server.server_close()
+
+
+def test_cancel_tailoring_removes_queued_job(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "tailoring-cancel-queued.db"
+    conn = init_db(db_path)
+    urls = ["https://example.com/jobs/running", "https://example.com/jobs/queued"]
+    for url in urls:
+        conn.execute(
+            "INSERT INTO jobs (url, title, full_description, fit_score) "
+            "VALUES (?, 'Engineer', 'Complete description', 8)",
+            (url,),
+        )
+    conn.commit()
+    monkeypatch.setattr(dashboard_server, "get_connection", lambda: get_connection(db_path))
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(_request):
+        started.set()
+        assert release.wait(timeout=2)
+        return "complete", {"approved": 1, "failed": 0, "errors": 0}, None
+
+    monkeypatch.setattr(dashboard_server, "_run_tailoring_request", execute)
+    server = DashboardHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+    try:
+        start_tailoring(server, min_score=1, limit=1, target_url=urls[0])
+        assert started.wait(timeout=2)
+        start_tailoring(server, min_score=1, limit=1, target_url=urls[1])
+
+        result = cancel_tailoring(server, urls[1])
+        assert result["status"] == "cancelled"
+        state = tailoring_status(server)
+        assert state["queued"] == []
+        assert state["recent"][0]["target_url"] == urls[1]
+        assert state["recent"][0]["status"] == "cancelled"
+    finally:
+        release.set()
+        server.server_close()
+
+
 def test_tailoring_queue_can_replace_an_existing_resume(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "tailoring-replace.db"
     conn = init_db(db_path)
@@ -1536,6 +1828,7 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "/api/discovery/status" in html
     assert "Run Tailoring" in html
     assert "/api/tailoring/status" in html
+    assert "/api/tailoring/cancel" in html
     assert "Queued (#" in html
     assert "applypilotTailoringPending" in html
     assert "Tailored resume" in html
@@ -1548,6 +1841,8 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "let tailoringJobUrls = new Set()" in html
     assert "tailoringJobUrls.has(workspaceJob.url)" in html
     assert "tailoringJobUrls.add(targetJob.url)" in html
+    assert 'id="workspace-cancel-tailoring"' in html
+    assert "currentTailoringRequest.target_url === workspaceJob.url" in html
     assert "tailoringInProgress" not in html
     assert 'data-replace-existing="true"' in html
     assert "deleteWorkspaceTailoredResume" in html

@@ -49,3 +49,11 @@ companies:
     company_id: "1337"
     max_pages: 5
     page_size: 10
+
+  scotiabank:
+    name: "Scotiabank"
+    provider: "successfactors"
+    base_url: "https://jobs.scotiabank.com"
+    category_path: "/go/IT-%26-Digital-Banking-Jobs/2298017/"
+    max_pages: 20
+    page_size: 25

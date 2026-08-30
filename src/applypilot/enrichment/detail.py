@@ -82,6 +82,28 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     return urljoin(base, raw_url)
 
 
+def normalize_application_url(application_url: str | None, job_url: str) -> str:
+    """Keep SuccessFactors applications on the live job-detail page.
+
+    Direct ``/talentcommunity/apply/<id>/`` links rely on browser state created
+    by the job page. Opening one from the dashboard can instead fall back to
+    the employer's careers homepage, so the stable external entry point is the
+    posting itself.
+    """
+    if not application_url:
+        return job_url
+
+    parsed_apply = urlparse(application_url)
+    parsed_job = urlparse(job_url)
+    if (
+        parsed_apply.netloc.lower() == parsed_job.netloc.lower()
+        and parsed_apply.path.lower().startswith("/talentcommunity/apply/")
+    ):
+        return job_url
+
+    return application_url
+
+
 def resolve_all_urls(conn: sqlite3.Connection) -> dict:
     """Resolve all relative URLs in the database. Returns stats."""
     rows = conn.execute("SELECT url, site FROM jobs").fetchall()
@@ -568,7 +590,7 @@ def extract_apply_url_deterministic(page) -> str | None:
             if el:
                 href = el.get_attribute("href")
                 if href and href != "#":
-                    return href
+                    return urljoin(page.url, href)
                 tag = el.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "button":
                     parent_href = el.evaluate("el => el.parentElement?.querySelector('a')?.href || null")
@@ -585,7 +607,7 @@ def extract_apply_url_deterministic(page) -> str | None:
             if "apply" in text and len(text) < 50:
                 href = link.get_attribute("href")
                 if href and href != "#" and "javascript:" not in href:
-                    return href
+                    return urljoin(page.url, href)
     except Exception:
         pass
 
@@ -828,6 +850,10 @@ def scrape_detail_page(page, url: str) -> dict:
             result["error"] = f"HTTP {resp.status}"
             result["elapsed"] = time.time() - t0
             return result
+        if resp and resp.status == 403:
+            result["error"] = "HTTP 403"
+            result["elapsed"] = time.time() - t0
+            return result
         page.wait_for_load_state("domcontentloaded", timeout=15000)
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
@@ -996,7 +1022,9 @@ def scrape_site_batch(
                         "WHERE url = ?",
                         (
                             result.get("full_description"),
-                            result.get("application_url") or url,
+                            normalize_application_url(
+                                result.get("application_url"), url
+                            ),
                             now,
                             result.get("title"),
                             result.get("company"),

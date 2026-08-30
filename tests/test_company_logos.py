@@ -28,6 +28,13 @@ def test_veeva_logo_uses_company_domain() -> None:
     ]
 
 
+def test_konrad_logo_uses_company_domain() -> None:
+    assert company_logos.company_logo_candidates("Konrad") == [
+        "https://konrad.com/favicon.ico",
+        "https://www.google.com/s2/favicons?domain=konrad.com&sz=128",
+    ]
+
+
 def test_disney_logo_uses_company_domain() -> None:
     assert company_logos.company_logo_candidates("The Walt Disney Company") == [
         "https://disney.com/favicon.ico",

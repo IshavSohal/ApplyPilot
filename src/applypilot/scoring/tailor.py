@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,15 @@ from applypilot.scoring.validator import (
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+
+
+class TailoringCancelled(Exception):
+    """Raised when a dashboard tailoring request is cooperatively cancelled."""
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise TailoringCancelled("Tailoring was cancelled")
 
 
 def _latex_to_plain_text(value: str) -> str:
@@ -187,6 +197,45 @@ def resolve_source_bullets(data: dict, catalog: dict[str, object]) -> list[str]:
     return errors
 
 
+_MONTH_NUMBERS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "spr": 3, "sum": 6, "fal": 9, "aut": 9, "win": 12,
+}
+
+
+def _experience_recency(entry: object) -> tuple[int, int, int, int, int]:
+    """Return a sortable recency key for a structured experience entry."""
+    if not isinstance(entry, dict):
+        return (0, 0, 0, 0, 0)
+    dates = str(entry.get("dates") or "")
+    points: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?|spring|summer|fall|autumn|winter)\.?,?\s+)?"
+        r"((?:19|20)\d{2})",
+        dates,
+        re.IGNORECASE,
+    ):
+        month = _MONTH_NUMBERS.get((match.group(1) or "").lower()[:3], 0)
+        points.append((int(match.group(2)), month))
+    if not points:
+        return (0, 0, 0, 0, 0)
+
+    start = points[0]
+    is_current = bool(re.search(r"\b(?:present|current|now)\b", dates, re.IGNORECASE))
+    end = (9999, 12) if is_current else points[-1]
+    return (1, end[0], end[1], start[0], start[1])
+
+
+def sort_experience_newest_first(data: dict) -> None:
+    """Enforce reverse chronology while preserving ties and unknown date formats."""
+    experience = data.get("experience")
+    if isinstance(experience, list):
+        experience.sort(key=_experience_recency, reverse=True)
+
+
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
 def _build_tailor_prompt(profile: dict) -> str:
@@ -223,7 +272,10 @@ Return a structured JSON decision document. The application, not you, renders an
 - Select at least one professional experience unless none is relevant.
 - Prefer relevant professional experience over projects with similar evidence.
 - Choose 3-4 source bullet IDs per selected entity where possible.
-- Keep experiences in experience and projects in projects, ordered by relevance within each section.
+- Keep experiences in experience and projects in projects.
+- ALWAYS order professional experience in reverse chronological order.
+- The most recent professional experience must come first. Never reorder experience by relevance.
+- Order projects by relevance.
 - Do not include an unselected entity or duplicate project variant.
 - Bullets are selection-only: copy bullet IDs from the supplied SOURCE BULLET CATALOG.
 - Never write, rewrite, shorten, combine, split, correct, or paraphrase a bullet.
@@ -307,7 +359,8 @@ VERDICT: PASS or FAIL
 ISSUES: (list any problems, or "none")
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Reorder professional experience entries, project entries, and bullets to put the most relevant first
+- Order professional experience in reverse chronological order, with the most recent experience first
+- Reorder project entries and bullets to put the most relevant first
 - Select or omit existing bullets without changing their text
 - Select or omit skills so only job-relevant ones remain, ordered with must-haves first
 
@@ -320,7 +373,11 @@ ISSUES: (list any problems, or "none")
 
 ## WHAT IS NOT FABRICATION (do NOT fail for these):
 - Dropping bullets entirely
-- Reordering any entries or bullets, including professional experience entries
+- Reordering professional experience entries only to put them in reverse chronological order
+- Reordering project entries or bullets by relevance
+
+## ORDERING (FAIL if violated):
+- Professional experience must always be in reverse chronological order, with the most recent experience first
 
 ## TOLERANCE RULE:
 Bullet wording changes are not allowed. Fail invented, altered, or moved bullets, as well as invented projects, companies, degrees, metrics, responsibilities, or technologies. Do not fail for style alone."""
@@ -569,6 +626,7 @@ def judge_tailored_resume(
 def tailor_resume(
     resume_text: str, job: dict, profile: dict,
     max_retries: int = 3, validation_mode: str = "normal",
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -617,6 +675,7 @@ def tailor_resume(
     )
 
     for attempt in range(max_retries + 1):
+        _raise_if_cancelled(cancel_check)
         report["attempts"] = attempt + 1
 
         # Fresh conversation every attempt
@@ -636,6 +695,7 @@ def tailor_resume(
         ]
 
         raw = client.chat(messages, max_tokens=4096, temperature=0.2)
+        _raise_if_cancelled(cancel_check)
 
         # Parse JSON from response
         try:
@@ -651,6 +711,10 @@ def tailor_resume(
                 attempt + 1, max_retries + 1, job.get("title", "untitled job"), error,
             )
             continue
+
+        # Experience chronology is a presentation invariant, not an LLM preference.
+        # Enforce it before validation, assembly, judging, and artifact generation.
+        sort_experience_newest_first(data)
 
         bullet_errors = resolve_source_bullets(data, bullet_catalog)
         if bullet_errors:
@@ -712,7 +776,9 @@ def tailor_resume(
             report["status"] = "approved"
             return tailored, report
 
+        _raise_if_cancelled(cancel_check)
         judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile)
+        _raise_if_cancelled(cancel_check)
         report["judge"] = judge
 
         if not judge["passed"]:
@@ -756,6 +822,7 @@ def run_tailoring(
     validation_mode: str = "normal",
     target_url: str | None = None,
     replace_existing: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
@@ -771,6 +838,7 @@ def run_tailoring(
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
+    _raise_if_cancelled(cancel_check)
     master_path = RESUME_TEX_PATH if RESUME_TEX_PATH.exists() else RESUME_PATH
     resume_text = master_path.read_text(encoding="utf-8")
     conn = get_connection()
@@ -805,9 +873,11 @@ def run_tailoring(
     t0 = time.time()
     completed = 0
     results: list[dict] = []
+    generated_artifacts: list[Path] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
     for job in jobs:
+        _raise_if_cancelled(cancel_check)
         current_job = conn.execute(
             "SELECT applied_at FROM jobs WHERE url = ?", (job["url"],)
         ).fetchone()
@@ -815,9 +885,16 @@ def run_tailoring(
             log.info("Skipping already-applied job: %s", job["title"])
             continue
         completed += 1
+        generated_paths: list[Path] = []
         try:
-            tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode)
+            tailored, report = tailor_resume(
+                resume_text,
+                job,
+                profile,
+                validation_mode=validation_mode,
+                cancel_check=cancel_check,
+            )
+            _raise_if_cancelled(cancel_check)
             current_job = conn.execute(
                 "SELECT applied_at FROM jobs WHERE url = ?", (job["url"],)
             ).fetchone()
@@ -843,6 +920,7 @@ def run_tailoring(
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
             txt_path.write_text(tailored, encoding="utf-8")
+            generated_paths.append(txt_path)
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -856,6 +934,7 @@ def run_tailoring(
                 f"{job.get('full_description', '')}"
             )
             job_path.write_text(job_desc, encoding="utf-8")
+            generated_paths.append(job_path)
 
             # Render the trusted LaTeX template and compile it. A resume is not
             # approved unless a valid, one-page PDF is produced.
@@ -868,6 +947,7 @@ def run_tailoring(
                     fitted, tex_source, pdf_bytes, fit_changes, visual_audit = fit_one_page(
                         report["structured_data"], profile
                     )
+                    _raise_if_cancelled(cancel_check)
                     report["structured_data"] = fitted
                     report["fit_to_one_page"] = {
                         "page_count": 1,
@@ -878,9 +958,13 @@ def run_tailoring(
                         fitted, fit_changes, visual_audit
                     )
                     tex_path.write_text(tex_source, encoding="utf-8")
+                    generated_paths.append(tex_path)
                     output_pdf = tex_path.with_suffix(".pdf")
                     output_pdf.write_bytes(pdf_bytes)
+                    generated_paths.append(output_pdf)
                     pdf_path = str(output_pdf)
+                except TailoringCancelled:
+                    raise
                 except Exception as exc:
                     report["status"] = "failed_compilation"
                     report["compile_error"] = str(exc)
@@ -889,6 +973,8 @@ def run_tailoring(
             # Save validation and decision report after compilation/auditing.
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            generated_paths.append(report_path)
+            _raise_if_cancelled(cancel_check)
 
             result = {
                 "url": job["url"],
@@ -901,6 +987,10 @@ def run_tailoring(
                 "status": report["status"],
                 "attempts": report["attempts"],
             }
+        except TailoringCancelled:
+            for generated_path in generated_paths:
+                generated_path.unlink(missing_ok=True)
+            raise
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
@@ -909,6 +999,7 @@ def run_tailoring(
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
         results.append(result)
+        generated_artifacts.extend(generated_paths)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
         elapsed = time.time() - t0
@@ -921,6 +1012,11 @@ def run_tailoring(
             rate * 60,
             result["title"][:40],
         )
+
+    if cancel_check is not None and cancel_check():
+        for generated_path in generated_artifacts:
+            generated_path.unlink(missing_ok=True)
+        raise TailoringCancelled("Tailoring was cancelled")
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()

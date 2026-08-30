@@ -112,3 +112,30 @@ def test_client_applies_429_cooldown_to_shared_limiter(monkeypatch) -> None:
     assert result == "ok"
     assert limiter.acquires == 2
     assert limiter.cooldowns == [2.0]
+
+
+def test_successful_completion_survives_usage_database_failure(monkeypatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": "SCORE: 8"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+            },
+        )
+
+    client = llm.LLMClient("http://local.test/v1", "test-model", "")
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        "applypilot.usage.record_usage",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("unable to open database file")),
+    )
+
+    try:
+        result = client.chat([{"role": "user", "content": "score this"}])
+    finally:
+        client.close()
+
+    assert result == "SCORE: 8"

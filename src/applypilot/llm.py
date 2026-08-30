@@ -175,6 +175,16 @@ _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
+def _record_usage_safely(**kwargs) -> None:
+    """Record request telemetry without invalidating a successful LLM call."""
+    try:
+        from applypilot.usage import record_usage
+
+        record_usage(**kwargs)
+    except Exception:  # Telemetry must never break the requested work.
+        log.exception("Could not persist LLM usage telemetry")
+
+
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
 
@@ -259,8 +269,7 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         metadata = data.get("usageMetadata", {})
-        from applypilot.usage import record_usage
-        record_usage(
+        _record_usage_safely(
             provider=self.provider,
             model=self.model,
             tokens={
@@ -318,7 +327,6 @@ class LLMClient:
             raise _GeminiCompatForbidden(resp)
 
         text, usage = self._handle_compat_response(resp)
-        from applypilot.usage import record_usage
         prompt_details = usage.get("prompt_tokens_details") or {}
         prompt_tokens = usage.get("prompt_tokens")
         cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
@@ -328,7 +336,7 @@ class LLMClient:
             if prompt_tokens is None
             else max(0, int(prompt_tokens) - int(cache_read_tokens) - int(cache_write_tokens))
         )
-        record_usage(
+        _record_usage_safely(
             provider=self.provider,
             model=self.model,
             tokens={

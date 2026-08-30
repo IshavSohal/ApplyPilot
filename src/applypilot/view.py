@@ -827,6 +827,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .workspace-panel {{ display: none; }}
   .workspace-panel.active {{ display: block; }}
   .detail-grid {{ display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 1rem; }}
+  #workspace-panel-details aside > button {{ width: 100%; }}
+  #workspace-cancel-tailoring {{ display: block; margin-top: .6rem; }}
+  #workspace-cancel-tailoring[hidden] {{ display: none; }}
   .content-card {{ background: white; border: 1px solid #e1e6ef; border-radius: 12px; padding: 1.1rem; }}
   .content-card h2 {{ font-size: 1rem; margin-bottom: .75rem; }}
   .job-description {{ white-space: pre-wrap; line-height: 1.65; color: #475467; font-size: .88rem; }}
@@ -1155,7 +1158,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
       <button class="workspace-tab" type="button" data-workspace-tab="report">Report</button>
     </nav>
     <div class="workspace-body">
-      <section id="workspace-panel-details" class="workspace-panel active"><div class="detail-grid"><article class="content-card"><h2>About this role</h2><div id="workspace-description" class="job-description"></div></article><aside class="content-card"><h2>Actions</h2><button id="workspace-tailor" class="primary-button" type="button">Tailor resume</button><p id="workspace-action-status" class="resume-meta"></p></aside></div></section>
+      <section id="workspace-panel-details" class="workspace-panel active"><div class="detail-grid"><article class="content-card"><h2>About this role</h2><div id="workspace-description" class="job-description"></div></article><aside class="content-card"><h2>Actions</h2><button id="workspace-tailor" class="primary-button" type="button">Tailor resume</button><button id="workspace-cancel-tailoring" class="danger-button" type="button" hidden>Cancel tailoring</button><p id="workspace-action-status" class="resume-meta"></p></aside></div></section>
       <section id="workspace-panel-match" class="workspace-panel"><article class="content-card"><h2>Why this role matches</h2><div id="workspace-reasoning" class="job-description"></div></article></section>
       <section id="workspace-panel-resume" class="workspace-panel"><div id="workspace-resume-content"></div></section>
       <section id="workspace-panel-report" class="workspace-panel"><div id="workspace-report-content"></div></section>
@@ -1661,6 +1664,7 @@ const tailoringButton = document.getElementById('tailoring-button');
 const tailoringStatus = document.getElementById('tailoring-status');
 let tailoringPollTimer = null;
 let tailoringJobUrls = new Set();
+let currentTailoringRequest = null;
 let bulkTailoringInProgress = false;
 
 const conceptWorkspace = document.querySelector('.concept-workspace');
@@ -1860,6 +1864,7 @@ function scheduleTailoringRefresh() {{
 
 function renderTailoringStatus(state) {{
   const current = state.current || null;
+  currentTailoringRequest = current;
   const queued = Array.isArray(state.queued) ? state.queued : [];
   const recent = Array.isArray(state.recent) ? state.recent : [];
   const outstanding = [current, ...queued].filter(Boolean);
@@ -1916,6 +1921,8 @@ function renderTailoringStatus(state) {{
   }} else if (latest && latest.status === 'skipped') {{
     tailoringStatus.textContent =
       'Skipped queued tailoring: ' + ((latest.result || {{}}).reason || 'job is no longer eligible');
+  }} else if (latest && latest.status === 'cancelled') {{
+    tailoringStatus.textContent = 'Tailoring cancelled.';
   }} else if (latest && latest.status === 'error') {{
     tailoringStatus.classList.add('error');
     tailoringStatus.textContent = 'Tailoring failed: ' + (latest.error || 'unknown error');
@@ -2821,6 +2828,17 @@ function syncWorkspaceTailoringControls() {{
           ? 'Tailor again'
           : (workspaceJob?.has_tailored ? 'Tailoring limit reached' : 'Tailor resume'));
   }}
+  const cancel = document.getElementById('workspace-cancel-tailoring');
+  if (cancel) {{
+    const isRunning = Boolean(
+      workspaceJob
+      && currentTailoringRequest?.kind === 'job'
+      && currentTailoringRequest.target_url === workspaceJob.url
+    );
+    cancel.hidden = !isRunning;
+    cancel.disabled = Boolean(isRunning && currentTailoringRequest.cancel_requested);
+    cancel.textContent = cancel.disabled ? 'Cancelling…' : 'Cancel tailoring';
+  }}
   document.querySelectorAll('.artifact-sidebar button').forEach(button => {{
     button.disabled = tailoringUnavailable;
   }});
@@ -3137,6 +3155,33 @@ async function queueWorkspaceTailoring() {{
   }}
 }}
 
+async function cancelWorkspaceTailoring() {{
+  if (!workspaceJob || currentTailoringRequest?.target_url !== workspaceJob.url) return;
+  const targetUrl = workspaceJob.url;
+  const button = document.getElementById('workspace-cancel-tailoring');
+  button.disabled = true;
+  button.textContent = 'Cancelling…';
+  document.getElementById('workspace-action-status').textContent = 'Cancelling tailoring…';
+  try {{
+    const response = await fetch('/api/tailoring/cancel', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{url: targetUrl}})
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not cancel tailoring');
+    currentTailoringRequest.cancel_requested = true;
+    syncWorkspaceTailoringControls();
+    document.getElementById('workspace-action-status').textContent =
+      'Cancellation requested. Waiting for the current step to stop…';
+    refreshTailoringStatus();
+  }} catch (error) {{
+    button.disabled = false;
+    button.textContent = 'Cancel tailoring';
+    document.getElementById('workspace-action-status').textContent = error.message;
+  }}
+}}
+
 async function deleteWorkspaceTailoredResume() {{
   if (!workspaceJob?.has_tailored || !window.confirm('Delete the tailored resume for this job?')) return;
   document.getElementById('workspace-action-status').textContent = 'Deleting tailored resume…';
@@ -3171,6 +3216,7 @@ async function deleteWorkspaceTailoredResume() {{
 }}
 
 document.getElementById('workspace-tailor').addEventListener('click', queueWorkspaceTailoring);
+document.getElementById('workspace-cancel-tailoring').addEventListener('click', cancelWorkspaceTailoring);
 
 async function deleteWorkspaceJob() {{
   if (!workspaceJob || !window.confirm(`Delete "${{workspaceJob.title}}" from ApplyPilot? This cannot be undone.`)) return;

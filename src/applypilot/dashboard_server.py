@@ -38,12 +38,72 @@ MAX_RESUME_REQUEST_BYTES = 7_000_000
 MAX_URL_LENGTH = 2048
 MAX_TAILORING_QUEUE_SIZE = 100
 TAILORING_HISTORY_SIZE = 20
+EXTERNAL_EMPLOYER_DOMAINS = {
+    "konrad.com": {
+        "name": "Konrad",
+        "greenhouse_board": "konradgroup",
+    },
+    "salesforce.com": {
+        "name": "Salesforce",
+        "workday_employer": "salesforce",
+    },
+}
 _settings_write_lock = threading.Lock()
 _DELETE_SETTING = {"__applypilot_delete__": True}
 
 
 class TailoringQueueFullError(RuntimeError):
     """Raised when the session-only tailoring queue reaches its bound."""
+
+
+def _external_employer(url: str) -> dict | None:
+    """Return canonical employer metadata for a recognized careers domain."""
+    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    return EXTERNAL_EMPLOYER_DOMAINS.get(hostname)
+
+
+def _backfill_external_employer_metadata(conn: sqlite3.Connection, url: str) -> None:
+    """Normalize a direct upload and recover metadata from its backing ATS."""
+    employer = _external_employer(url)
+    if not employer:
+        return
+
+    name = employer["name"]
+    conn.execute(
+        "UPDATE jobs SET company = ?, site = ? WHERE url = ?",
+        (name, name, url),
+    )
+    board = employer.get("greenhouse_board")
+    job_id_match = re.search(r"_(\d+)(?:[/?#]|$)", url)
+    if not board or not job_id_match:
+        conn.commit()
+        return
+
+    try:
+        from applypilot.discovery.greenhouse import fetch_company_jobs
+
+        job = next(
+            (
+                candidate
+                for candidate in fetch_company_jobs(board)
+                if str(candidate.get("id")) == job_id_match.group(1)
+            ),
+            None,
+        )
+    except Exception:  # The page scrape is still usable if the ATS lookup fails.
+        log.exception("Could not recover %s metadata from Greenhouse", name)
+        conn.commit()
+        return
+
+    if job:
+        location = job.get("location") or {}
+        location_name = location.get("name") if isinstance(location, dict) else location
+        conn.execute(
+            "UPDATE jobs SET title = COALESCE(?, title), "
+            "location = COALESCE(?, location) WHERE url = ?",
+            (job.get("title"), location_name, url),
+        )
+    conn.commit()
 
 
 def _is_nonnegative_finite_number(value: object) -> bool:
@@ -579,6 +639,18 @@ def _amazon_job_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _external_workday_job_id(url: str) -> tuple[str, str] | None:
+    """Return the Workday employer key and requisition ID for a vanity URL."""
+    employer = _external_employer(url)
+    employer_key = employer.get("workday_employer") if employer else None
+    if not employer_key:
+        return None
+    match = re.search(r"/jobs/(JR\d+)(?:/|$)", urlparse(url).path, re.IGNORECASE)
+    if not match:
+        return None
+    return employer_key, match.group(1).upper()
+
+
 def load_dashboard_company_logo(
     raw_url: str,
     conn: sqlite3.Connection | None = None,
@@ -613,35 +685,52 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
     url = normalize_job_url(raw_url)
     conn = conn or get_connection()
     existing = conn.execute(
-        "SELECT url, title, full_description, detail_scraped_at, detail_error "
+        "SELECT url, title, strategy, full_description, detail_scraped_at, "
+        "detail_error, fit_score "
         "FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
     if existing:
         should_enrich = not bool(existing["full_description"])
-        if should_enrich:
+        should_retry_score = (
+            existing["strategy"] == "external_upload"
+            and bool(existing["full_description"])
+            and existing["fit_score"] == 0
+        )
+        if should_enrich or should_retry_score:
             conn.execute(
-                "UPDATE jobs SET detail_scraped_at = NULL, detail_error = NULL, "
-                "fit_score = NULL, score_reasoning = NULL, scored_at = NULL "
+                "UPDATE jobs SET detail_scraped_at = CASE WHEN ? THEN NULL ELSE detail_scraped_at END, "
+                "detail_error = CASE WHEN ? THEN NULL ELSE detail_error END, fit_score = NULL, "
+                "score_reasoning = NULL, scored_at = NULL, discovery_status = 'accepted', "
+                "discovery_rejection_reason = NULL "
                 "WHERE url = ?",
-                (url,),
+                (should_enrich, should_enrich, url),
             )
             conn.commit()
         return {
             "created": False,
             "url": url,
             "title": existing["title"],
-            "status": "pending" if should_enrich else job_import_status(url, conn)["status"],
-            "enrichment_pending": should_enrich,
+            "status": (
+                "pending"
+                if should_enrich
+                else "scoring"
+                if should_retry_score
+                else job_import_status(url, conn)["status"]
+            ),
+            "enrichment_pending": should_enrich or should_retry_score,
         }
 
     hostname = urlparse(url).hostname or "external"
-    title = f"Imported job from {hostname}"
+    employer = _external_employer(url)
+    company = employer["name"] if employer else None
+    site = company or hostname
+    title = f"Imported job from {company or hostname}"
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO jobs (url, title, company, site, strategy, discovered_at, application_url) "
-        "VALUES (?, ?, NULL, ?, 'external_upload', ?, ?)",
-        (url, title, hostname, now, url),
+        "VALUES (?, ?, ?, ?, 'external_upload', ?, ?)",
+        (url, title, company, site, now, url),
     )
     conn.commit()
     return {
@@ -903,26 +992,99 @@ def _enrich_external_amazon_job(conn: sqlite3.Connection, url: str) -> bool:
     return True
 
 
+def _enrich_external_workday_job(conn: sqlite3.Connection, url: str) -> bool:
+    """Resolve a recognized vanity careers URL through its Workday API."""
+    identity = _external_workday_job_id(url)
+    if not identity:
+        return False
+    employer_key, job_id = identity
+
+    from applypilot.discovery.workday import (
+        load_employers,
+        strip_html,
+        workday_detail,
+        workday_search,
+    )
+
+    employer = load_employers().get(employer_key)
+    if not employer:
+        return False
+    search = workday_search(employer, job_id, limit=20)
+    posting = next(
+        (
+            candidate
+            for candidate in search.get("jobPostings", [])
+            if job_id in candidate.get("bulletFields", [])
+            or job_id in candidate.get("externalPath", "").upper()
+        ),
+        None,
+    )
+    if not posting or not posting.get("externalPath"):
+        return False
+
+    info = workday_detail(employer, posting["externalPath"]).get(
+        "jobPostingInfo", {}
+    )
+    if str(info.get("jobReqId", "")).upper() != job_id:
+        return False
+    full_description = strip_html(info.get("jobDescription", ""))
+    if len(full_description) < 200:
+        return False
+
+    locations = [info.get("location"), *(info.get("additionalLocations") or [])]
+    location = "; ".join(
+        str(item).strip() for item in locations if str(item or "").strip()
+    ) or None
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET title = COALESCE(?, title), company = ?, site = ?, "
+        "description = ?, location = COALESCE(?, location), full_description = ?, "
+        "application_url = COALESCE(?, ?), posted_at = COALESCE(?, posted_at), "
+        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+        (
+            info.get("title") or posting.get("title"),
+            employer["name"],
+            employer["name"],
+            full_description[:500],
+            location,
+            full_description,
+            info.get("externalUrl"),
+            url,
+            info.get("startDate"),
+            now,
+            url,
+        ),
+    )
+    conn.commit()
+    return True
+
+
 def enrich_external_job(url: str) -> None:
     """Enrich and, when configured, score one imported URL."""
     from applypilot.enrichment.detail import scrape_site_batch
 
     conn = get_connection()
-    row = conn.execute("SELECT title, site FROM jobs WHERE url = ?", (url,)).fetchone()
+    row = conn.execute(
+        "SELECT title, site, full_description, detail_error FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
     if not row:
         return
 
     from applypilot.usage import usage_context
     try:
-        with usage_context(stage="enrich"):
-            enriched = _enrich_external_amazon_job(conn, url)
-            if not enriched:
-                scrape_site_batch(
-                    conn,
-                    row["site"] or "external",
-                    [(url, row["title"])],
-                    delay=0,
-                )
+        if not row["full_description"] or row["detail_error"]:
+            with usage_context(stage="enrich"):
+                enriched = _enrich_external_workday_job(conn, url)
+                if not enriched:
+                    enriched = _enrich_external_amazon_job(conn, url)
+                if not enriched:
+                    scrape_site_batch(
+                        conn,
+                        row["site"] or "external",
+                        [(url, row["title"])],
+                        delay=0,
+                    )
     except Exception as exc:
         log.exception("External job enrichment failed for %s", url)
         now = datetime.now(timezone.utc).isoformat()
@@ -933,20 +1095,32 @@ def enrich_external_job(url: str) -> None:
         conn.commit()
         return
 
+    _backfill_external_employer_metadata(conn, url)
+
     location_row = conn.execute(
         "SELECT location FROM jobs WHERE url = ? AND strategy = 'external_upload'",
         (url,),
     ).fetchone()
-    if location_row and not config.location_is_allowed(location_row["location"]):
-        now = datetime.now(timezone.utc).isoformat()
+    if location_row:
+        location = location_row["location"]
+        if location and not config.location_is_allowed(location):
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE jobs SET discovery_status = 'rejected', "
+                "discovery_rejection_reason = 'outside_allowed_countries', "
+                "discovery_checked_at = ? WHERE url = ?",
+                (now, url),
+            )
+            conn.commit()
+            return
         conn.execute(
-            "UPDATE jobs SET discovery_status = 'rejected', "
-            "discovery_rejection_reason = 'outside_allowed_countries', "
-            "discovery_checked_at = ? WHERE url = ?",
-            (now, url),
+            "UPDATE jobs SET discovery_status = 'accepted', "
+            "discovery_rejection_reason = NULL WHERE url = ? "
+            "AND (discovery_rejection_reason IS NULL "
+            "OR discovery_rejection_reason = 'outside_allowed_countries')",
+            (url,),
         )
         conn.commit()
-        return
 
     from applypilot.config import get_tier
 
@@ -1133,7 +1307,7 @@ def _run_tailoring_request(request: dict) -> tuple[str, dict | None, str | None]
             return "skipped", {"reason": reason}, None
 
     try:
-        from applypilot.scoring.tailor import run_tailoring
+        from applypilot.scoring.tailor import TailoringCancelled, run_tailoring
         from applypilot.usage import usage_context
 
         with usage_context(stage="tailor"):
@@ -1143,8 +1317,11 @@ def _run_tailoring_request(request: dict) -> tuple[str, dict | None, str | None]
                 validation_mode=request["validation_mode"],
                 target_url=target_url,
                 replace_existing=request.get("replace_existing", False),
+                cancel_check=lambda: request.get("cancel_requested", False),
             )
         return "complete", result, None
+    except TailoringCancelled:
+        return "cancelled", None, None
     except Exception as exc:
         log.exception("Dashboard tailoring request failed")
         return "error", None, str(exc)[:500]
@@ -1250,6 +1427,7 @@ def start_tailoring(
             "finished_at": None,
             "result": None,
             "error": None,
+            "cancel_requested": False,
         }
         server.tailoring_queue.append(request)
         queue_position = len(server.tailoring_queue)
@@ -1274,6 +1452,40 @@ def start_tailoring(
                     pass
             raise
     return response
+
+
+def cancel_tailoring(server: DashboardHTTPServer, target_url: str) -> dict:
+    """Cancel an outstanding single-job tailoring request."""
+    if not isinstance(target_url, str) or not target_url.strip():
+        raise ValueError("Job URL is required")
+    target_url = target_url.strip()
+
+    with server.tailoring_lock:
+        current = server.tailoring_current
+        if current is not None and current.get("target_url") == target_url:
+            current["cancel_requested"] = True
+            return {
+                "id": current["id"],
+                "url": target_url,
+                "status": "cancelling",
+            }
+
+        queued = next(
+            (request for request in server.tailoring_queue if request.get("target_url") == target_url),
+            None,
+        )
+        if queued is not None:
+            server.tailoring_queue.remove(queued)
+            queued["status"] = "cancelled"
+            queued["finished_at"] = datetime.now(timezone.utc).isoformat()
+            server.tailoring_recent.appendleft(copy.deepcopy(queued))
+            return {
+                "id": queued["id"],
+                "url": target_url,
+                "status": "cancelled",
+            }
+
+    raise ValueError("No active tailoring request was found for this job")
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -1539,6 +1751,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/discovery",
             "/api/tailoring",
             "/api/tailoring/job",
+            "/api/tailoring/cancel",
             "/api/pipeline",
         }:
             self._send_json(404, {"error": "Not found"})
@@ -1566,6 +1779,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_url=payload.get("url"),
                     replace_existing=payload.get("replace_existing", False),
                 )
+            elif path == "/api/tailoring/cancel":
+                result = cancel_tailoring(self.server, payload.get("url", ""))
             elif path == "/api/jobs/applied":
                 applied = payload.get("applied", True)
                 if not isinstance(applied, bool):
@@ -1600,6 +1815,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path in {"/api/discovery", "/api/tailoring", "/api/tailoring/job", "/api/pipeline"}:
             self._send_json(202, result)
+            return
+
+        if path == "/api/tailoring/cancel":
+            self._send_json(200, result)
             return
 
         if path == "/api/jobs/applied":

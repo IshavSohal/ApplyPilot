@@ -326,3 +326,38 @@ def test_run_scoring_target_url_only_scores_requested_job(monkeypatch, tmp_path)
         (urls[0], 8),
         (urls[1], None),
     ]
+
+
+def test_run_scoring_preserves_low_score_for_requested_job(monkeypatch, tmp_path) -> None:
+    conn = init_db(tmp_path / "targeted-low-score.db")
+    url = "https://example.com/imported"
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, strategy, full_description) "
+        "VALUES (?, 'Imported', 'Example Co', 'external_upload', 'Python APIs')",
+        (url,),
+    )
+    conn.commit()
+
+    resume = tmp_path / "resume.txt"
+    resume.write_text("Python developer", encoding="utf-8")
+    monkeypatch.setattr(scorer, "RESUME_PATH", resume)
+    monkeypatch.setattr(scorer, "RESUME_TEX_PATH", tmp_path / "missing.tex")
+    monkeypatch.setattr(scorer, "load_profile", lambda: {"experience": {}})
+    monkeypatch.setattr(scorer, "get_connection", lambda: conn)
+    monkeypatch.setattr(scorer, "get_client", lambda: object())
+    monkeypatch.setattr(
+        scorer,
+        "score_job",
+        lambda *_args, **_kwargs: {
+            "score": 4,
+            "keywords": "Python",
+            "reasoning": "Limited fit",
+        },
+    )
+
+    result = scorer.run_scoring(target_url=url, workers=1)
+
+    row = conn.execute("SELECT fit_score FROM jobs WHERE url = ?", (url,)).fetchone()
+    assert result["scored"] == 1
+    assert result["removed"] == 0
+    assert row["fit_score"] == 4

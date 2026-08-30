@@ -14,6 +14,7 @@ from applypilot.scoring.tailor import (
     build_source_bullet_catalog,
     judge_tailored_resume,
     resolve_source_bullets,
+    sort_experience_newest_first,
     tailor_resume,
 )
 from applypilot.scoring.validator import validate_json_fields
@@ -209,11 +210,37 @@ def test_judge_reports_an_empty_model_response(monkeypatch) -> None:
     assert "empty response" in result["issues"]
 
 
-def test_judge_explicitly_allows_reordering_experience_entries() -> None:
+def test_prompts_require_newest_experience_first() -> None:
+    tailor_prompt = _build_tailor_prompt(_profile())
     prompt = tailor._build_judge_prompt(_profile())
 
-    assert "Reorder professional experience entries" in prompt
-    assert "including professional experience entries" in prompt
+    assert "ALWAYS order professional experience in reverse chronological order" in tailor_prompt
+    assert "most recent professional experience must come first" in tailor_prompt
+    assert "Never reorder experience by relevance" in tailor_prompt
+    assert "FAIL if violated" in prompt
+    assert "most recent experience first" in prompt
+
+
+def test_experience_is_sorted_newest_first_across_common_date_formats() -> None:
+    data = {
+        "experience": [
+            {"role": "Oldest", "dates": "2019 -- 2021"},
+            {"role": "Recent completed", "dates": "Sept. 2023 - April 2026"},
+            {"role": "Current older start", "dates": "May 2024 - Present"},
+            {"role": "Current newer start", "dates": "Summer 2025 to Current"},
+            {"role": "Middle", "dates": "2022"},
+        ]
+    }
+
+    sort_experience_newest_first(data)
+
+    assert [entry["role"] for entry in data["experience"]] == [
+        "Current newer start",
+        "Current older start",
+        "Recent completed",
+        "Middle",
+        "Oldest",
+    ]
 
 
 def test_tailoring_records_and_logs_attempt_failure(monkeypatch, caplog) -> None:
@@ -476,3 +503,56 @@ def test_retailoring_replaces_artifacts_only_after_success(tmp_path, monkeypatch
     assert preserved["tailored_resume_path"] == replacement
     assert preserved["tailor_attempts"] == 3
     assert Path(replacement).exists()
+
+
+def test_cancelled_retailoring_preserves_artifacts_and_attempt_count(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "tailored"
+    output_dir.mkdir()
+    resume_path = tmp_path / "resume.txt"
+    resume_path.write_text("Master resume", encoding="utf-8")
+    old_tex = output_dir / "Existing_Tailored_Resume.tex"
+    old_tex.write_text("old tex", encoding="utf-8")
+
+    conn = init_db(tmp_path / "jobs.db")
+    url = "https://example.com/job/cancel"
+    conn.execute(
+        "INSERT INTO jobs (url, title, company, site, full_description, fit_score, "
+        "tailored_resume_path, tailor_attempts) VALUES (?, 'Engineer', 'Acme', "
+        "'example', 'Complete description', 8, ?, 2)",
+        (url, str(old_tex)),
+    )
+    conn.commit()
+
+    cancelled = False
+
+    def generate(*_args, **_kwargs):
+        nonlocal cancelled
+        cancelled = True
+        return (
+            "Tailored text",
+            {"status": "approved", "attempts": 1, "structured_data": _resume_data()},
+        )
+
+    monkeypatch.setattr(tailor, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(tailor, "RESUME_TEX_PATH", tmp_path / "missing.tex")
+    monkeypatch.setattr(tailor, "TAILORED_DIR", output_dir)
+    monkeypatch.setattr(tailor, "get_connection", lambda: conn)
+    monkeypatch.setattr(tailor, "load_profile", _profile)
+    monkeypatch.setattr(tailor, "tailor_resume", generate)
+
+    with pytest.raises(tailor.TailoringCancelled):
+        tailor.run_tailoring(
+            target_url=url,
+            replace_existing=True,
+            cancel_check=lambda: cancelled,
+        )
+
+    row = conn.execute(
+        "SELECT tailored_resume_path, tailor_attempts FROM jobs WHERE url = ?", (url,)
+    ).fetchone()
+    assert row["tailored_resume_path"] == str(old_tex)
+    assert row["tailor_attempts"] == 2
+    assert old_tex.read_text(encoding="utf-8") == "old tex"
+    assert sorted(path.name for path in output_dir.iterdir()) == [old_tex.name]

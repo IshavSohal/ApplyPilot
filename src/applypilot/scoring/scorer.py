@@ -409,7 +409,7 @@ def run_scoring(
 
             # Only the coordinating thread writes to SQLite. Valid low scores
             # are removed immediately; score 0 is an error, not a fit rating.
-            if 1 <= result["score"] <= LOW_SCORE_REMOVAL_MAX:
+            if target_url is None and 1 <= result["score"] <= LOW_SCORE_REMOVAL_MAX:
                 conn.execute("DELETE FROM jobs WHERE url = ?", (job["url"],))
                 removed += 1
             else:

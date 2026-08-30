@@ -28,7 +28,7 @@ def _amazon_payload() -> dict:
                     "The base salary range for this position is listed below.<br/><br/>"
                     "USA, WA, Seattle - 168,100.00 - 227,400.00 USD annually"
                 ),
-                "url_next_step": "https://account.amazon.jobs/jobs/1234567/apply",
+                "url_next_step": "https://account.amazon.com/jobs/1234567/apply",
                 "posted_date": "August 1, 2026",
             }
         ]
@@ -56,7 +56,9 @@ def test_amazon_fetch_assembles_qualifications_and_salary(monkeypatch):
     assert "168,100.00 - 227,400.00 USD annually" in description
     assert job["salary"] == "USA, WA, Seattle - 168,100.00 - 227,400.00 USD annually"
     assert job["content_is_full"] is True
-    assert job["application_url"] == "https://account.amazon.jobs/jobs/1234567/apply"
+    assert job["application_url"] == (
+        "https://www.amazon.jobs/applicant/jobs/1234567/apply"
+    )
 
 
 def test_fetch_amazon_job_requires_an_exact_job_id(monkeypatch):

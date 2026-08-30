@@ -20,6 +20,7 @@ companies:
   rippling:   { name: "Rippling",   board_token: "rippling" }
   benchling:  { name: "Benchling",  board_token: "benchling" }
   plaid:      { name: "Plaid",      board_token: "plaid" }
+  konrad:     { name: "Konrad",     board_token: "konradgroup" }
 
   # -- Consumer / Marketplace ----------------------------------------------
   doordash:   { name: "DoorDash",   board_token: "doordash" }
@@ -36,11 +37,7 @@ companies:
   coinbase:   { name: "Coinbase",   board_token: "coinbase" }
   robinhood:  { name: "Robinhood",  board_token: "robinhood" }
   brex:       { name: "Brex",       board_token: "brex" }
-  ramp:       { name: "Ramp",       board_token: "ramp" }
 
   # -- AI / Frontier Labs --------------------------------------------------
   anthropic:  { name: "Anthropic",  board_token: "anthropic" }
   scaleai:    { name: "Scale AI",   board_token: "scaleai" }
-
-  # -- Aerospace -----------------------------------------------------------
-  spacex:     { name: "SpaceX",     board_token: "spacex" }
