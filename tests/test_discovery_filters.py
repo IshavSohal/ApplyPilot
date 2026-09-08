@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from applypilot.database import (
     get_jobs_by_stage,
     init_db,
+    is_job_within_retention_window,
     normalize_posted_at,
     normalize_relative_posted_dates,
 )
@@ -14,7 +17,6 @@ from applypilot.discovery.filters import (
     load_include_titles,
     reconcile_unscored_jobs,
 )
-
 
 APP_AI_CONFIG = {
     "include_titles": [
@@ -61,6 +63,20 @@ def test_normalize_relative_posted_dates_updates_existing_jobs(tmp_path) -> None
     assert normalize_relative_posted_dates(conn) == 1
     assert conn.execute("SELECT posted_at FROM jobs").fetchone()[0] == "2026-08-16"
     assert normalize_relative_posted_dates(conn) == 0
+
+
+def test_discovery_retention_rejects_only_known_stale_postings() -> None:
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+
+    assert is_job_within_retention_window("2026-08-28", now=now)
+    assert not is_job_within_retention_window("2026-08-26", now=now)
+    assert not is_job_within_retention_window(
+        "2 weeks ago",
+        reference_at="2026-09-03T12:00:00+00:00",
+        now=now,
+    )
+    assert is_job_within_retention_window(None, now=now)
+    assert is_job_within_retention_window("not-a-date", now=now)
 
 
 @pytest.mark.parametrize(

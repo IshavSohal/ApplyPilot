@@ -20,6 +20,15 @@ def test_disney_is_in_default_workday_registry() -> None:
     }
 
 
+def test_autodesk_is_in_default_workday_registry() -> None:
+    assert workday.load_employers()["autodesk"] == {
+        "name": "Autodesk",
+        "tenant": "autodesk",
+        "site_id": "Ext",
+        "base_url": "https://autodesk.wd1.myworkdayjobs.com",
+    }
+
+
 def test_workday_discovery_repairs_existing_external_job(tmp_path) -> None:
     conn = init_db(tmp_path / "jobs.db")
     url = (
@@ -44,7 +53,7 @@ def test_workday_discovery_repairs_existing_external_job(tmp_path) -> None:
             "apply_url": url,
             "title": "Software Engineer I",
             "location": "Glendale, CA, USA",
-            "posted": "2026-08-19",
+            "posted": "Today",
             "full_description": description,
             "employer_name": "The Walt Disney Company",
         }],

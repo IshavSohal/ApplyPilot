@@ -94,7 +94,7 @@ def test_apple_search_summary_is_not_marked_as_full_description(monkeypatch):
                 "url": "https://jobs.apple.com/en-ca/details/200000002/example",
                 "content": "This summary is intentionally longer than two hundred characters. " * 5,
                 "content_is_full": False,
-                "posted_at": "2026-08-01",
+                "posted_at": "Today",
             }
         ],
     )

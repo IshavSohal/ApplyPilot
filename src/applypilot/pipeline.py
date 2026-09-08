@@ -22,7 +22,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from applypilot.config import ensure_dirs, load_env
-from applypilot.database import delete_jobs_older_than, get_connection, get_stats, init_db
+from applypilot.database import (
+    JOB_RETENTION_DAYS,
+    delete_jobs_older_than,
+    get_connection,
+    get_stats,
+    init_db,
+)
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -565,7 +571,7 @@ def run_pipeline(
 
     deleted_jobs = 0
     if not dry_run:
-        deleted_jobs = delete_jobs_older_than(days=30)
+        deleted_jobs = delete_jobs_older_than(days=JOB_RETENTION_DAYS)
 
     # Banner
     mode = "streaming" if stream else "sequential"
@@ -580,7 +586,9 @@ def run_pipeline(
     console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
     if deleted_jobs:
-        console.print(f"  Cleanup:    deleted {deleted_jobs} jobs older than 30 days")
+        console.print(
+            f"  Cleanup:    deleted {deleted_jobs} jobs older than {JOB_RETENTION_DAYS} days"
+        )
 
     # Pre-run stats
     pre_stats = get_stats()

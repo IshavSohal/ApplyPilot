@@ -299,13 +299,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
         </button>"""
     workspace_jobs_json = json.dumps(workspace_jobs).replace("<", "\\u003c")
     workspace_filter_counts = {
-        "all": sum(not job["applied"] for job in workspace_jobs),
-        "strong": sum(
-            not job["applied"] and (job["score"] or 0) >= 7
+        "jobs": sum(
+            not job["applied"] and not job["has_tailored"]
             for job in workspace_jobs
         ),
         "tailored": sum(
-            not job["applied"] and job["has_pdf"] for job in workspace_jobs
+            not job["applied"] and job["has_tailored"] for job in workspace_jobs
         ),
         "applied": sum(job["applied"] for job in workspace_jobs),
     }
@@ -752,9 +751,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .inbox-title h1 {{ font-size: 1.25rem; margin: 0; }}
   .icon-button {{ border: 1px solid #d8deea; background: white; border-radius: 8px; padding: .5rem .65rem; color: #344054; cursor: pointer; }}
   .workspace-search {{ width: 100%; padding: .65rem .8rem; border: 1px solid #d8deea; border-radius: 8px; font: inherit; color: #172033; background: #fff; }}
-  .inbox-filters {{ display: flex; gap: .4rem; margin-top: .7rem; overflow-x: auto; }}
+  .inbox-filter-row {{ display: flex; align-items: center; gap: .5rem; margin-top: .7rem; }}
+  .inbox-filters {{ display: flex; flex: 1; min-width: 0; gap: .4rem; overflow-x: auto; }}
   .inbox-filter {{ white-space: nowrap; border: 1px solid #d8deea; background: white; border-radius: 7px; padding: .4rem .65rem; color: #667085; cursor: pointer; }}
   .inbox-filter.active {{ color: #1d4ed8; border-color: #7694ff; background: #f3f6ff; }}
+  .workspace-score-filter {{ flex: 0 0 auto; border: 1px solid #d8deea; background: white; border-radius: 7px; padding: .38rem .45rem; color: #344054; cursor: pointer; font: inherit; font-size: .78rem; }}
   .company-filter {{ position: relative; margin-top: .65rem; }}
   .company-filter-toggle {{ width: 100%; display: flex; align-items: center; justify-content: space-between; gap: .7rem; border: 1px solid #d8deea; background: white; border-radius: 8px; padding: .55rem .7rem; color: #344054; cursor: pointer; font: inherit; font-size: .82rem; text-align: left; }}
   .company-filter-toggle.active {{ color: #1d4ed8; border-color: #7694ff; background: #f8faff; }}
@@ -960,6 +961,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   html[data-theme="dark"] .inbox-job {{ border-color: #27313d; }}
   html[data-theme="dark"] .workspace-search,
   html[data-theme="dark"] .inbox-filter,
+  html[data-theme="dark"] .workspace-score-filter,
   html[data-theme="dark"] .company-filter-toggle,
   html[data-theme="dark"] .company-filter-menu,
   html[data-theme="dark"] .company-filter-search,
@@ -1099,11 +1101,19 @@ def generate_dashboard(output_path: str | None = None) -> str:
     <div class="inbox-head">
       <div class="inbox-title"><h1>Job inbox</h1><button id="show-import" class="icon-button" type="button" title="Add a job">+ Add</button></div>
       <input id="workspace-search" class="workspace-search" type="search" placeholder="Search jobs" aria-label="Search jobs">
-      <div class="inbox-filters" aria-label="Job filters">
-        <button class="inbox-filter active" type="button" data-workspace-filter="all">All active ({workspace_filter_counts['all']})</button>
-        <button class="inbox-filter" type="button" data-workspace-filter="strong">Strong fit ({workspace_filter_counts['strong']})</button>
-        <button class="inbox-filter" type="button" data-workspace-filter="tailored">Tailored ({workspace_filter_counts['tailored']})</button>
-        <button class="inbox-filter" type="button" data-workspace-filter="applied">Applied ({workspace_filter_counts['applied']})</button>
+      <div class="inbox-filter-row">
+        <div class="inbox-filters" aria-label="Job status">
+          <button class="inbox-filter active" type="button" data-workspace-filter="jobs">Jobs ({workspace_filter_counts['jobs']})</button>
+          <button class="inbox-filter" type="button" data-workspace-filter="tailored">Tailored ({workspace_filter_counts['tailored']})</button>
+          <button class="inbox-filter" type="button" data-workspace-filter="applied">Applied ({workspace_filter_counts['applied']})</button>
+        </div>
+        <select id="workspace-score-filter" class="workspace-score-filter" aria-label="Filter jobs by score">
+          <option value="all">Score · All</option>
+          <option value="10">Score · 10</option>
+          <option value="9">Score · 9</option>
+          <option value="8">Score · 8</option>
+          <option value="7">Score · 7</option>
+        </select>
       </div>
       <div id="company-filter" class="company-filter">
         <button id="company-filter-toggle" class="company-filter-toggle" type="button"
@@ -2746,9 +2756,10 @@ themeToggle.addEventListener('click', () => {{
 syncThemeToggle();
 
 const workspaceJobs = JSON.parse(document.getElementById('workspace-jobs-data').textContent);
-let workspaceJob = workspaceJobs.find(job => !job.applied) || null;
-let workspaceFilter = 'all';
-const workspaceCompanySelections = {{all: null, strong: null, tailored: null, applied: null}};
+let workspaceJob = workspaceJobs.find(job => !job.applied && !job.has_tailored) || null;
+let workspaceFilter = 'jobs';
+let workspaceScore = 'all';
+const workspaceCompanySelections = {{jobs: null, tailored: null, applied: null}};
 let workspacePdfScale = 1.2;
 let workspacePdfGeneration = 0;
 
@@ -2994,16 +3005,16 @@ document.querySelectorAll('.inbox-job').forEach(row => row.addEventListener('cli
 function jobMatchesWorkspaceView(job, filter = workspaceFilter) {{
   return filter === 'applied'
     ? job.applied
-    : !job.applied && (
-        filter === 'all' ||
-        (filter === 'strong' && Number(job.score || 0) >= 7) ||
-        (filter === 'tailored' && job.has_pdf)
-      );
+    : !job.applied && (filter === 'tailored' ? job.has_tailored : !job.has_tailored);
+}}
+
+function jobMatchesWorkspaceScore(job) {{
+  return workspaceScore === 'all' || Number(job.score) === Number(workspaceScore);
 }}
 
 function workspaceCompanyChoices() {{
   const counts = new Map();
-  workspaceJobs.filter(job => jobMatchesWorkspaceView(job)).forEach(job => {{
+  workspaceJobs.filter(job => jobMatchesWorkspaceView(job) && jobMatchesWorkspaceScore(job)).forEach(job => {{
     counts.set(job.company, (counts.get(job.company) || 0) + 1);
   }});
   return [...counts.entries()].sort(([left], [right]) => left.localeCompare(right));
@@ -3061,24 +3072,30 @@ function applyWorkspaceFilters() {{
     const job = workspaceJobs[index];
     const textMatch = !query || `${{job.title}} ${{job.company}} ${{job.location}}`.toLowerCase().includes(query);
     const companyMatch = companySelection === null || companySelection.has(job.company);
-    row.classList.toggle('hidden', !(textMatch && companyMatch && jobMatchesWorkspaceView(job)));
+    row.classList.toggle('hidden', !(textMatch && companyMatch && jobMatchesWorkspaceView(job) && jobMatchesWorkspaceScore(job)));
   }});
 }}
 
 function updateWorkspaceFilterCounts() {{
   const counts = {{
-    all: workspaceJobs.filter(job => !job.applied).length,
-    strong: workspaceJobs.filter(job => !job.applied && Number(job.score || 0) >= 7).length,
-    tailored: workspaceJobs.filter(job => !job.applied && job.has_pdf).length,
-    applied: workspaceJobs.filter(job => job.applied).length
+    jobs: workspaceJobs.filter(job => !job.applied && !job.has_tailored && jobMatchesWorkspaceScore(job)).length,
+    tailored: workspaceJobs.filter(job => !job.applied && job.has_tailored && jobMatchesWorkspaceScore(job)).length,
+    applied: workspaceJobs.filter(job => job.applied && jobMatchesWorkspaceScore(job)).length
   }};
-  const labels = {{all: 'All active', strong: 'Strong fit', tailored: 'Tailored', applied: 'Applied'}};
+  const labels = {{jobs: 'Jobs', tailored: 'Tailored', applied: 'Applied'}};
   document.querySelectorAll('.inbox-filter').forEach(button => {{
     const filter = button.dataset.workspaceFilter;
     button.textContent = `${{labels[filter]}} (${{counts[filter]}})`;
   }});
 }}
 document.getElementById('workspace-search').addEventListener('input', applyWorkspaceFilters);
+document.getElementById('workspace-score-filter').addEventListener('change', event => {{
+  workspaceScore = event.currentTarget.value;
+  document.getElementById('company-filter-search').value = '';
+  updateWorkspaceFilterCounts();
+  renderWorkspaceCompanyFilter();
+  applyWorkspaceFilters();
+}});
 document.querySelectorAll('.inbox-filter').forEach(button => button.addEventListener('click', () => {{
   workspaceFilter = button.dataset.workspaceFilter;
   document.querySelectorAll('.inbox-filter').forEach(item => item.classList.toggle('active', item === button));
@@ -3257,7 +3274,7 @@ document.getElementById('workspace-mark-applied').addEventListener('click', asyn
     workspaceJob.status = applied
       ? 'Applied'
       : (workspaceJob.has_tailored ? 'Tailored' : (workspaceJob.score == null ? 'Discovered' : 'Scored'));
-    workspaceFilter = applied ? 'applied' : 'all';
+    workspaceFilter = applied ? 'applied' : 'jobs';
     document.querySelectorAll('.inbox-filter').forEach(item => {{
       item.classList.toggle('active', item.dataset.workspaceFilter === workspaceFilter);
     }});

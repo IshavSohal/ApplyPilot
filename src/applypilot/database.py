@@ -8,10 +8,12 @@ without migration ordering issues.
 import re
 import sqlite3
 import threading
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from applypilot.config import DB_PATH
+
+JOB_RETENTION_DAYS = 7
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -363,10 +365,35 @@ def _parse_job_date(value: str | None, reference_at: str | None = None) -> datet
     return parsed
 
 
+def is_job_within_retention_window(
+    posted_at: str | None,
+    *,
+    reference_at: str | None = None,
+    days: int = JOB_RETENTION_DAYS,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a discovered posting is recent enough to retain.
+
+    Postings without a usable source date are accepted because their age is
+    unknown. ``reference_at`` anchors relative labels such as ``2 days ago``.
+    """
+    if days < 1:
+        raise ValueError("days must be at least 1")
+
+    posted = _parse_job_date(posted_at, reference_at)
+    if posted is None:
+        return True
+
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return posted >= reference - timedelta(days=days)
+
+
 def delete_jobs_older_than(
     conn: sqlite3.Connection | None = None,
     *,
-    days: int = 30,
+    days: int = JOB_RETENTION_DAYS,
     now: datetime | None = None,
 ) -> int:
     """Delete jobs whose posting date is older than the retention window.
@@ -527,13 +554,15 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
     for job in jobs:
         url = job.get("url")
         if not url:
+            continue
+        if not is_job_within_retention_window(job.get("posted_at"), reference_at=now):
             continue
         try:
             conn.execute(

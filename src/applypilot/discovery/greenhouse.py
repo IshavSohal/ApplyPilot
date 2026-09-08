@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, is_job_within_retention_window
 from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 from applypilot.discovery.workday import strip_html
 
@@ -1052,6 +1052,8 @@ def _process_bigtech_company(
             continue
         url = job.get("url") or ""
         if not url:
+            continue
+        if not is_job_within_retention_window(job.get("posted_at"), reference_at=now):
             continue
 
         # Microsoft's JobPosting JSON-LD omits Overview. Fetch the complete

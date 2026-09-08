@@ -108,6 +108,51 @@ def test_import_external_salesforce_job_uses_canonical_source(db) -> None:
     assert tuple(row) == ("Salesforce", "Salesforce")
 
 
+def test_import_external_ashby_job_uses_board_as_company(db) -> None:
+    imported = import_external_job(
+        "https://jobs.ashbyhq.com/Spectral%20Labs/"
+        "99c79fda-2125-4e09-9313-97e91b730d75",
+        db,
+    )
+
+    row = db.execute(
+        "SELECT title, company, site FROM jobs WHERE url = ?",
+        (imported["url"],),
+    ).fetchone()
+    assert tuple(row) == (
+        "Imported job from Spectral Labs",
+        "Spectral Labs",
+        "Spectral Labs",
+    )
+
+
+def test_reimport_repairs_existing_ashby_company_placeholder(db) -> None:
+    url = (
+        "https://jobs.ashbyhq.com/Spectral%20Labs/"
+        "99c79fda-2125-4e09-9313-97e91b730d75"
+    )
+    db.execute(
+        "INSERT INTO jobs (url, title, company, site, full_description) "
+        "VALUES (?, 'Imported job from jobs.ashbyhq.com', "
+        "'jobs.ashbyhq.com', 'jobs.ashbyhq.com', 'Existing description')",
+        (url,),
+    )
+    db.commit()
+
+    imported = import_external_job(url, db)
+
+    assert imported["created"] is False
+    row = db.execute(
+        "SELECT title, company, site FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    assert tuple(row) == (
+        "Imported job from Spectral Labs",
+        "Spectral Labs",
+        "Spectral Labs",
+    )
+
+
 def test_backfill_konrad_metadata_uses_greenhouse_location(db, monkeypatch) -> None:
     imported = import_external_job(
         "https://www.konrad.com/careers/job/full-stack-developer_7860136003",
@@ -1010,6 +1055,24 @@ def test_extract_job_metadata_parses_greenhouse_page_title() -> None:
     assert metadata["company_logo"] == "https://job-boards.greenhouse.io/favicon.ico"
 
 
+def test_extract_job_metadata_parses_ashby_page_title() -> None:
+    metadata = extract_job_metadata(
+        {
+            "final_url": (
+                "https://jobs.ashbyhq.com/Spectral%20Labs/"
+                "99c79fda-2125-4e09-9313-97e91b730d75"
+            ),
+            "page_title": "Engineer, New Grad @ Spectral Labs",
+            "page_icon": "https://jobs.ashbyhq.com/favicon.ico",
+            "json_ld": [],
+        }
+    )
+
+    assert metadata["title"] == "Engineer, New Grad"
+    assert metadata["company"] == "Spectral Labs"
+    assert metadata["company_logo"] == "https://jobs.ashbyhq.com/favicon.ico"
+
+
 def test_extract_job_metadata_resolves_relative_logo_url() -> None:
     metadata = extract_job_metadata({
         "final_url": "https://example.com/jobs/engineer",
@@ -1741,19 +1804,25 @@ def test_dashboard_settings_api(settings_files) -> None:
         thread.join(timeout=2)
 
 
-def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
+def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "dashboard.db")
     import_external_job("https://example.com/jobs/active", connection)
     connection.execute(
         "UPDATE jobs SET full_description = ?, company = ?, company_logo = ?, "
-        "tailored_resume_path = ? WHERE url = ?",
+        "tailored_resume_path = ?, fit_score = ? WHERE url = ?",
         (
             "Complete job description",
             "Example Corp",
             "https://cdn.example.com/logo.png",
             str(tmp_path / "Active_Engineer_Tailored_Resume.tex"),
+            8,
             "https://example.com/jobs/active",
         ),
+    )
+    strong = import_external_job("https://example.com/jobs/strong", connection)
+    connection.execute(
+        "UPDATE jobs SET fit_score = ? WHERE url = ?",
+        (9, strong["url"]),
     )
     applied = import_external_job("https://example.com/jobs/done", connection)
     mark_job_applied(applied["url"], connection)
@@ -1773,7 +1842,7 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     generate_dashboard(str(output))
     html = output.read_text(encoding="utf-8")
 
-    assert "Active postings (1)" in html
+    assert "Active postings (2)" in html
     assert "Applied (1)" in html
     assert 'data-applied="false"' in html
     assert 'data-applied="true"' in html
@@ -1808,20 +1877,27 @@ def test_dashboard_has_active_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "Object.entries(report)" in html
     assert "function renderReportValue(value, depth = 0)" in html
     assert "View raw JSON" in html
-    assert 'data-workspace-filter="all">All active (1)' in html
-    assert 'data-workspace-filter="strong">Strong fit (0)' in html
-    assert 'data-workspace-filter="tailored">Tailored (0)' in html
+    assert 'data-workspace-filter="jobs">Jobs (1)' in html
+    assert 'data-workspace-filter="tailored">Tailored (1)' in html
     assert 'data-workspace-filter="applied">Applied (1)' in html
+    assert 'id="workspace-score-filter"' in html
+    assert '<option value="all">Score · All</option>' in html
+    assert '<option value="10">Score · 10</option>' in html
+    assert '<option value="9">Score · 9</option>' in html
+    assert '<option value="8">Score · 8</option>' in html
+    assert '<option value="7">Score · 7</option>' in html
     assert 'id="company-filter-toggle"' in html
     assert 'id="company-filter-search"' in html
     assert 'id="company-filter-select-all"' in html
     assert 'id="company-filter-clear"' in html
-    assert "const workspaceCompanySelections = {all: null, strong: null, tailored: null, applied: null}" in html
+    assert "const workspaceCompanySelections = {jobs: null, tailored: null, applied: null}" in html
     assert "companySelection.has(job.company)" in html
     assert "function renderWorkspaceCompanyFilter()" in html
     assert "updateWorkspaceFilterCounts()" in html
     assert "filter === 'applied'" in html
-    assert "!job.applied && (" in html
+    assert "filter === 'tailored' ? job.has_tailored : !job.has_tailored" in html
+    assert "workspaceScore === 'all' || Number(job.score) === Number(workspaceScore)" in html
+    assert "jobMatchesWorkspaceView(job) && jobMatchesWorkspaceScore(job)" in html
     assert 'id="spend-widget"' in html
     assert "'/api/usage/summary'" in html
     assert "'/api/settings/pricing'" in html

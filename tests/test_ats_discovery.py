@@ -130,7 +130,7 @@ def test_process_ats_company_filters_and_persists_full_description(monkeypatch):
                 "application_url": "https://jobs.ashbyhq.com/example/one/application",
                 "content": "A complete engineering job description. " * 20,
                 "salary": "CAD 140K - 180K",
-                "posted_at": "2026-08-01T12:00:00Z",
+                "posted_at": "Today",
             },
             {
                 "title": "Sales Director",
@@ -183,7 +183,7 @@ def test_process_ats_company_refreshes_existing_job(monkeypatch):
             "url": url,
             "application_url": f"{url}/apply",
             "content": "A newly complete description. " * 20,
-            "posted_at": "2026-08-14T12:00:00Z",
+            "posted_at": "Today",
         }],
     )
 
@@ -200,9 +200,37 @@ def test_process_ats_company_refreshes_existing_job(monkeypatch):
         "SELECT posted_at, full_description, application_url FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
-    assert row[0] == "2026-08-14T12:00:00Z"
+    assert row[0] == "Today"
     assert row[1] == ("A newly complete description. " * 20).strip()
     assert row[2] == f"{url}/apply"
+
+
+def test_process_ats_company_ignores_stale_posting(monkeypatch):
+    conn = _jobs_connection()
+    monkeypatch.setattr(ats, "get_connection", lambda: conn)
+    monkeypatch.setitem(
+        ats.ATS_FETCHERS,
+        "ashby",
+        lambda _company: [{
+            "title": "Software Engineer",
+            "location": "Toronto, Canada",
+            "url": "https://jobs.ashbyhq.com/example/stale",
+            "content": "An old engineering job description. " * 20,
+            "posted_at": "2020-01-01",
+        }],
+    )
+
+    result = ats._process_company(
+        "example",
+        {"name": "Example"},
+        "ashby",
+        {"include_titles": ["software engineer"]},
+        False,
+    )
+
+    assert result["kept"] == 0
+    assert result["new"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
 def test_default_ats_registries_have_required_slugs():

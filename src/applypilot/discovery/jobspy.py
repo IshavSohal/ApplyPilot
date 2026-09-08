@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import (
+    get_connection,
+    init_db,
+    is_job_within_retention_window,
+)
 from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
@@ -171,6 +175,8 @@ def store_jobspy_results(
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
         posted_at = str(row.get("date_posted", "")) if str(row.get("date_posted", "")) != "nan" else None
+        if not is_job_within_retention_window(posted_at, reference_at=now):
+            continue
 
         try:
             conn.execute(
@@ -270,8 +276,9 @@ def _run_one_search(
         log.error("[%s]: all sites failed", label)
         return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
 
-    import pandas as pd
     import warnings
+
+    import pandas as pd
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]

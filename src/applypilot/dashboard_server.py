@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
 import yaml
 
@@ -58,8 +58,35 @@ class TailoringQueueFullError(RuntimeError):
 
 def _external_employer(url: str) -> dict | None:
     """Return canonical employer metadata for a recognized careers domain."""
-    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
-    return EXTERNAL_EMPLOYER_DOMAINS.get(hostname)
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().removeprefix("www.")
+    employer = EXTERNAL_EMPLOYER_DOMAINS.get(hostname)
+    if employer:
+        return employer
+
+    if hostname == "jobs.ashbyhq.com":
+        segments = [unquote(segment).strip() for segment in parsed.path.split("/") if segment]
+        if len(segments) >= 2 and segments[0]:
+            board = segments[0]
+            try:
+                from applypilot.discovery.ats import load_ashby_companies
+
+                configured = next(
+                    (
+                        company
+                        for company in load_ashby_companies().values()
+                        if str(company.get("board") or "").casefold() == board.casefold()
+                    ),
+                    None,
+                )
+            except (OSError, TypeError, ValueError, yaml.YAMLError):
+                configured = None
+            return {
+                "name": configured.get("name", board) if configured else board,
+                "ashby_board": board,
+                "provisional": True,
+            }
+    return None
 
 
 def _backfill_external_employer_metadata(conn: sqlite3.Connection, url: str) -> None:
@@ -69,6 +96,15 @@ def _backfill_external_employer_metadata(conn: sqlite3.Connection, url: str) -> 
         return
 
     name = employer["name"]
+    if employer.get("provisional"):
+        conn.execute(
+            "UPDATE jobs SET company = COALESCE(company, ?), "
+            "site = COALESCE(company, ?) WHERE url = ?",
+            (name, name, url),
+        )
+        conn.commit()
+        return
+
     conn.execute(
         "UPDATE jobs SET company = ?, site = ? WHERE url = ?",
         (name, name, url),
@@ -691,6 +727,23 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
         (url,),
     ).fetchone()
     if existing:
+        display_title = existing["title"]
+        employer = _external_employer(url)
+        if employer and employer.get("provisional"):
+            company = employer["name"]
+            placeholder = "Imported job from jobs.ashbyhq.com"
+            if display_title == placeholder:
+                display_title = f"Imported job from {company}"
+            conn.execute(
+                "UPDATE jobs SET company = CASE "
+                "WHEN company IS NULL OR company = 'jobs.ashbyhq.com' THEN ? "
+                "ELSE company END, site = CASE WHEN site = 'jobs.ashbyhq.com' "
+                "THEN ? ELSE site END, title = CASE "
+                "WHEN title = 'Imported job from jobs.ashbyhq.com' THEN ? "
+                "ELSE title END WHERE url = ?",
+                (company, company, display_title, url),
+            )
+            conn.commit()
         should_enrich = not bool(existing["full_description"])
         should_retry_score = (
             existing["strategy"] == "external_upload"
@@ -710,7 +763,7 @@ def import_external_job(raw_url: str, conn: sqlite3.Connection | None = None) ->
         return {
             "created": False,
             "url": url,
-            "title": existing["title"],
+            "title": display_title,
             "status": (
                 "pending"
                 if should_enrich

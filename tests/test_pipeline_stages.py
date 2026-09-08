@@ -119,7 +119,7 @@ def test_pipeline_cleans_old_jobs_before_running(monkeypatch) -> None:
 
     pipeline.run_pipeline(["score"], stream=False)
 
-    assert calls == [("cleanup", 30)]
+    assert calls == [("cleanup", 7)]
 
 
 def test_pending_tailoring_excludes_jobs_already_applied_to(tmp_path) -> None:

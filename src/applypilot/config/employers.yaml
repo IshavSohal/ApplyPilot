@@ -202,6 +202,12 @@ employers:
     site_id: "external_experienced"
     base_url: "https://adobe.wd5.myworkdayjobs.com"
 
+  autodesk:
+    name: "Autodesk"
+    tenant: "autodesk"
+    site_id: "Ext"
+    base_url: "https://autodesk.wd1.myworkdayjobs.com"
+
   motorola:
     name: "Motorola Solutions"
     tenant: "motorolasolutions"

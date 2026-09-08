@@ -21,7 +21,12 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, normalize_posted_at
+from applypilot.database import (
+    get_connection,
+    init_db,
+    is_job_within_retention_window,
+    normalize_posted_at,
+)
 from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 
 log = logging.getLogger(__name__)
@@ -334,6 +339,8 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
         posted_at = normalize_posted_at(job.get("posted"), now)
+        if not is_job_within_retention_window(posted_at, reference_at=now):
+            continue
 
         try:
             conn.execute(

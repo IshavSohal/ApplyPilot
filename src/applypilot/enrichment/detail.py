@@ -487,6 +487,19 @@ def extract_job_metadata(intel: dict) -> dict:
                 "posted_at": None,
             }
 
+    if hostname == "jobs.ashbyhq.com":
+        # Ashby pages are client-rendered and do not always expose JobPosting
+        # JSON-LD, but their document title follows "<role> @ <company>".
+        ashby_title = re.fullmatch(r"(.+?)\s+@\s+(.+)", page_title)
+        if ashby_title:
+            return {
+                "title": ashby_title.group(1).strip(),
+                "company": ashby_title.group(2).strip(),
+                "company_logo": intel.get("page_icon"),
+                "location": None,
+                "posted_at": None,
+            }
+
     return {
         "title": re.split(r"\s+[|–—]\s+", page_title, maxsplit=1)[0] or None,
         "company": None,
@@ -1002,12 +1015,17 @@ def scrape_site_batch(
                         existing_location[0] if existing_location else None
                     )
                     location_allowed = config.location_is_allowed(effective_location)
+                    is_external_ashby = (
+                        (urlparse(url).hostname or "").lower() == "jobs.ashbyhq.com"
+                    )
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
                         "detail_scraped_at = ?, detail_error = NULL, "
                         "title = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, title) ELSE title END, "
-                        "company = COALESCE(company, ?), "
+                        "company = CASE WHEN strategy = 'external_upload' "
+                        "AND ? = 1 THEN COALESCE(?, company) "
+                        "ELSE COALESCE(company, ?) END, "
                         "company_logo = COALESCE(company_logo, ?), "
                         "location = CASE WHEN strategy = 'external_upload' "
                         "THEN COALESCE(?, location) ELSE location END, "
@@ -1027,6 +1045,8 @@ def scrape_site_batch(
                             ),
                             now,
                             result.get("title"),
+                            is_external_ashby,
+                            result.get("company"),
                             result.get("company"),
                             result.get("company_logo"),
                             result.get("location"),

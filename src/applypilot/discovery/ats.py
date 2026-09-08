@@ -14,7 +14,7 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, is_job_within_retention_window
 from applypilot.discovery.filters import classify_title, reconcile_unscored_jobs
 from applypilot.discovery.greenhouse import (
     _http_request,
@@ -243,6 +243,8 @@ def _process_company(
             continue
         url = job.get("url") or ""
         if not url:
+            continue
+        if not is_job_within_retention_window(job.get("posted_at"), reference_at=now):
             continue
         description = _normalize_description(job.get("content"))
         detail_scraped_at = now if len(description) > 200 else None
