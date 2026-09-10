@@ -106,6 +106,16 @@ ashby_location_filter: true
 lever_location_filter: true
 bigtech_location_filter: true
 
+# Optional startup-wide discovery through https://startup.jobs/api.
+# Set STARTUP_JOBS_API_KEY in ~/.applypilot/.env to enable it. Listings retain
+# their Startup Jobs URL and source credit as required by the API terms.
+startup_jobs:
+  enabled: true
+  max_queries: 10
+  page_size: 50
+  max_pages_per_query: 1
+  location_filter: true
+
 # Country for Indeed/LinkedIn/Google Jobs searches
 country: "USA"
 

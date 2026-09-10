@@ -41,7 +41,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (Greenhouse + Workday + Ashby + Lever + big-tech)"},
+    "discover": {"desc": "Job discovery (direct employers + startup feeds)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -78,7 +78,8 @@ def _run_discover(workers: int = 3) -> dict:
             audit["checked"], audit["accepted"], audit["rejected"], audit["changed"],
         )
     stats: dict = {
-        "greenhouse": None, "workday": None, "ashby": None, "lever": None, "bigtech": None,
+        "greenhouse": None, "workday": None, "ashby": None, "lever": None,
+        "bigtech": None, "startup_jobs": None,
     }
     totals = {
         key: 0
@@ -136,6 +137,21 @@ def _run_discover(workers: int = 3) -> dict:
         log.error("Big-tech crawl failed: %s", e)
         console.print(f"  [red]Big-tech error:[/red] {e}")
         stats["bigtech"] = f"error: {e}"
+
+    # Run the aggregate feed after direct-employer sources so an exact
+    # company/title match can prefer the canonical ATS record.
+    console.print("  [cyan]Startup Jobs feed...[/cyan]")
+    try:
+        from applypilot.discovery.startup_jobs import run_startup_jobs_discovery
+        result = run_startup_jobs_discovery()
+        skipped = result.get("skipped")
+        stats["startup_jobs"] = f"skipped: {skipped}" if skipped else "ok"
+        for key in totals:
+            totals[key] += result.get(key, 0)
+    except Exception as e:
+        log.error("Startup Jobs discovery failed: %s", e)
+        console.print(f"  [red]Startup Jobs error:[/red] {e}")
+        stats["startup_jobs"] = f"error: {e}"
 
     stats.update(totals)
 

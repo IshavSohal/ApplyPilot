@@ -61,7 +61,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
+| **1. Discover** | Searches major boards, public ATS feeds, direct career sites, and an optional attributed Startup Jobs feed |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI selects and reorganizes your existing resume entities and bullets per job. Bullet wording stays unchanged |
@@ -129,6 +129,13 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `LLM_RPM`, `LLM_TPM`
 - `config/lever_companies.yaml` - Lever public job-board registry (global and EU)
 - `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
 - `config/searches.example.yaml` - Example search configuration
+
+Set `STARTUP_JOBS_API_KEY` in `~/.applypilot/.env` to add recent listings from
+[Startup Jobs](https://startup.jobs/api). The free API key is optional; when it
+is absent this source is skipped without failing discovery. ApplyPilot retains
+the Startup Jobs listing URL and labels the source in the dashboard to satisfy
+the feed's attribution requirements. Wellfound is intentionally not scraped;
+its listings can still be added individually through the dashboard.
 
 ---
 

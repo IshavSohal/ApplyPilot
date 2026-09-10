@@ -408,9 +408,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
         meta_parts = []
         if priority:
             meta_parts.append('<span class="meta-tag priority">Priority: early career</span>')
-        meta_parts.append(
-            f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
-        )
+        if j["strategy"] == "startup_jobs_api":
+            meta_parts.append(
+                f'<a href="https://startup.jobs" class="meta-tag site-tag" target="_blank" '
+                f'style="background:{site_color}33;color:{site_color}">{site}</a>'
+            )
+        else:
+            meta_parts.append(
+                f'<span class="meta-tag site-tag" '
+                f'style="background:{site_color}33;color:{site_color}">{site}</span>'
+            )
         if salary:
             meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
         if location:
