@@ -194,6 +194,8 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
+    if status == "applied":
+        _prepare_outreach_safely(url, conn)
 
 
 def release_lock(url: str) -> None:
@@ -270,6 +272,8 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
+    if status == "applied":
+        _prepare_outreach_safely(url, conn)
 
 
 def unmark_job(url: str) -> None:
@@ -280,6 +284,20 @@ def unmark_job(url: str) -> None:
         (url,),
     )
     conn.commit()
+    from applypilot.outreach.service import cancel_for_job
+    cancel_for_job(url, conn)
+
+
+def _prepare_outreach_safely(url: str, conn=None) -> None:
+    """Prepare outreach without ever changing an application result."""
+    try:
+        from applypilot.outreach.service import enqueue_for_job, prepare_batch
+
+        batch = enqueue_for_job(url, conn)
+        if batch and batch["status"] in {"queued", "failed"}:
+            prepare_batch(batch["id"], conn=conn)
+    except Exception:
+        logger.exception("Outreach preparation failed for %s", url)
 
 
 def reset_failed() -> int:

@@ -70,5 +70,13 @@
     "hispanic_latino": "Decline to self-identify",
     "veteran_status": "I am not a protected veteran",
     "disability_status": "I do not wish to answer"
+  },
+  "outreach": {
+    "signature": "YOUR_PREFERRED_NAME",
+    "writing_samples": [
+      "Hi Sam,\n\nExample message in your natural writing style.\n\nBest,\nYour Name",
+      "Hi Taylor,\n\nAdd a second representative email or networking message here.\n\nThanks,\nYour Name",
+      "Hi Jordan,\n\nAdd a third representative sample here.\n\nBest,\nYour Name"
+    ]
   }
 }

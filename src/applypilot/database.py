@@ -174,6 +174,67 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
         )
     """)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS outreach_batches (
+            id TEXT PRIMARY KEY,
+            job_url TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'queued',
+            company_domain TEXT,
+            company_research_json TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            approved_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        );
+
+        CREATE TABLE IF NOT EXISTS outreach_recipients (
+            id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            apollo_person_id TEXT NOT NULL,
+            apollo_contact_id TEXT,
+            apollo_message_id TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            title TEXT,
+            linkedin_url TEXT,
+            email TEXT,
+            email_status TEXT,
+            relevance_score INTEGER,
+            relevance_reason TEXT,
+            subject TEXT,
+            body_text TEXT,
+            source_facts_json TEXT,
+            status TEXT NOT NULL DEFAULT 'ready',
+            error TEXT,
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(batch_id, apollo_person_id),
+            FOREIGN KEY(batch_id) REFERENCES outreach_batches(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS company_research (
+            domain TEXT PRIMARY KEY,
+            facts_json TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            researched_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS outreach_suppressions (
+            key TEXT PRIMARY KEY,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outreach_batches_status
+            ON outreach_batches(status);
+        CREATE INDEX IF NOT EXISTS idx_outreach_recipients_batch
+            ON outreach_recipients(batch_id, status);
+        CREATE INDEX IF NOT EXISTS idx_outreach_recipients_email
+            ON outreach_recipients(email);
+    """)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage(created_at)"
     )

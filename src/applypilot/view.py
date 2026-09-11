@@ -204,7 +204,15 @@ def generate_dashboard(output_path: str | None = None) -> str:
         SELECT url, title, company, company_logo, salary, description, location, site, strategy,
                full_description, application_url, detail_error, posted_at, discovered_at,
                fit_score, score_reasoning, applied_at, tailored_resume_path,
-               COALESCE(tailor_attempts, 0) AS tailor_attempts
+               COALESCE(tailor_attempts, 0) AS tailor_attempts,
+               (SELECT id FROM outreach_batches WHERE job_url = jobs.url) AS outreach_batch_id,
+               (SELECT status FROM outreach_batches WHERE job_url = jobs.url) AS outreach_status,
+               (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
+                WHERE b.job_url = jobs.url AND r.status = 'ready') AS outreach_ready,
+               (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
+                WHERE b.job_url = jobs.url AND r.status = 'sent') AS outreach_sent,
+               (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
+                WHERE b.job_url = jobs.url AND r.status = 'failed') AS outreach_failed
         FROM jobs
         WHERE COALESCE(discovery_status, 'accepted') = 'accepted'
         """
@@ -279,6 +287,14 @@ def generate_dashboard(output_path: str | None = None) -> str:
             "has_report": has_report,
             "can_tailor": bool(not job["applied_at"] and job["full_description"] and not stored and job["tailor_attempts"] < 5),
             "can_retailor": bool(not job["applied_at"] and job["full_description"] and stored and job["tailor_attempts"] < 5),
+            "outreach_summary": {
+                "batch_id": job["outreach_batch_id"],
+                "status": job["outreach_status"],
+                "ready": job["outreach_ready"],
+                "sent": job["outreach_sent"],
+                "failed": job["outreach_failed"],
+                "review_required": job["outreach_status"] == "ready_for_review",
+            } if job["outreach_batch_id"] else None,
         }
         workspace_jobs.append(payload)
         score_text = "—" if job["fit_score"] is None else str(job["fit_score"])
@@ -840,6 +856,13 @@ def generate_dashboard(output_path: str | None = None) -> str:
   #workspace-cancel-tailoring[hidden] {{ display: none; }}
   .content-card {{ background: white; border: 1px solid #e1e6ef; border-radius: 12px; padding: 1.1rem; }}
   .content-card h2 {{ font-size: 1rem; margin-bottom: .75rem; }}
+  .outreach-header {{ display: flex; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 1rem; }}
+  .outreach-recipient {{ margin-bottom: 1rem; }}
+  .outreach-recipient-head {{ display: flex; gap: .65rem; align-items: flex-start; margin-bottom: .8rem; }}
+  .outreach-recipient-head small {{ display: block; color: #667085; margin-top: .2rem; }}
+  .outreach-recipient .field {{ margin-bottom: .7rem; }}
+  .outreach-recipient textarea, .outreach-recipient input[type="text"] {{ width: 100%; }}
+  .outreach-actions {{ display: flex; gap: .6rem; flex-wrap: wrap; }}
   .job-description {{ white-space: pre-wrap; line-height: 1.65; color: #475467; font-size: .88rem; }}
   .description-section-heading {{ color: #263244; font-weight: 750; }}
   .artifact-layout {{ display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 1rem; }}
@@ -1173,12 +1196,14 @@ def generate_dashboard(output_path: str | None = None) -> str:
       <button class="workspace-tab" type="button" data-workspace-tab="match">Match</button>
       <button class="workspace-tab" type="button" data-workspace-tab="resume">Resume</button>
       <button class="workspace-tab" type="button" data-workspace-tab="report">Report</button>
+      <button class="workspace-tab" type="button" data-workspace-tab="outreach">Outreach</button>
     </nav>
     <div class="workspace-body">
       <section id="workspace-panel-details" class="workspace-panel active"><div class="detail-grid"><article class="content-card"><h2>About this role</h2><div id="workspace-description" class="job-description"></div></article><aside class="content-card"><h2>Actions</h2><button id="workspace-tailor" class="primary-button" type="button">Tailor resume</button><button id="workspace-cancel-tailoring" class="danger-button" type="button" hidden>Cancel tailoring</button><p id="workspace-action-status" class="resume-meta"></p></aside></div></section>
       <section id="workspace-panel-match" class="workspace-panel"><article class="content-card"><h2>Why this role matches</h2><div id="workspace-reasoning" class="job-description"></div></article></section>
       <section id="workspace-panel-resume" class="workspace-panel"><div id="workspace-resume-content"></div></section>
       <section id="workspace-panel-report" class="workspace-panel"><div id="workspace-report-content"></div></section>
+      <section id="workspace-panel-outreach" class="workspace-panel"><div id="workspace-outreach-content"></div></section>
     </div>
   </section>
 </div>
@@ -1484,6 +1509,15 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <option>Yes, I have a disability</option>
             <option>No, I do not have a disability</option>
           </select>
+        </div>
+      </section>
+
+      <section class="settings-card wide">
+        <h2>Employee Outreach</h2>
+        <p class="settings-help">Messages are generated only after an application and are never sent without your review. Add 3–10 examples that sound like you.</p>
+        <div class="field"><label>Email signature</label><textarea rows="3" data-profile-path="outreach.signature"></textarea></div>
+        <div class="field"><label>Writing samples (separate samples with a line containing ---)</label>
+          <textarea rows="14" data-outreach-samples></textarea>
         </div>
       </section>
     </div>
@@ -2306,6 +2340,11 @@ function populateProfileForm() {{
     const value = getPath(profile, input.dataset.profileList);
     input.value = Array.isArray(value) ? value.join('\\n') : '';
   }});
+  const outreachSamples = document.querySelector('[data-outreach-samples]');
+  if (outreachSamples) {{
+    const samples = getPath(profile, 'outreach.writing_samples');
+    outreachSamples.value = Array.isArray(samples) ? samples.join('\\n\\n---\\n\\n') : '';
+  }}
   renderTagEditors();
   const passwordInput = document.querySelector('[data-profile-password]');
   passwordInput.value = '';
@@ -2330,6 +2369,11 @@ function collectProfileForm() {{
     const value = input.value === '' ? '' : Number(input.value);
     setPath(profile, input.dataset.profileNumber, value);
   }});
+  const outreachSamples = document.querySelector('[data-outreach-samples]');
+  if (outreachSamples) {{
+    setPath(profile, 'outreach.writing_samples', outreachSamples.value
+      .split(/^\\s*---\\s*$/m).map(value => value.trim()).filter(Boolean));
+  }}
   const password = document.querySelector('[data-profile-password]').value;
   if (password) setPath(profile, 'personal.password', password);
   return profile;
@@ -2832,6 +2876,9 @@ function renderWorkspaceJob(job) {{
   renderResumePanel();
   syncWorkspaceTailoringControls();
   document.getElementById('workspace-report-content').innerHTML = '<div class="empty-state">Open this tab to load the tailoring report.</div>';
+  document.getElementById('workspace-outreach-content').innerHTML = job?.applied
+    ? '<div class="empty-state">Open this tab to load employee outreach.</div>'
+    : '<div class="empty-state">Outreach becomes available after you apply.</div>';
 }}
 
 function syncWorkspaceTailoringControls() {{
@@ -3004,6 +3051,110 @@ function openWorkspaceTab(tab) {{
   document.querySelectorAll('.workspace-tab').forEach(button => button.classList.toggle('active', button.dataset.workspaceTab === tab));
   document.querySelectorAll('.workspace-panel').forEach(panel => panel.classList.toggle('active', panel.id === `workspace-panel-${{tab}}`));
   if (tab === 'report') loadWorkspaceReport();
+  if (tab === 'outreach') loadWorkspaceOutreach();
+}}
+
+let outreachPollTimer = null;
+async function loadWorkspaceOutreach() {{
+  window.clearTimeout(outreachPollTimer);
+  const target = document.getElementById('workspace-outreach-content');
+  if (!workspaceJob) return;
+  target.innerHTML = '<div class="empty-state">Loading outreach…</div>';
+  try {{
+    const response = await fetch('/api/outreach?job_url=' + encodeURIComponent(workspaceJob.url));
+    const payload = await response.json();
+    if (response.status === 404) {{
+      target.innerHTML = workspaceJob.applied
+        ? '<div class="empty-state"><div><h2>No outreach batch</h2><p>Enable Apollo outreach and prepare a batch for this application.</p></div></div>'
+        : '<div class="empty-state">Outreach becomes available after you apply.</div>';
+      return;
+    }}
+    if (!response.ok) throw new Error(payload.error || 'Could not load outreach');
+    renderWorkspaceOutreach(payload.batch);
+    if (['queued', 'preparing', 'sending'].includes(payload.batch.status)) {{
+      outreachPollTimer = window.setTimeout(loadWorkspaceOutreach, 2500);
+    }}
+  }} catch (error) {{
+    target.innerHTML = `<div class="empty-state"><div><h2>Outreach unavailable</h2><p>${{safeHtml(error.message)}}</p></div></div>`;
+  }}
+}}
+
+function renderWorkspaceOutreach(batch) {{
+  const target = document.getElementById('workspace-outreach-content');
+  const editable = ['ready_for_review', 'failed', 'partial_failed'].includes(batch.status);
+  const recipients = batch.recipients || [];
+  const cards = recipients.map(recipient => `
+    <article class="content-card outreach-recipient" data-outreach-recipient="${{safeHtml(recipient.id)}}">
+      <div class="outreach-recipient-head">
+        <input type="checkbox" data-outreach-selected ${{recipient.status === 'ready' || recipient.status === 'failed' ? 'checked' : ''}} ${{editable ? '' : 'disabled'}}>
+        <div><strong>${{safeHtml([recipient.first_name, recipient.last_name].filter(Boolean).join(' ') || recipient.email)}}</strong>
+          <small>${{safeHtml(recipient.title || 'Employee')}} · ${{safeHtml(recipient.email)}} · ${{safeHtml(recipient.status)}}</small>
+          <small>${{safeHtml(recipient.relevance_reason || '')}}</small></div>
+      </div>
+      <div class="field"><label>Subject</label><input type="text" maxlength="200" data-outreach-subject value="${{safeHtml(recipient.subject || '')}}" ${{editable ? '' : 'disabled'}}></div>
+      <div class="field"><label>Message</label><textarea rows="8" maxlength="4000" data-outreach-body ${{editable ? '' : 'disabled'}}>${{safeHtml(recipient.body_text || '')}}</textarea></div>
+      ${{recipient.error ? `<p class="settings-status error">${{safeHtml(recipient.error)}}</p>` : ''}}
+      ${{editable && !['sent', 'sending', 'suppressed'].includes(recipient.status) ? `<button class="danger-button" type="button" onclick="suppressOutreachRecipient('${{safeHtml(recipient.id)}}')">Never contact</button>` : ''}}
+    </article>`).join('');
+  target.innerHTML = `<div class="outreach-header"><div><h2>Employee outreach</h2><p class="resume-meta">Status: ${{safeHtml(batch.status)}}${{batch.company_domain ? ` · ${{safeHtml(batch.company_domain)}}` : ''}}</p></div></div>
+    ${{batch.error ? `<p class="settings-status error">${{safeHtml(batch.error)}}</p>` : ''}}
+    ${{cards || '<div class="empty-state">No eligible recipients are available yet.</div>'}}
+    <div class="outreach-actions">
+      ${{editable && recipients.length ? '<button class="primary-button" type="button" onclick="approveWorkspaceOutreach()">Approve and send selected</button>' : ''}}
+      ${{['failed', 'partial_failed'].includes(batch.status) ? '<button class="secondary-button" type="button" onclick="retryWorkspaceOutreach()">Retry failed</button>' : ''}}
+      ${{!['sending', 'completed', 'cancelled'].includes(batch.status) ? '<button class="danger-button" type="button" onclick="cancelWorkspaceOutreach()">Cancel batch</button>' : ''}}
+      ${{batch.status === 'cancelled' ? '<button class="danger-button" type="button" onclick="clearWorkspaceOutreach()">Clear outreach</button>' : ''}}
+    </div>`;
+  target.dataset.batchId = batch.id;
+}}
+
+async function outreachAction(path, body) {{
+  const response = await fetch('/api/outreach/' + path, {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(body)}});
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || 'Outreach action failed');
+  renderWorkspaceOutreach(payload.batch);
+}}
+
+async function approveWorkspaceOutreach() {{
+  const target = document.getElementById('workspace-outreach-content');
+  const recipients = Array.from(target.querySelectorAll('[data-outreach-recipient]'))
+    .filter(card => card.querySelector('[data-outreach-selected]').checked)
+    .map(card => ({{id: card.dataset.outreachRecipient, subject: card.querySelector('[data-outreach-subject]').value.trim(), body_text: card.querySelector('[data-outreach-body]').value.trim()}}));
+  if (!recipients.length) return window.alert('Select at least one recipient.');
+  if (!window.confirm(`Send ${{recipients.length}} reviewed email${{recipients.length === 1 ? '' : 's'}} from your connected Apollo mailbox?`)) return;
+  try {{ await outreachAction('approve', {{batch_id: target.dataset.batchId, recipients, confirmed: true}}); }}
+  catch (error) {{ window.alert(error.message); }}
+}}
+
+async function retryWorkspaceOutreach() {{
+  const target = document.getElementById('workspace-outreach-content');
+  try {{ await outreachAction('retry', {{batch_id: target.dataset.batchId}}); }} catch (error) {{ window.alert(error.message); }}
+}}
+
+async function cancelWorkspaceOutreach() {{
+  const target = document.getElementById('workspace-outreach-content');
+  if (!window.confirm('Cancel this unsent outreach batch?')) return;
+  try {{ await outreachAction('cancel', {{batch_id: target.dataset.batchId}}); }} catch (error) {{ window.alert(error.message); }}
+}}
+
+async function clearWorkspaceOutreach() {{
+  const target = document.getElementById('workspace-outreach-content');
+  if (!window.confirm('Permanently clear this cancelled outreach batch and its unsent local drafts?')) return;
+  try {{
+    const response = await fetch('/api/outreach/clear', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{batch_id: target.dataset.batchId}}),
+    }});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Could not clear outreach');
+    await loadWorkspaceOutreach();
+  }} catch (error) {{ window.alert(error.message); }}
+}}
+
+async function suppressOutreachRecipient(recipientId) {{
+  if (!window.confirm('Never contact this person through ApplyPilot?')) return;
+  try {{ await outreachAction('suppress', {{recipient_id: recipientId, reason: 'user'}}); }} catch (error) {{ window.alert(error.message); }}
 }}
 
 document.querySelectorAll('.workspace-tab').forEach(button => button.addEventListener('click', () => openWorkspaceTab(button.dataset.workspaceTab)));

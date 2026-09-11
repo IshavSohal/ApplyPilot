@@ -30,7 +30,7 @@ from applypilot.view import generate_dashboard
 
 log = logging.getLogger(__name__)
 
-MAX_REQUEST_BYTES = 8192
+MAX_REQUEST_BYTES = 32768
 MAX_SETTINGS_BYTES = 262144
 MAX_RESUME_BYTES = 1_000_000
 # JSON may expand control-heavy text to six bytes per source byte.
@@ -450,6 +450,7 @@ def _validate_profile(profile: object) -> dict:
         "resume_facts",
         "eeo_voluntary",
         "availability",
+        "outreach",
     ):
         if section in profile and not isinstance(profile[section], dict):
             raise ValueError(f"Profile section '{section}' must be an object")
@@ -472,6 +473,16 @@ def _validate_profile(profile: object) -> dict:
                 raise ValueError(
                     f"Profile field '{section}.{key}' must contain only text"
                 )
+
+    outreach = profile.get("outreach", {})
+    if "writing_samples" in outreach:
+        samples = outreach["writing_samples"]
+        if not isinstance(samples, list) or not all(isinstance(item, str) for item in samples):
+            raise ValueError("Profile field 'outreach.writing_samples' must contain only text")
+        if len(samples) > 10 or any(len(item) > 5000 for item in samples):
+            raise ValueError("Provide no more than 10 writing samples of at most 5,000 characters each")
+    if "signature" in outreach and not isinstance(outreach["signature"], str):
+        raise ValueError("Profile field 'outreach.signature' must be text")
 
     for section, key in (
         ("compensation", "salary_expectation"),
@@ -851,12 +862,15 @@ def mark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> di
         (applied_at, url),
     )
     conn.commit()
+    from applypilot.outreach.service import enqueue_for_job
+    outreach = enqueue_for_job(url, conn)
     return {
         "updated": True,
         "url": url,
         "title": row["title"],
         "status": "applied",
         "applied_at": applied_at,
+        "outreach": outreach,
     }
 
 
@@ -881,6 +895,8 @@ def unmark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> 
         (url,),
     )
     conn.commit()
+    from applypilot.outreach.service import cancel_for_job
+    cancel_for_job(url, conn)
     return {
         "updated": True,
         "url": url,
@@ -1566,6 +1582,10 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             max_workers=1,
             thread_name_prefix="applypilot-pipeline",
         )
+        self.outreach_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="applypilot-outreach",
+        )
         self.pipeline_lock = threading.Lock()
         self.discovery_lock = threading.Lock()
         self.discovery_state = {
@@ -1583,6 +1603,17 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.tailoring_processor_running = False
         self.tailoring_stopping = False
         self.render_lock = threading.Lock()
+        if os.environ.get("OUTREACH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+            from applypilot.outreach.service import prepare_batch
+            rows = get_connection().execute(
+                "SELECT id FROM outreach_batches WHERE status IN ('queued', 'preparing')"
+            ).fetchall()
+            get_connection().execute(
+                "UPDATE outreach_batches SET status = 'queued' WHERE status = 'preparing'"
+            )
+            get_connection().commit()
+            for row in rows:
+                self.outreach_pool.submit(prepare_batch, row["id"])
 
     def server_close(self) -> None:
         self.enrichment_pool.shutdown(wait=False, cancel_futures=True)
@@ -1592,6 +1623,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             self.tailoring_queue.clear()
         self.tailoring_pool.shutdown(wait=False, cancel_futures=True)
         self.pipeline_pool.shutdown(wait=False, cancel_futures=True)
+        self.outreach_pool.shutdown(wait=False, cancel_futures=True)
         super().server_close()
 
 
@@ -1668,6 +1700,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             try:
                 self._send_json(200, job_import_status(raw_url))
             except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        if parsed.path == "/api/outreach":
+            try:
+                self._validate_local_host()
+                from applypilot.outreach.service import get_batch, refresh_delivery_statuses
+                query = parse_qs(parsed.query)
+                identifier = query.get("batch_id", query.get("job_url", [""]))[0]
+                batch = get_batch(identifier)
+                if not batch:
+                    self._send_json(404, {"error": "Outreach batch not found"})
+                    return
+                if batch["status"] == "sending":
+                    batch = refresh_delivery_statuses(identifier)
+                self._send_json(200, {"batch": batch})
+            except PermissionError as exc:
+                self._send_json(403, {"error": str(exc)})
+            except (ValueError, RuntimeError) as exc:
                 self._send_json(400, {"error": str(exc)})
             return
 
@@ -1806,11 +1857,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/tailoring/job",
             "/api/tailoring/cancel",
             "/api/pipeline",
+            "/api/outreach/prepare",
+            "/api/outreach/approve",
+            "/api/outreach/retry",
+            "/api/outreach/cancel",
+            "/api/outreach/clear",
+            "/api/outreach/suppress",
         }:
             self._send_json(404, {"error": "Not found"})
             return
 
         try:
+            if path.startswith("/api/outreach/"):
+                self._validate_origin()
             payload = self._read_json()
             if path == "/api/discovery":
                 result = start_discovery(self.server, payload.get("workers", 3))
@@ -1847,6 +1906,35 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 result = delete_job(payload.get("url", ""))
             elif path == "/api/jobs/tailored/clear":
                 result = clear_tailored_resume(payload.get("url", ""))
+            elif path.startswith("/api/outreach/"):
+                from applypilot.outreach.service import (
+                    approve_batch,
+                    cancel_batch,
+                    clear_cancelled_batch,
+                    prepare_batch,
+                    retry_batch,
+                    suppress_recipient,
+                )
+                if path == "/api/outreach/prepare":
+                    identifier = payload.get("batch_id") or payload.get("job_url") or ""
+                    self.server.outreach_pool.submit(prepare_batch, identifier)
+                    result = {"status": "queued", "id": identifier}
+                elif path == "/api/outreach/approve":
+                    result = approve_batch(
+                        payload.get("batch_id", ""),
+                        payload.get("recipients", []),
+                        confirmed=payload.get("confirmed") is True,
+                    )
+                elif path == "/api/outreach/retry":
+                    result = retry_batch(payload.get("batch_id", ""))
+                elif path == "/api/outreach/cancel":
+                    result = cancel_batch(payload.get("batch_id", ""))
+                elif path == "/api/outreach/clear":
+                    result = clear_cancelled_batch(payload.get("batch_id", ""))
+                else:
+                    result = suppress_recipient(
+                        payload.get("recipient_id", ""), payload.get("reason", "user")
+                    )
             else:
                 result = import_external_job(payload.get("url", ""))
         except PermissionError as exc:
@@ -1870,12 +1958,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(202, result)
             return
 
+        if path.startswith("/api/outreach/"):
+            self._send_json(202 if path == "/api/outreach/prepare" else 200, {"batch": result})
+            return
+
         if path == "/api/tailoring/cancel":
             self._send_json(200, result)
             return
 
         if path == "/api/jobs/applied":
             if result["updated"]:
+                batch = result.get("outreach")
+                if batch and batch.get("status") in {"queued", "failed"}:
+                    from applypilot.outreach.service import prepare_batch
+                    self.server.outreach_pool.submit(prepare_batch, batch["id"])
                 self._send_json(200, result)
             else:
                 self._send_json(404, {"error": "Job not found"})

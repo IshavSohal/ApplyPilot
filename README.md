@@ -68,6 +68,8 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
+After a confirmed application, optional **Apollo outreach** finds up to five relevant employees, enriches only verified work emails, and prepares personalized messages for review. It never sends until you approve the selected recipients in the dashboard.
+
 Each stage is independent. Run them all or pick what you need.
 
 ---
@@ -173,6 +175,25 @@ applypilot apply --reset-failed        # reset all failed jobs for retry
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
+### Employee Outreach (optional)
+
+ApplyPilot can use Apollo's REST API to contact a balanced hiring circle: a likely manager, functional leader, recruiter, and relevant team members. People are ranked against the role and job location, with company-wide candidates retained as fallbacks for remote roles or sparse local results. At most ten profiles are enriched to find up to five verified work emails, and official company pages plus the job description ground the generated message.
+
+1. In Apollo, link the personal Gmail, Outlook, or other mailbox you want to send from and make it the authenticated user's default. Apollo's one-off email API uses that linked/default mailbox, and replies arrive in its inbox.
+2. Add `APOLLO_API_KEY`, that linked mailbox's `APOLLO_EMAIL_ACCOUNT_ID` (used as a safety check), and `OUTREACH_ENABLED=true` to `~/.applypilot/.env`.
+3. Add 3–10 representative writing samples and your signature under **Profile → Employee Outreach** in the dashboard.
+4. Apply normally. Open the applied job's **Outreach** tab to edit, exclude, suppress, and approve recipients.
+
+Apollo search does not reveal email addresses. ApplyPilot enriches candidates in rank order, which consumes Apollo credits, and stops after ten attempts. Personal emails and phone numbers are never requested. Sending uses one-off Apollo drafts and requires a final browser confirmation; the initial send response is tracked until Apollo reports delivery or failure.
+
+Recovery commands do not bypass review:
+
+```bash
+applypilot outreach --url URL             # show batch status
+applypilot outreach --url URL --prepare   # prepare/re-prepare an unsent batch
+applypilot outreach --url URL --retry     # retry failed preparation or sends
+```
+
 #### How `--limit` counts jobs
 
 - `--limit` counts **every job the worker finishes processing**, including jobs the agent rejects as out-of-scope (e.g. freelance-only listings, ineligible locations, expired postings).
@@ -203,6 +224,7 @@ applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
+applypilot outreach --url URL           # Inspect/recover post-application outreach
 ```
 
 ---

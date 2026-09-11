@@ -187,6 +187,13 @@ def _setup_profile() -> dict:
         "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
     }
 
+    # Outreach is configured later in the dashboard. Keeping the section in
+    # every new profile makes upgrades and settings round-trips predictable.
+    profile["outreach"] = {
+        "signature": profile["personal"].get("preferred_name") or full_name,
+        "writing_samples": [],
+    }
+
     # Save
     PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
     console.print(f"\n[green]Profile saved to {PROFILE_PATH}[/green]")

@@ -361,12 +361,45 @@ def dashboard(
 
 
 @app.command()
+def outreach(
+    url: str = typer.Option(..., "--url", help="Applied job URL."),
+    prepare: bool = typer.Option(False, "--prepare", help="Prepare or re-prepare an unsent batch."),
+    retry: bool = typer.Option(False, "--retry", help="Retry failed preparation or sends."),
+) -> None:
+    """Inspect or recover an outreach batch. Sending still requires dashboard approval."""
+    _bootstrap()
+    from applypilot.outreach.service import enqueue_for_job, get_batch, prepare_batch, retry_batch
+
+    batch = get_batch(url)
+    if prepare:
+        batch = batch or enqueue_for_job(url)
+        if not batch:
+            console.print("[red]Outreach is disabled or the job is not applied.[/red]")
+            raise typer.Exit(code=1)
+        batch = prepare_batch(batch["id"])
+    elif retry:
+        if not batch:
+            console.print("[red]No outreach batch exists for this job.[/red]")
+            raise typer.Exit(code=1)
+        batch = retry_batch(batch["id"])
+    if not batch:
+        console.print("[yellow]No outreach batch exists for this job.[/yellow]")
+        return
+    console.print(f"[bold]Outreach:[/bold] {batch['status']}")
+    if batch.get("error"):
+        console.print(f"[red]{batch['error']}[/red]")
+    for recipient in batch.get("recipients", []):
+        name = " ".join(filter(None, (recipient.get("first_name"), recipient.get("last_name"))))
+        console.print(f"  {recipient['status']:<12} {name or recipient.get('email')} — {recipient.get('title') or ''}")
+
+
+@app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_TEX_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, load_profile,
     )
 
     load_env()
@@ -469,6 +502,36 @@ def doctor() -> None:
     else:
         results.append(("CapSolver API key", "[dim]optional[/dim]",
                         "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+
+    # Apollo outreach (optional and only network-checked when enabled)
+    outreach_enabled = os.environ.get("OUTREACH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if outreach_enabled:
+        if not os.environ.get("APOLLO_API_KEY"):
+            results.append(("Apollo API", fail_mark, "Set APOLLO_API_KEY before enabling outreach"))
+        elif not os.environ.get("APOLLO_EMAIL_ACCOUNT_ID"):
+            results.append(("Apollo mailbox", fail_mark, "Set APOLLO_EMAIL_ACCOUNT_ID to a linked mailbox"))
+        else:
+            try:
+                from applypilot.outreach.apollo import ApolloClient
+                apollo = ApolloClient()
+                apollo.health()
+                account_id = os.environ["APOLLO_EMAIL_ACCOUNT_ID"]
+                account = next((item for item in apollo.email_accounts() if str(item.get("id")) == account_id), None)
+                if account:
+                    address = account.get("email") or account.get("email_address") or account_id
+                    results.append(("Apollo mailbox", ok_mark, f"Replies will arrive at {address}"))
+                else:
+                    results.append(("Apollo mailbox", fail_mark, "Configured mailbox is not linked to this Apollo user"))
+            except Exception as exc:
+                results.append(("Apollo API", fail_mark, str(exc)[:120]))
+        try:
+            samples = load_profile().get("outreach", {}).get("writing_samples", [])
+            marker = ok_mark if len(samples) >= 3 else fail_mark
+            results.append(("Outreach style", marker, f"{len(samples)} writing samples configured; 3 required"))
+        except (OSError, ValueError):
+            results.append(("Outreach style", fail_mark, "Profile could not be loaded"))
+    else:
+        results.append(("Apollo outreach", "[dim]optional[/dim]", "Set OUTREACH_ENABLED=true after configuration"))
 
     # --- Render results ---
     console.print()

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional, review-gated Apollo employee outreach after confirmed applications, including
+  official-site research, verified work-email enrichment, personalized drafts, suppression,
+  retries, delivery tracking, and connected-mailbox validation.
 - Microsoft discovery through its public Eightfold/PCSX careers endpoint.
 - Ashby and Lever public job-board discovery, including full descriptions, application URLs,
   posting dates, locations, and available compensation.
