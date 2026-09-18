@@ -192,6 +192,16 @@ def _setup_profile() -> dict:
     profile["outreach"] = {
         "signature": profile["personal"].get("preferred_name") or full_name,
         "writing_samples": [],
+        "schedule": {
+            "timezone": "America/Toronto",
+            "weekdays": [0, 1, 2, 3, 4],
+            "send_window_start": "09:00",
+            "send_window_end": "16:00",
+            "first_wave_size": 2,
+            "second_wave_delay_business_days": 2,
+            "min_spacing_minutes": 10,
+            "daily_limit": 15,
+        },
     }
 
     # Save

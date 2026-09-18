@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse, urlunparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -349,6 +350,14 @@ def load_dashboard_settings() -> dict:
     searches = copy.deepcopy(config.load_search_config())
     if not isinstance(profile, dict) or not isinstance(searches, dict):
         raise ValueError("Profile and search settings must contain objects")
+    from applypilot.outreach.service import DEFAULT_SCHEDULE
+    outreach = profile.setdefault("outreach", {})
+    if isinstance(outreach, dict):
+        configured_schedule = outreach.get("schedule")
+        outreach["schedule"] = {
+            **DEFAULT_SCHEDULE,
+            **(configured_schedule if isinstance(configured_schedule, dict) else {}),
+        }
 
     personal = profile.get("personal")
     password_configured = False
@@ -483,6 +492,50 @@ def _validate_profile(profile: object) -> dict:
             raise ValueError("Provide no more than 10 writing samples of at most 5,000 characters each")
     if "signature" in outreach and not isinstance(outreach["signature"], str):
         raise ValueError("Profile field 'outreach.signature' must be text")
+    schedule = outreach.get("schedule", {})
+    if schedule and not isinstance(schedule, dict):
+        raise ValueError("Profile field 'outreach.schedule' must be an object")
+    if isinstance(schedule, dict):
+        timezone_name = schedule.get("timezone")
+        if timezone_name is not None:
+            if not isinstance(timezone_name, str):
+                raise ValueError("Outreach schedule timezone must be text")
+            try:
+                ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError("Outreach schedule timezone is unknown") from exc
+        weekdays = schedule.get("weekdays")
+        if weekdays is not None and (
+            not isinstance(weekdays, list)
+            or not weekdays
+            or any(not isinstance(day, int) or isinstance(day, bool) or day < 0 or day > 6 for day in weekdays)
+        ):
+            raise ValueError("Outreach schedule weekdays must contain integers from 0 through 6")
+        for key in (
+            "first_wave_size",
+            "second_wave_delay_business_days",
+            "min_spacing_minutes",
+            "daily_limit",
+        ):
+            value = schedule.get(key)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+            ):
+                raise ValueError(f"Outreach schedule field '{key}' must be a positive integer")
+        parsed_times = {}
+        for key in ("send_window_start", "send_window_end"):
+            value = schedule.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError(f"Outreach schedule field '{key}' must use HH:MM")
+            parsed_times[key] = value
+        if (
+            parsed_times.get("send_window_start")
+            and parsed_times.get("send_window_end")
+            and parsed_times["send_window_start"] >= parsed_times["send_window_end"]
+        ):
+            raise ValueError("Outreach send window must end after it starts")
 
     for section, key in (
         ("compensation", "salary_expectation"),
@@ -863,7 +916,7 @@ def mark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> di
     )
     conn.commit()
     from applypilot.outreach.service import enqueue_for_job
-    outreach = enqueue_for_job(url, conn)
+    outreach = enqueue_for_job(url, conn, reapplied=not bool(row["applied_at"]))
     return {
         "updated": True,
         "url": url,
@@ -1557,6 +1610,28 @@ def cancel_tailoring(server: DashboardHTTPServer, target_url: str) -> dict:
     raise ValueError("No active tailoring request was found for this job")
 
 
+def _run_outreach_dispatcher(stop_event: threading.Event, wake_event: threading.Event) -> None:
+    """Run the restart-safe local outreach dispatcher."""
+    from applypilot.outreach.service import (
+        dispatch_due_outreach,
+        recover_outreach_dispatcher,
+        refresh_inflight_outreach,
+    )
+
+    try:
+        recover_outreach_dispatcher()
+    except Exception:
+        log.exception("Could not recover scheduled outreach")
+    while not stop_event.is_set():
+        try:
+            refresh_inflight_outreach()
+            dispatch_due_outreach()
+        except Exception:
+            log.exception("Scheduled outreach dispatcher iteration failed")
+        wake_event.wait(30)
+        wake_event.clear()
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     """Threaded localhost server with a bounded enrichment pool."""
 
@@ -1603,8 +1678,12 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.tailoring_processor_running = False
         self.tailoring_stopping = False
         self.render_lock = threading.Lock()
+        self.outreach_dispatcher_stop = threading.Event()
+        self.outreach_dispatcher_wake = threading.Event()
+        self.outreach_dispatcher_thread: threading.Thread | None = None
         if os.environ.get("OUTREACH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-            from applypilot.outreach.service import prepare_batch
+            from applypilot.outreach.service import prepare_batch, recover_reapplied_batches
+            recover_reapplied_batches(get_connection())
             rows = get_connection().execute(
                 "SELECT id FROM outreach_batches WHERE status IN ('queued', 'preparing')"
             ).fetchall()
@@ -1614,8 +1693,19 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             get_connection().commit()
             for row in rows:
                 self.outreach_pool.submit(prepare_batch, row["id"])
+            self.outreach_dispatcher_thread = threading.Thread(
+                target=_run_outreach_dispatcher,
+                args=(self.outreach_dispatcher_stop, self.outreach_dispatcher_wake),
+                name="applypilot-outreach-dispatcher",
+                daemon=True,
+            )
+            self.outreach_dispatcher_thread.start()
 
     def server_close(self) -> None:
+        self.outreach_dispatcher_stop.set()
+        self.outreach_dispatcher_wake.set()
+        if self.outreach_dispatcher_thread:
+            self.outreach_dispatcher_thread.join(timeout=2)
         self.enrichment_pool.shutdown(wait=False, cancel_futures=True)
         self.discovery_pool.shutdown(wait=False, cancel_futures=True)
         with self.tailoring_lock:
@@ -1706,6 +1796,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/outreach":
             try:
                 self._validate_local_host()
+                from applypilot.outreach.gmail import connected_account
                 from applypilot.outreach.service import get_batch, refresh_delivery_statuses
                 query = parse_qs(parsed.query)
                 identifier = query.get("batch_id", query.get("job_url", [""]))[0]
@@ -1715,7 +1806,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     return
                 if batch["status"] == "sending":
                     batch = refresh_delivery_statuses(identifier)
-                self._send_json(200, {"batch": batch})
+                self._send_json(200, {"batch": batch, "gmail_account": connected_account()})
             except PermissionError as exc:
                 self._send_json(403, {"error": str(exc)})
             except (ValueError, RuntimeError) as exc:
@@ -1858,9 +1949,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/tailoring/cancel",
             "/api/pipeline",
             "/api/outreach/prepare",
+            "/api/outreach/preview",
             "/api/outreach/approve",
+            "/api/outreach/gmail-drafts",
+            "/api/outreach/reset-gmail-draft",
             "/api/outreach/retry",
             "/api/outreach/cancel",
+            "/api/outreach/cancel-pending",
             "/api/outreach/clear",
             "/api/outreach/suppress",
         }:
@@ -1910,31 +2005,60 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 from applypilot.outreach.service import (
                     approve_batch,
                     cancel_batch,
+                    cancel_pending,
                     clear_cancelled_batch,
+                    create_gmail_drafts,
                     prepare_batch,
+                    preview_batch_schedule,
                     retry_batch,
+                    reset_uncertain_gmail_draft,
                     suppress_recipient,
                 )
                 if path == "/api/outreach/prepare":
                     identifier = payload.get("batch_id") or payload.get("job_url") or ""
                     self.server.outreach_pool.submit(prepare_batch, identifier)
                     result = {"status": "queued", "id": identifier}
+                elif path == "/api/outreach/preview":
+                    result = {
+                        "schedule": preview_batch_schedule(
+                            payload.get("batch_id", ""), payload.get("recipient_ids", [])
+                        )
+                    }
                 elif path == "/api/outreach/approve":
                     result = approve_batch(
                         payload.get("batch_id", ""),
                         payload.get("recipients", []),
                         confirmed=payload.get("confirmed") is True,
                     )
+                elif path == "/api/outreach/gmail-drafts":
+                    result = create_gmail_drafts(
+                        payload.get("batch_id", ""),
+                        payload.get("recipients", []),
+                        confirmed_account=payload.get("confirmed_account", ""),
+                    )
+                elif path == "/api/outreach/reset-gmail-draft":
+                    result = reset_uncertain_gmail_draft(
+                        payload.get("recipient_id", ""),
+                        confirmed_no_draft=payload.get("confirmed_no_draft") is True,
+                    )
                 elif path == "/api/outreach/retry":
                     result = retry_batch(payload.get("batch_id", ""))
                 elif path == "/api/outreach/cancel":
                     result = cancel_batch(payload.get("batch_id", ""))
+                elif path == "/api/outreach/cancel-pending":
+                    result = cancel_pending(payload.get("batch_id", ""))
                 elif path == "/api/outreach/clear":
                     result = clear_cancelled_batch(payload.get("batch_id", ""))
                 else:
                     result = suppress_recipient(
                         payload.get("recipient_id", ""), payload.get("reason", "user")
                     )
+                if path in {
+                    "/api/outreach/approve",
+                    "/api/outreach/retry",
+                    "/api/outreach/cancel-pending",
+                }:
+                    self.server.outreach_dispatcher_wake.set()
             else:
                 result = import_external_job(payload.get("url", ""))
         except PermissionError as exc:
@@ -1959,7 +2083,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/outreach/"):
-            self._send_json(202 if path == "/api/outreach/prepare" else 200, {"batch": result})
+            if path == "/api/outreach/preview":
+                self._send_json(200, result)
+            else:
+                self._send_json(202 if path == "/api/outreach/prepare" else 200, {"batch": result})
             return
 
         if path == "/api/tailoring/cancel":

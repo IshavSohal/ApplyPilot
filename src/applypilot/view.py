@@ -1519,6 +1519,26 @@ def generate_dashboard(output_path: str | None = None) -> str:
         <div class="field"><label>Writing samples (separate samples with a line containing ---)</label>
           <textarea rows="14" data-outreach-samples></textarea>
         </div>
+        <h3>Legacy Apollo delivery schedule</h3>
+        <p class="settings-help">Only applies to outreach batches previously scheduled through Apollo. New outreach is created as Gmail drafts; set their send times in Gmail.</p>
+        <div class="field-grid">
+          <div class="field"><label>Timezone</label><input data-profile-path="outreach.schedule.timezone" placeholder="America/Toronto"></div>
+          <div class="field"><label>Send window starts</label><input type="time" data-profile-path="outreach.schedule.send_window_start"></div>
+          <div class="field"><label>Send window ends</label><input type="time" data-profile-path="outreach.schedule.send_window_end"></div>
+          <div class="field"><label>First-wave recipients</label><input type="number" min="1" max="5" data-profile-number="outreach.schedule.first_wave_size"></div>
+          <div class="field"><label>Second-wave delay (business days)</label><input type="number" min="1" max="30" data-profile-number="outreach.schedule.second_wave_delay_business_days"></div>
+          <div class="field"><label>Minimum spacing (minutes)</label><input type="number" min="1" max="1440" data-profile-number="outreach.schedule.min_spacing_minutes"></div>
+          <div class="field"><label>ApplyPilot daily limit</label><input type="number" min="1" max="100" data-profile-number="outreach.schedule.daily_limit"></div>
+        </div>
+        <div class="field"><label>Sending days</label><div class="checkbox-grid">
+          <label><input type="checkbox" data-outreach-weekday value="0"> Mon</label>
+          <label><input type="checkbox" data-outreach-weekday value="1"> Tue</label>
+          <label><input type="checkbox" data-outreach-weekday value="2"> Wed</label>
+          <label><input type="checkbox" data-outreach-weekday value="3"> Thu</label>
+          <label><input type="checkbox" data-outreach-weekday value="4"> Fri</label>
+          <label><input type="checkbox" data-outreach-weekday value="5"> Sat</label>
+          <label><input type="checkbox" data-outreach-weekday value="6"> Sun</label>
+        </div></div>
       </section>
     </div>
     <div class="settings-actions">
@@ -2345,6 +2365,12 @@ function populateProfileForm() {{
     const samples = getPath(profile, 'outreach.writing_samples');
     outreachSamples.value = Array.isArray(samples) ? samples.join('\\n\\n---\\n\\n') : '';
   }}
+  const outreachWeekdays = getPath(profile, 'outreach.schedule.weekdays');
+  document.querySelectorAll('[data-outreach-weekday]').forEach(input => {{
+    input.checked = Array.isArray(outreachWeekdays)
+      ? outreachWeekdays.includes(Number(input.value))
+      : Number(input.value) < 5;
+  }});
   renderTagEditors();
   const passwordInput = document.querySelector('[data-profile-password]');
   passwordInput.value = '';
@@ -2374,6 +2400,9 @@ function collectProfileForm() {{
     setPath(profile, 'outreach.writing_samples', outreachSamples.value
       .split(/^\\s*---\\s*$/m).map(value => value.trim()).filter(Boolean));
   }}
+  setPath(profile, 'outreach.schedule.weekdays', Array.from(
+    document.querySelectorAll('[data-outreach-weekday]:checked')
+  ).map(input => Number(input.value)));
   const password = document.querySelector('[data-profile-password]').value;
   if (password) setPath(profile, 'personal.password', password);
   return profile;
@@ -3055,6 +3084,7 @@ function openWorkspaceTab(tab) {{
 }}
 
 let outreachPollTimer = null;
+let gmailOutreachAccount = null;
 async function loadWorkspaceOutreach() {{
   window.clearTimeout(outreachPollTimer);
   const target = document.getElementById('workspace-outreach-content');
@@ -3070,9 +3100,13 @@ async function loadWorkspaceOutreach() {{
       return;
     }}
     if (!response.ok) throw new Error(payload.error || 'Could not load outreach');
+    gmailOutreachAccount = payload.gmail_account || null;
     renderWorkspaceOutreach(payload.batch);
-    if (['queued', 'preparing', 'sending'].includes(payload.batch.status)) {{
-      outreachPollTimer = window.setTimeout(loadWorkspaceOutreach, 2500);
+    if (['queued', 'preparing', 'sending', 'scheduled', 'partial_failed'].includes(payload.batch.status)) {{
+      outreachPollTimer = window.setTimeout(
+        loadWorkspaceOutreach,
+        ['scheduled', 'partial_failed'].includes(payload.batch.status) ? 30000 : 2500
+      );
     }}
   }} catch (error) {{
     target.innerHTML = `<div class="empty-state"><div><h2>Outreach unavailable</h2><p>${{safeHtml(error.message)}}</p></div></div>`;
@@ -3083,26 +3117,38 @@ function renderWorkspaceOutreach(batch) {{
   const target = document.getElementById('workspace-outreach-content');
   const editable = ['ready_for_review', 'failed', 'partial_failed'].includes(batch.status);
   const recipients = batch.recipients || [];
+  const timezone = getPath(settingsState?.profile || {{}}, 'outreach.schedule.timezone') || 'America/Toronto';
+  const formatScheduled = value => value
+    ? new Intl.DateTimeFormat(undefined, {{dateStyle: 'medium', timeStyle: 'short', timeZone: timezone}}).format(new Date(value))
+    : '';
   const cards = recipients.map(recipient => `
     <article class="content-card outreach-recipient" data-outreach-recipient="${{safeHtml(recipient.id)}}">
       <div class="outreach-recipient-head">
-        <input type="checkbox" data-outreach-selected ${{recipient.status === 'ready' || recipient.status === 'failed' ? 'checked' : ''}} ${{editable ? '' : 'disabled'}}>
+        <input type="checkbox" data-outreach-selected ${{recipient.status === 'ready' || recipient.status === 'failed' ? 'checked' : ''}} ${{editable && ['ready', 'needs_edit', 'failed'].includes(recipient.status) ? '' : 'disabled'}}>
         <div><strong>${{safeHtml([recipient.first_name, recipient.last_name].filter(Boolean).join(' ') || recipient.email)}}</strong>
           <small>${{safeHtml(recipient.title || 'Employee')}} · ${{safeHtml(recipient.email)}} · ${{safeHtml(recipient.status)}}</small>
+          ${{recipient.scheduled_for ? `<small>Wave ${{safeHtml(recipient.wave)}} · ${{safeHtml(formatScheduled(recipient.scheduled_for))}} (${{safeHtml(timezone)}})</small>` : ''}}
+          ${{recipient.gmail_draft_id ? `<small>Gmail draft in ${{safeHtml(recipient.gmail_account_email || '')}} · Not sent by ApplyPilot</small>` : ''}}
           <small>${{safeHtml(recipient.relevance_reason || '')}}</small></div>
       </div>
-      <div class="field"><label>Subject</label><input type="text" maxlength="200" data-outreach-subject value="${{safeHtml(recipient.subject || '')}}" ${{editable ? '' : 'disabled'}}></div>
-      <div class="field"><label>Message</label><textarea rows="8" maxlength="4000" data-outreach-body ${{editable ? '' : 'disabled'}}>${{safeHtml(recipient.body_text || '')}}</textarea></div>
+      <div class="field"><label>Subject</label><input type="text" maxlength="200" data-outreach-subject value="${{safeHtml(recipient.subject || '')}}" ${{editable && ['ready', 'needs_edit', 'failed'].includes(recipient.status) ? '' : 'disabled'}}></div>
+      <div class="field"><label>Message</label><textarea rows="8" maxlength="4000" data-outreach-body ${{editable && ['ready', 'needs_edit', 'failed'].includes(recipient.status) ? '' : 'disabled'}}>${{safeHtml(recipient.body_text || '')}}</textarea></div>
       ${{recipient.error ? `<p class="settings-status error">${{safeHtml(recipient.error)}}</p>` : ''}}
-      ${{editable && !['sent', 'sending', 'suppressed'].includes(recipient.status) ? `<button class="danger-button" type="button" onclick="suppressOutreachRecipient('${{safeHtml(recipient.id)}}')">Never contact</button>` : ''}}
+      ${{recipient.status === 'drafting' ? `<button class="secondary-button" type="button" onclick="resetUncertainGmailDraft('${{safeHtml(recipient.id)}}')">I checked Gmail; no draft exists</button>` : ''}}
+      ${{editable && !['sent', 'sending', 'drafting', 'drafted', 'suppressed'].includes(recipient.status) ? `<button class="danger-button" type="button" onclick="suppressOutreachRecipient('${{safeHtml(recipient.id)}}')">Never contact</button>` : ''}}
     </article>`).join('');
   target.innerHTML = `<div class="outreach-header"><div><h2>Employee outreach</h2><p class="resume-meta">Status: ${{safeHtml(batch.status)}}${{batch.company_domain ? ` · ${{safeHtml(batch.company_domain)}}` : ''}}</p></div></div>
     ${{batch.error ? `<p class="settings-status error">${{safeHtml(batch.error)}}</p>` : ''}}
+    ${{batch.status === 'drafting' ? '<p class="settings-status error">Gmail draft creation was interrupted or its outcome is uncertain. Check Gmail Drafts before trying to create more.</p>' : ''}}
+    ${{recipients.some(recipient => recipient.status === 'scheduled') ? '<p class="settings-status error">This batch still has legacy Apollo sends scheduled. Cancel remaining sends if you no longer want ApplyPilot to send them.</p>' : ''}}
     ${{cards || '<div class="empty-state">No eligible recipients are available yet.</div>'}}
     <div class="outreach-actions">
-      ${{editable && recipients.length ? '<button class="primary-button" type="button" onclick="approveWorkspaceOutreach()">Approve and send selected</button>' : ''}}
-      ${{['failed', 'partial_failed'].includes(batch.status) ? '<button class="secondary-button" type="button" onclick="retryWorkspaceOutreach()">Retry failed</button>' : ''}}
-      ${{!['sending', 'completed', 'cancelled'].includes(batch.status) ? '<button class="danger-button" type="button" onclick="cancelWorkspaceOutreach()">Cancel batch</button>' : ''}}
+      ${{editable && recipients.some(recipient => ['ready', 'needs_edit', 'failed'].includes(recipient.status)) ? '<button class="primary-button" type="button" onclick="createWorkspaceGmailDrafts()">Create selected Gmail drafts</button>' : ''}}
+      ${{editable && !gmailOutreachAccount ? '<p class="resume-meta">Connect Gmail first: run <code>applypilot gmail-connect --credentials /path/to/oauth-client.json</code></p>' : ''}}
+      ${{recipients.some(recipient => recipient.status === 'drafted') ? `<a class="secondary-button" href="https://mail.google.com/mail/?authuser=${{encodeURIComponent(recipients.find(item => item.gmail_account_email)?.gmail_account_email || gmailOutreachAccount || '')}}#drafts" target="_blank" rel="noopener noreferrer">Open Gmail Drafts</a>` : ''}}
+      ${{['failed', 'partial_failed'].includes(batch.status) && !recipients.length ? '<button class="secondary-button" type="button" onclick="retryWorkspaceOutreach()">Retry preparation</button>' : ''}}
+      ${{recipients.some(recipient => recipient.status === 'scheduled') ? '<button class="danger-button" type="button" onclick="cancelPendingOutreach()">Cancel remaining sends</button>' : ''}}
+      ${{!['sending', 'drafting', 'drafted', 'completed', 'cancelled'].includes(batch.status) ? '<button class="danger-button" type="button" onclick="cancelWorkspaceOutreach()">Cancel batch</button>' : ''}}
       ${{batch.status === 'cancelled' ? '<button class="danger-button" type="button" onclick="clearWorkspaceOutreach()">Clear outreach</button>' : ''}}
     </div>`;
   target.dataset.batchId = batch.id;
@@ -3115,14 +3161,21 @@ async function outreachAction(path, body) {{
   renderWorkspaceOutreach(payload.batch);
 }}
 
-async function approveWorkspaceOutreach() {{
+async function createWorkspaceGmailDrafts() {{
   const target = document.getElementById('workspace-outreach-content');
   const recipients = Array.from(target.querySelectorAll('[data-outreach-recipient]'))
     .filter(card => card.querySelector('[data-outreach-selected]').checked)
     .map(card => ({{id: card.dataset.outreachRecipient, subject: card.querySelector('[data-outreach-subject]').value.trim(), body_text: card.querySelector('[data-outreach-body]').value.trim()}}));
   if (!recipients.length) return window.alert('Select at least one recipient.');
-  if (!window.confirm(`Send ${{recipients.length}} reviewed email${{recipients.length === 1 ? '' : 's'}} from your connected Apollo mailbox?`)) return;
-  try {{ await outreachAction('approve', {{batch_id: target.dataset.batchId, recipients, confirmed: true}}); }}
+  if (!gmailOutreachAccount) return window.alert('Connect Gmail first with applypilot gmail-connect --credentials PATH, then reload this page.');
+  if (!window.confirm(`Create ${{recipients.length}} unsent draft${{recipients.length === 1 ? '' : 's'}} in ${{gmailOutreachAccount}}? ApplyPilot will not send them. Review and schedule each draft in Gmail.`)) return;
+  try {{ await outreachAction('gmail-drafts', {{batch_id: target.dataset.batchId, recipients, confirmed_account: gmailOutreachAccount}}); }}
+  catch (error) {{ window.alert(error.message); }}
+}}
+
+async function resetUncertainGmailDraft(recipientId) {{
+  if (!window.confirm('First check Gmail Drafts for this exact recipient and subject. Confirm only if no matching draft exists; otherwise retrying could create a duplicate. Have you checked and found no draft?')) return;
+  try {{ await outreachAction('reset-gmail-draft', {{recipient_id: recipientId, confirmed_no_draft: true}}); }}
   catch (error) {{ window.alert(error.message); }}
 }}
 
@@ -3135,6 +3188,13 @@ async function cancelWorkspaceOutreach() {{
   const target = document.getElementById('workspace-outreach-content');
   if (!window.confirm('Cancel this unsent outreach batch?')) return;
   try {{ await outreachAction('cancel', {{batch_id: target.dataset.batchId}}); }} catch (error) {{ window.alert(error.message); }}
+}}
+
+async function cancelPendingOutreach() {{
+  const target = document.getElementById('workspace-outreach-content');
+  if (!window.confirm('Cancel every outreach email that has not started sending? Sent emails will be kept.')) return;
+  try {{ await outreachAction('cancel-pending', {{batch_id: target.dataset.batchId}}); }}
+  catch (error) {{ window.alert(error.message); }}
 }}
 
 async function clearWorkspaceOutreach() {{

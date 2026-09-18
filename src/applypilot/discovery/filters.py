@@ -118,7 +118,8 @@ def reconcile_unscored_jobs(
     rows = conn.execute(
         "SELECT url, title, discovery_status, discovery_rejection_reason, discovery_checked_at "
         "FROM jobs WHERE fit_score IS NULL "
-        "AND tailored_resume_path IS NULL AND applied_at IS NULL"
+        "AND tailored_resume_path IS NULL AND applied_at IS NULL "
+        "AND COALESCE(strategy, '') != 'external_upload'"
     ).fetchall()
     now = datetime.now(timezone.utc).isoformat()
     accepted = 0

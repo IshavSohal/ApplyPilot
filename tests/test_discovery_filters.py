@@ -188,6 +188,28 @@ def test_reconciliation_leaves_scored_tailored_and_applied_jobs_untouched(tmp_pa
     assert [row[0] for row in statuses] == ["accepted", "accepted", "accepted"]
 
 
+def test_reconciliation_leaves_manual_external_imports_accepted(tmp_path) -> None:
+    conn = init_db(tmp_path / "external-import.db")
+    conn.execute(
+        "INSERT INTO jobs (url, title, strategy, discovery_status) VALUES (?, ?, ?, ?)",
+        (
+            "https://example.com/imported-job",
+            "Imported job from example.com",
+            "external_upload",
+            "accepted",
+        ),
+    )
+    conn.commit()
+
+    result = reconcile_unscored_jobs(conn, APP_AI_CONFIG)
+
+    assert result["checked"] == 0
+    row = conn.execute(
+        "SELECT discovery_status, discovery_rejection_reason FROM jobs"
+    ).fetchone()
+    assert tuple(row) == ("accepted", None)
+
+
 def test_workday_rejects_titles_before_returning_jobs_for_detail_fetch(monkeypatch) -> None:
     monkeypatch.setattr(
         workday,

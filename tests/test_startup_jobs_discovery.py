@@ -85,21 +85,21 @@ def test_run_startup_jobs_filters_persists_and_prefers_direct_source(monkeypatch
             "location": "Remote, Toronto, Canada", "url": "https://startup.jobs/new-1",
             "application_url": "https://startup.jobs/new-1",
             "content": "A complete startup engineering description. " * 20,
-            "salary": None, "posted_at": "2026-09-01T12:00:00Z",
+                "salary": None, "posted_at": "2026-09-09T12:00:00Z",
         },
         {
             "title": "Backend Engineer", "company": "Direct Co", "company_logo": None,
             "location": "Toronto, Canada", "url": "https://startup.jobs/duplicate-2",
             "application_url": "https://startup.jobs/duplicate-2",
             "content": "Duplicate role. " * 20, "salary": None,
-            "posted_at": "2026-09-01T12:00:00Z",
+                "posted_at": "2026-09-09T12:00:00Z",
         },
         {
             "title": "Sales Director", "company": "Other Co", "company_logo": None,
             "location": "Toronto, Canada", "url": "https://startup.jobs/rejected-3",
             "application_url": "https://startup.jobs/rejected-3",
             "content": "Wrong title. " * 20, "salary": None,
-            "posted_at": "2026-09-01T12:00:00Z",
+                "posted_at": "2026-09-09T12:00:00Z",
         },
     ])
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -361,10 +362,26 @@ def dashboard(
 
 
 @app.command()
+def gmail_connect(
+    credentials: Path = typer.Option(..., "--credentials", help="Google OAuth Desktop app credentials JSON."),
+) -> None:
+    """Connect a personal Gmail account for draft creation only."""
+    from applypilot.outreach.gmail import connect_gmail
+
+    try:
+        email = connect_gmail(credentials)
+    except Exception as exc:  # noqa: BLE001 - OAuth providers can raise several error classes
+        console.print(f"[red]Gmail connection failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Connected Gmail Drafts:[/green] {email}")
+    console.print("ApplyPilot will create drafts only. Schedule or send them yourself in Gmail.")
+
+
+@app.command()
 def outreach(
     url: str = typer.Option(..., "--url", help="Applied job URL."),
     prepare: bool = typer.Option(False, "--prepare", help="Prepare or re-prepare an unsent batch."),
-    retry: bool = typer.Option(False, "--retry", help="Retry failed preparation or sends."),
+    retry: bool = typer.Option(False, "--retry", help="Retry failed preparation or legacy Apollo sends."),
 ) -> None:
     """Inspect or recover an outreach batch. Sending still requires dashboard approval."""
     _bootstrap()
@@ -508,22 +525,31 @@ def doctor() -> None:
     if outreach_enabled:
         if not os.environ.get("APOLLO_API_KEY"):
             results.append(("Apollo API", fail_mark, "Set APOLLO_API_KEY before enabling outreach"))
-        elif not os.environ.get("APOLLO_EMAIL_ACCOUNT_ID"):
-            results.append(("Apollo mailbox", fail_mark, "Set APOLLO_EMAIL_ACCOUNT_ID to a linked mailbox"))
         else:
             try:
                 from applypilot.outreach.apollo import ApolloClient
                 apollo = ApolloClient()
                 apollo.health()
-                account_id = os.environ["APOLLO_EMAIL_ACCOUNT_ID"]
-                account = next((item for item in apollo.email_accounts() if str(item.get("id")) == account_id), None)
-                if account:
-                    address = account.get("email") or account.get("email_address") or account_id
-                    results.append(("Apollo mailbox", ok_mark, f"Replies will arrive at {address}"))
+                results.append(("Apollo API", ok_mark, "People discovery available"))
+                account_id = os.environ.get("APOLLO_EMAIL_ACCOUNT_ID")
+                if account_id:
+                    account = next((item for item in apollo.email_accounts() if str(item.get("id")) == account_id), None)
+                    if account:
+                        address = account.get("email") or account.get("email_address") or account_id
+                        results.append(("Apollo mailbox", ok_mark, f"Legacy Apollo sends use {address}"))
+                    else:
+                        results.append(("Apollo mailbox", fail_mark, "Configured mailbox is not linked to this Apollo user"))
                 else:
-                    results.append(("Apollo mailbox", fail_mark, "Configured mailbox is not linked to this Apollo user"))
+                    results.append(("Apollo mailbox", "[dim]optional[/dim]", "Only needed for legacy Apollo scheduled sends"))
             except Exception as exc:
                 results.append(("Apollo API", fail_mark, str(exc)[:120]))
+        from applypilot.outreach.gmail import connected_account
+        gmail_email = connected_account()
+        results.append((
+            "Gmail Drafts",
+            ok_mark if gmail_email else "[dim]optional[/dim]",
+            gmail_email or "Run applypilot gmail-connect --credentials PATH to create drafts",
+        ))
         try:
             samples = load_profile().get("outreach", {}).get("writing_samples", [])
             marker = ok_mark if len(samples) >= 3 else fail_mark

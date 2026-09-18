@@ -3,10 +3,13 @@
 from applypilot.outreach.service import (
     approve_batch,
     cancel_batch,
+    cancel_pending,
     clear_cancelled_batch,
+    dispatch_due_outreach,
     enqueue_for_job,
     get_batch,
     prepare_batch,
+    recover_outreach_dispatcher,
     retry_batch,
     suppress_recipient,
 )
@@ -14,10 +17,13 @@ from applypilot.outreach.service import (
 __all__ = [
     "approve_batch",
     "cancel_batch",
+    "cancel_pending",
     "clear_cancelled_batch",
+    "dispatch_due_outreach",
     "enqueue_for_job",
     "get_batch",
     "prepare_batch",
+    "recover_outreach_dispatcher",
     "retry_batch",
     "suppress_recipient",
 ]

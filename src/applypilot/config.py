@@ -17,6 +17,8 @@ RESUME_TEX_PATH = APP_DIR / "resume.tex"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
+GMAIL_TOKEN_PATH = APP_DIR / "gmail_oauth_token.json"
+GMAIL_ACCOUNT_PATH = APP_DIR / "gmail_account.json"
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"

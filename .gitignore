@@ -5,6 +5,10 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+client_secret*.json
+oauth-client*.json
+gmail_oauth_token.json
+gmail_account.json
 
 # Runtime artifacts
 *.db

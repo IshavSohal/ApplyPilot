@@ -195,6 +195,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             apollo_person_id TEXT NOT NULL,
             apollo_contact_id TEXT,
             apollo_message_id TEXT,
+            gmail_draft_id TEXT,
+            gmail_account_email TEXT,
             first_name TEXT,
             last_name TEXT,
             title TEXT,
@@ -209,6 +211,10 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             status TEXT NOT NULL DEFAULT 'ready',
             error TEXT,
             sent_at TEXT,
+            scheduled_for TEXT,
+            wave INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(batch_id, apollo_person_id),
@@ -245,6 +251,12 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    ensure_outreach_columns(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outreach_recipients_due "
+        "ON outreach_recipients(status, scheduled_for)"
+    )
+    conn.commit()
     normalize_relative_posted_dates(conn)
 
     return conn
@@ -298,6 +310,15 @@ _ALL_COLUMNS: dict[str, str] = {
     "verification_confidence": "TEXT",
 }
 
+_OUTREACH_RECIPIENT_COLUMNS: dict[str, str] = {
+    "scheduled_for": "TEXT",
+    "wave": "INTEGER",
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_attempt_at": "TEXT",
+    "gmail_draft_id": "TEXT",
+    "gmail_account_email": "TEXT",
+}
+
 
 def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     """Add any missing columns to the jobs table (forward migration).
@@ -332,6 +353,23 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     if added:
         conn.commit()
 
+    return added
+
+
+def ensure_outreach_columns(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Forward-migrate durable outreach scheduling fields."""
+    if conn is None:
+        conn = get_connection()
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(outreach_recipients)").fetchall()
+    }
+    added: list[str] = []
+    for column, dtype in _OUTREACH_RECIPIENT_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE outreach_recipients ADD COLUMN {column} {dtype}")
+            added.append(column)
+    if added:
+        conn.commit()
     return added
 
 
