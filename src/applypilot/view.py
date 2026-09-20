@@ -25,6 +25,24 @@ from applypilot.database import get_connection, normalize_posted_at
 
 console = Console()
 
+# Apollo outreach first shipped in this commit. Applications before it have no
+# draft workflow to finish, so keep them with completed applications.
+OUTREACH_INTRODUCED_AT = datetime.fromisoformat("2026-09-10T23:26:04-04:00")
+
+
+def applied_view(applied_at: str | None, has_email_draft: bool = False) -> str:
+    """Classify an application for the dashboard's two applied tabs."""
+    if not applied_at:
+        return "active"
+    try:
+        timestamp = datetime.fromisoformat(applied_at)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+    except ValueError:
+        # Unknown dates should stay visible as needing review, not silently done.
+        return "drafts_done" if has_email_draft else "needs_drafts"
+    return "drafts_done" if has_email_draft or timestamp < OUTREACH_INTRODUCED_AT else "needs_drafts"
+
 
 _JOB_SECTION_HEADING_RE = re.compile(
     r"^(?:"
@@ -212,7 +230,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
                (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
                 WHERE b.job_url = jobs.url AND r.status = 'sent') AS outreach_sent,
                (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
-                WHERE b.job_url = jobs.url AND r.status = 'failed') AS outreach_failed
+                WHERE b.job_url = jobs.url AND r.status = 'failed') AS outreach_failed,
+               (SELECT COUNT(*) FROM outreach_recipients r JOIN outreach_batches b ON b.id = r.batch_id
+                 WHERE b.job_url = jobs.url AND
+                       (r.gmail_draft_id IS NOT NULL OR r.apollo_message_id IS NOT NULL)) AS email_draft_count
         FROM jobs
         WHERE COALESCE(discovery_status, 'accepted') = 'accepted'
         """
@@ -259,7 +280,20 @@ def generate_dashboard(output_path: str | None = None) -> str:
         has_pdf = bool(stored and stored.with_suffix(".pdf").is_file())
         has_tex = bool(stored and stored.suffix.lower() == ".tex" and stored.is_file())
         has_report = bool(stored and stored.with_name(f"{stored.stem}_REPORT.json").is_file())
-        status = "Applied" if job["applied_at"] else ("Tailored" if stored else ("Scored" if job["fit_score"] is not None else "Discovered"))
+        applied_tab = applied_view(job["applied_at"], bool(job["email_draft_count"]))
+        if applied_tab == "drafts_done":
+            if job["outreach_status"] == "completed":
+                status = "Outreach sent"
+            else:
+                status = "Drafts created" if job["email_draft_count"] else "Applied (legacy)"
+        elif applied_tab == "needs_drafts":
+            status = "Needs drafts"
+        elif stored:
+            status = "Tailored"
+        elif job["fit_score"] is not None:
+            status = "Scored"
+        else:
+            status = "Discovered"
         payload = {
             "url": job["url"] or "",
             "title": job["title"] or "Untitled role",
@@ -280,6 +314,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             "description": job["full_description"] or job["description"] or "",
             "application_url": job["application_url"] or job["url"] or "",
             "applied": bool(job["applied_at"]),
+            "applied_tab": applied_tab,
             "status": status,
             "has_tailored": bool(stored),
             "has_pdf": has_pdf,
@@ -322,7 +357,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
         "tailored": sum(
             not job["applied"] and job["has_tailored"] for job in workspace_jobs
         ),
-        "applied": sum(job["applied"] for job in workspace_jobs),
+        "needs_drafts": sum(job["applied_tab"] == "needs_drafts" for job in workspace_jobs),
+        "drafts_done": sum(job["applied_tab"] == "drafts_done" for job in workspace_jobs),
     }
 
     # Color map per site
@@ -420,6 +456,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         ))
         applied_label = escape(format_applied_at(j["applied_at"]))
         is_applied = bool(j["applied_at"])
+        applied_tab = applied_view(j["applied_at"], bool(j["email_draft_count"]))
 
         meta_parts = []
         if priority:
@@ -494,7 +531,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             )
 
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-applied="{str(is_applied).lower()}"
+        <div class="job-card" data-score="{score}" data-applied="{str(is_applied).lower()}" data-applied-tab="{applied_tab}"
              data-site="{site_value}" data-location="{location.lower()}">
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{"&mdash;" if score == 0 else score}</span>
@@ -1135,7 +1172,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
         <div class="inbox-filters" aria-label="Job status">
           <button class="inbox-filter active" type="button" data-workspace-filter="jobs">Jobs ({workspace_filter_counts['jobs']})</button>
           <button class="inbox-filter" type="button" data-workspace-filter="tailored">Tailored ({workspace_filter_counts['tailored']})</button>
-          <button class="inbox-filter" type="button" data-workspace-filter="applied">Applied ({workspace_filter_counts['applied']})</button>
+          <button class="inbox-filter" type="button" data-workspace-filter="needs_drafts">Needs drafts ({workspace_filter_counts['needs_drafts']})</button>
+          <button class="inbox-filter" type="button" data-workspace-filter="drafts_done">Drafts done / legacy ({workspace_filter_counts['drafts_done']})</button>
         </div>
         <select id="workspace-score-filter" class="workspace-score-filter" aria-label="Filter jobs by score">
           <option value="all">Score · All</option>
@@ -1288,8 +1326,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <button class="tab-btn active" data-tab="active" onclick="switchTab('active')">
     Active postings ({active_count})
   </button>
-  <button class="tab-btn" data-tab="applied" onclick="switchTab('applied')">
-    Applied ({applied_count})
+  <button class="tab-btn" data-tab="needs_drafts" onclick="switchTab('needs_drafts')">
+    Needs drafts ({workspace_filter_counts['needs_drafts']})
+  </button>
+  <button class="tab-btn" data-tab="drafts_done" onclick="switchTab('drafts_done')">
+    Drafts done / legacy ({workspace_filter_counts['drafts_done']})
   </button>
 </nav>
 
@@ -1724,7 +1765,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
 let minScore = 0;
 let searchText = '';
 let selectedSource = '';
-let currentTab = window.location.hash === '#applied' ? 'applied' : 'active';
+let currentTab = ['#applied', '#needs_drafts'].includes(window.location.hash)
+  ? 'needs_drafts' : (window.location.hash === '#drafts_done' ? 'drafts_done' : 'active');
 const importForm = document.getElementById('job-import-form');
 const importInput = document.getElementById('job-url');
 const importButton = document.getElementById('job-import-button');
@@ -2075,7 +2117,7 @@ function switchTab(tab) {{
   document.querySelectorAll('.tab-btn').forEach(button => {{
     button.classList.toggle('active', button.dataset.tab === tab);
   }});
-  history.replaceState(null, '', tab === 'applied' ? '#applied' : window.location.pathname);
+  history.replaceState(null, '', tab === 'active' ? window.location.pathname : '#' + tab);
   applyFilters();
 }}
 
@@ -2106,7 +2148,9 @@ function applyFilters() {{
     const scoreMatch = score >= minScore;
     const textMatch = !searchText || text.includes(searchText);
     const sourceMatch = !selectedSource || card.dataset.site.toLowerCase() === selectedSource;
-    const tabMatch = card.dataset.applied === String(currentTab === 'applied');
+    const tabMatch = currentTab === 'active'
+      ? card.dataset.applied === 'false'
+      : card.dataset.appliedTab === currentTab;
     if (scoreMatch && textMatch && sourceMatch && tabMatch) {{
       card.classList.remove('hidden');
       shown++;
@@ -2192,7 +2236,10 @@ document.addEventListener('click', async event => {{
     if (wasApplied) {{
       window.location.reload();
     }} else {{
-      if (card) card.dataset.applied = 'true';
+      if (card) {{
+        card.dataset.applied = 'true';
+        card.dataset.appliedTab = result.applied_tab || 'needs_drafts';
+      }}
       button.remove();
       applyFilters();
     }}
@@ -2221,7 +2268,7 @@ function switchView(view, updateHash = true) {{
   if (updateHash) {{
     const target = view === 'profile'
       ? '#profile'
-      : (currentTab === 'applied' ? '#applied' : window.location.pathname);
+      : (currentTab === 'active' ? window.location.pathname : '#' + currentTab);
     history.replaceState(null, '', target);
   }}
 }}
@@ -2839,7 +2886,7 @@ const workspaceJobs = JSON.parse(document.getElementById('workspace-jobs-data').
 let workspaceJob = workspaceJobs.find(job => !job.applied && !job.has_tailored) || null;
 let workspaceFilter = 'jobs';
 let workspaceScore = 'all';
-const workspaceCompanySelections = {{jobs: null, tailored: null, applied: null}};
+const workspaceCompanySelections = {{jobs: null, tailored: null, needs_drafts: null, drafts_done: null}};
 let workspacePdfScale = 1.2;
 let workspacePdfGeneration = 0;
 
@@ -3095,7 +3142,7 @@ async function loadWorkspaceOutreach() {{
     const payload = await response.json();
     if (response.status === 404) {{
       target.innerHTML = workspaceJob.applied
-        ? '<div class="empty-state"><div><h2>No outreach batch</h2><p>Enable Apollo outreach and prepare a batch for this application.</p></div></div>'
+        ? '<div class="empty-state"><div><h2>No outreach batch</h2><p>Prepare personalized emails for relevant employees at this company.</p><button class="primary-button" type="button" onclick="prepareWorkspaceOutreach(this)">Prepare outreach emails</button></div></div>'
         : '<div class="empty-state">Outreach becomes available after you apply.</div>';
       return;
     }}
@@ -3146,6 +3193,7 @@ function renderWorkspaceOutreach(batch) {{
       ${{editable && recipients.some(recipient => ['ready', 'needs_edit', 'failed'].includes(recipient.status)) ? '<button class="primary-button" type="button" onclick="createWorkspaceGmailDrafts()">Create selected Gmail drafts</button>' : ''}}
       ${{editable && !gmailOutreachAccount ? '<p class="resume-meta">Connect Gmail first: run <code>applypilot gmail-connect --credentials /path/to/oauth-client.json</code></p>' : ''}}
       ${{recipients.some(recipient => recipient.status === 'drafted') ? `<a class="secondary-button" href="https://mail.google.com/mail/?authuser=${{encodeURIComponent(recipients.find(item => item.gmail_account_email)?.gmail_account_email || gmailOutreachAccount || '')}}#drafts" target="_blank" rel="noopener noreferrer">Open Gmail Drafts</a>` : ''}}
+      ${{['ready_for_review', 'cancelled'].includes(batch.status) && recipients.some(recipient => ['ready', 'needs_edit', 'failed', 'cancelled'].includes(recipient.status)) ? '<button class="secondary-button" type="button" onclick="redraftWorkspaceOutreach(this)">Redraft emails</button>' : ''}}
       ${{['failed', 'partial_failed'].includes(batch.status) && !recipients.length ? '<button class="secondary-button" type="button" onclick="retryWorkspaceOutreach()">Retry preparation</button>' : ''}}
       ${{recipients.some(recipient => recipient.status === 'scheduled') ? '<button class="danger-button" type="button" onclick="cancelPendingOutreach()">Cancel remaining sends</button>' : ''}}
       ${{!['sending', 'drafting', 'drafted', 'completed', 'cancelled'].includes(batch.status) ? '<button class="danger-button" type="button" onclick="cancelWorkspaceOutreach()">Cancel batch</button>' : ''}}
@@ -3159,6 +3207,40 @@ async function outreachAction(path, body) {{
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || 'Outreach action failed');
   renderWorkspaceOutreach(payload.batch);
+  if (path === 'gmail-drafts' && payload.batch.recipients?.some(recipient => recipient.gmail_draft_id)) {{
+    workspaceJob.applied_tab = 'drafts_done';
+    workspaceJob.status = 'Drafts created';
+    const row = document.querySelector(`.inbox-job[data-workspace-index="${{workspaceJobs.indexOf(workspaceJob)}}"]`);
+    if (row) row.querySelector('.inbox-job-meta small').textContent = workspaceJob.status;
+    document.getElementById('workspace-job-meta').textContent = `${{workspaceJob.company}} · ${{workspaceJob.location}} · ${{workspaceJob.status}}`;
+    workspaceFilter = 'drafts_done';
+    document.querySelectorAll('.inbox-filter').forEach(item => item.classList.toggle('active', item.dataset.workspaceFilter === workspaceFilter));
+    updateWorkspaceFilterCounts();
+    renderWorkspaceCompanyFilter();
+    applyWorkspaceFilters();
+  }}
+}}
+
+async function prepareWorkspaceOutreach(button) {{
+  if (!workspaceJob?.applied) return window.alert('Mark this job as applied first.');
+  if (!window.confirm('Prepare outreach for this application? Finding verified work emails may use Apollo enrichment credits.')) return;
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Preparing…';
+  try {{
+    const response = await fetch('/api/outreach/prepare', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{job_url: workspaceJob.url}}),
+    }});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Could not prepare outreach');
+    await loadWorkspaceOutreach();
+  }} catch (error) {{
+    window.alert(error.message);
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }}
 }}
 
 async function createWorkspaceGmailDrafts() {{
@@ -3182,6 +3264,20 @@ async function resetUncertainGmailDraft(recipientId) {{
 async function retryWorkspaceOutreach() {{
   const target = document.getElementById('workspace-outreach-content');
   try {{ await outreachAction('retry', {{batch_id: target.dataset.batchId}}); }} catch (error) {{ window.alert(error.message); }}
+}}
+
+async function redraftWorkspaceOutreach(button) {{
+  const target = document.getElementById('workspace-outreach-content');
+  if (!window.confirm('Replace every editable subject and message in this batch with newly generated drafts? Your current edits will be overwritten.')) return;
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Redrafting…';
+  try {{ await outreachAction('redraft', {{batch_id: target.dataset.batchId}}); }}
+  catch (error) {{
+    window.alert(error.message);
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }}
 }}
 
 async function cancelWorkspaceOutreach() {{
@@ -3221,8 +3317,8 @@ document.querySelectorAll('.workspace-tab').forEach(button => button.addEventLis
 document.querySelectorAll('.inbox-job').forEach(row => row.addEventListener('click', () => renderWorkspaceJob(workspaceJobs[Number(row.dataset.workspaceIndex)])));
 
 function jobMatchesWorkspaceView(job, filter = workspaceFilter) {{
-  return filter === 'applied'
-    ? job.applied
+  return filter === 'needs_drafts' || filter === 'drafts_done'
+    ? job.applied_tab === filter
     : !job.applied && (filter === 'tailored' ? job.has_tailored : !job.has_tailored);
 }}
 
@@ -3298,9 +3394,10 @@ function updateWorkspaceFilterCounts() {{
   const counts = {{
     jobs: workspaceJobs.filter(job => !job.applied && !job.has_tailored && jobMatchesWorkspaceScore(job)).length,
     tailored: workspaceJobs.filter(job => !job.applied && job.has_tailored && jobMatchesWorkspaceScore(job)).length,
-    applied: workspaceJobs.filter(job => job.applied && jobMatchesWorkspaceScore(job)).length
+    needs_drafts: workspaceJobs.filter(job => job.applied_tab === 'needs_drafts' && jobMatchesWorkspaceScore(job)).length,
+    drafts_done: workspaceJobs.filter(job => job.applied_tab === 'drafts_done' && jobMatchesWorkspaceScore(job)).length
   }};
-  const labels = {{jobs: 'Jobs', tailored: 'Tailored', applied: 'Applied'}};
+  const labels = {{jobs: 'Jobs', tailored: 'Tailored', needs_drafts: 'Needs drafts', drafts_done: 'Drafts done / legacy'}};
   document.querySelectorAll('.inbox-filter').forEach(button => {{
     const filter = button.dataset.workspaceFilter;
     button.textContent = `${{labels[filter]}} (${{counts[filter]}})`;
@@ -3489,10 +3586,13 @@ document.getElementById('workspace-mark-applied').addEventListener('click', asyn
       return;
     }}
     workspaceJob.applied = applied;
+    workspaceJob.applied_tab = result.applied_tab || 'needs_drafts';
     workspaceJob.status = applied
-      ? 'Applied'
+      ? (workspaceJob.applied_tab === 'drafts_done' ? 'Drafts created' : 'Needs drafts')
       : (workspaceJob.has_tailored ? 'Tailored' : (workspaceJob.score == null ? 'Discovered' : 'Scored'));
-    workspaceFilter = applied ? 'applied' : 'jobs';
+    const row = document.querySelector(`.inbox-job[data-workspace-index="${{workspaceJobs.indexOf(workspaceJob)}}"]`);
+    if (row) row.querySelector('.inbox-job-meta small').textContent = workspaceJob.status;
+    workspaceFilter = applied ? workspaceJob.applied_tab : 'jobs';
     document.querySelectorAll('.inbox-filter').forEach(item => {{
       item.classList.toggle('active', item.dataset.workspaceFilter === workspaceFilter);
     }});

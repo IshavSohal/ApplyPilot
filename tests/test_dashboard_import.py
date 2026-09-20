@@ -38,7 +38,7 @@ from applypilot.dashboard_server import (
 )
 from applypilot.database import get_connection, init_db
 from applypilot.enrichment.detail import extract_job_metadata, scrape_detail_page
-from applypilot.view import format_applied_at, format_posted_at, generate_dashboard
+from applypilot.view import applied_view, format_applied_at, format_posted_at, generate_dashboard
 
 
 @pytest.fixture
@@ -1843,7 +1843,7 @@ def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     html = output.read_text(encoding="utf-8")
 
     assert "Active postings (2)" in html
-    assert "Applied (1)" in html
+    assert "1 applied" in html
     assert 'data-applied="false"' in html
     assert 'data-applied="true"' in html
     assert "Mark as applied" in html
@@ -1852,6 +1852,12 @@ def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert 'id="workspace-delete-job"' in html
     assert "deleteWorkspaceJob" in html
     assert "/api/jobs/delete" in html
+    assert "Redraft emails" in html
+    assert "redraftWorkspaceOutreach" in html
+    assert "outreachAction('redraft'" in html
+    assert "Prepare outreach emails" in html
+    assert "prepareWorkspaceOutreach" in html
+    assert "fetch('/api/outreach/prepare'" in html
     assert "All Sources" in html
     assert 'data-site="example.com"' in html
     assert "filterSource(this.value)" in html
@@ -1879,7 +1885,8 @@ def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "View raw JSON" in html
     assert 'data-workspace-filter="jobs">Jobs (1)' in html
     assert 'data-workspace-filter="tailored">Tailored (1)' in html
-    assert 'data-workspace-filter="applied">Applied (1)' in html
+    assert 'data-workspace-filter="needs_drafts">Needs drafts (1)' in html
+    assert 'data-workspace-filter="drafts_done">Drafts done / legacy (0)' in html
     assert 'id="workspace-score-filter"' in html
     assert '<option value="all">Score · All</option>' in html
     assert '<option value="10">Score · 10</option>' in html
@@ -1890,11 +1897,11 @@ def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert 'id="company-filter-search"' in html
     assert 'id="company-filter-select-all"' in html
     assert 'id="company-filter-clear"' in html
-    assert "const workspaceCompanySelections = {jobs: null, tailored: null, applied: null}" in html
+    assert "const workspaceCompanySelections = {jobs: null, tailored: null, needs_drafts: null, drafts_done: null}" in html
     assert "companySelection.has(job.company)" in html
     assert "function renderWorkspaceCompanyFilter()" in html
     assert "updateWorkspaceFilterCounts()" in html
-    assert "filter === 'applied'" in html
+    assert "filter === 'needs_drafts' || filter === 'drafts_done'" in html
     assert "filter === 'tailored' ? job.has_tailored : !job.has_tailored" in html
     assert "workspaceScore === 'all' || Number(job.score) === Number(workspaceScore)" in html
     assert "jobMatchesWorkspaceView(job) && jobMatchesWorkspaceScore(job)" in html
@@ -1986,6 +1993,50 @@ def test_dashboard_has_fit_and_applied_tabs(tmp_path, monkeypatch) -> None:
     assert "const value = input.value.trim();" in html
     assert "if (!value || values.includes(value)) return;" in html
     assert "if (event.key !== 'Enter') return;" in html
+
+
+def test_applied_tabs_use_draft_ids_and_pre_apollo_dates(tmp_path, monkeypatch) -> None:
+    connection = init_db(tmp_path / "dashboard.db")
+    connection.executemany(
+        "INSERT INTO jobs (url, title, company, applied_at) VALUES (?, ?, 'Example', ?)",
+        [
+            ("https://example.com/old", "Old application", "2026-09-11T03:26:03+00:00"),
+            ("https://example.com/pending", "Pending drafts", "2026-09-11T03:26:05+00:00"),
+            ("https://example.com/drafted", "Created drafts", "2026-09-11T03:26:05+00:00"),
+            ("https://example.com/sent", "Sent outreach", "2026-09-11T03:26:05+00:00"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO outreach_batches (id, job_url, status, created_at, updated_at) "
+        "VALUES ('batch-1', 'https://example.com/drafted', 'drafted', '', '')"
+    )
+    connection.execute(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, gmail_draft_id, status, created_at, updated_at) "
+        "VALUES ('recipient-1', 'batch-1', 'person-1', 'draft-1', 'drafted', '', '')"
+    )
+    connection.execute(
+        "INSERT INTO outreach_batches (id, job_url, status, created_at, updated_at) "
+        "VALUES ('batch-2', 'https://example.com/sent', 'completed', '', '')"
+    )
+    connection.execute(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, apollo_message_id, status, created_at, updated_at) "
+        "VALUES ('recipient-2', 'batch-2', 'person-2', 'message-1', 'sent', '', '')"
+    )
+    connection.commit()
+
+    import applypilot.view as view
+
+    monkeypatch.setattr(view, "get_connection", lambda: connection)
+    output = tmp_path / "dashboard.html"
+    generate_dashboard(str(output))
+    html = output.read_text(encoding="utf-8")
+    assert 'data-workspace-filter="needs_drafts">Needs drafts (1)' in html
+    assert 'data-workspace-filter="drafts_done">Drafts done / legacy (3)' in html
+    assert applied_view("2026-09-11T03:26:03+00:00") == "drafts_done"
+    assert applied_view("2026-09-11T03:26:05+00:00") == "needs_drafts"
+    assert applied_view("2026-09-11T03:26:05+00:00", True) == "drafts_done"
 
 
 def test_dashboard_cards_show_dates_and_sort_newest_within_score(

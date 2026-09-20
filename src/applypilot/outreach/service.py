@@ -63,7 +63,7 @@ PROHIBITED_PHRASES = (
     "make money",
 )
 ISHAV_INTRO_PREFIX = (
-    "I'm Ishav, a recent Computer Science graduate from the University of Toronto with "
+    "I'm Ishav, a recent Computer Science graduate from the University of Toronto with experience in "
 )
 
 
@@ -389,10 +389,71 @@ def _message_words(body: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", body))
 
 
-def _introduction_sentence(body: str) -> str:
-    """Return the first prose sentence after the recipient greeting."""
+def _introduction_sentence(body: str, candidate_first_name: str = "") -> str:
+    """Return the candidate's short biographical sentence after the greeting."""
     prose = re.sub(r"^hi\s+[^,\n]+,\s*", "", body.strip(), count=1, flags=re.IGNORECASE)
-    return re.split(r"(?<=[.!?])(?:\s+|$)", prose, maxsplit=1)[0].strip()
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])(?:\s+|$)", prose)
+        if sentence.strip()
+    ]
+    if candidate_first_name:
+        named_intro = re.compile(
+            rf"^(?:i'm|i am)\s+{re.escape(candidate_first_name)}\b",
+            re.IGNORECASE,
+        )
+        match = next((sentence for sentence in sentences if named_intro.search(sentence)), None)
+        if match:
+            return match
+    return sentences[0] if sentences else ""
+
+
+def _introduction_errors(body: str, candidate_first_name: str) -> list[str]:
+    """Check the introduction in both generated and reviewed outreach."""
+    introduction = _introduction_sentence(body, candidate_first_name)
+    intro_lower = introduction.casefold().replace("’", "'")
+    failures: list[str] = []
+    if candidate_first_name and candidate_first_name.casefold() not in intro_lower:
+        failures.append("message does not include a short biographical sentence with the candidate's name")
+    if not re.search(
+        r"\b(?:graduate|graduated|student|degree|university|college|studied)\b",
+        intro_lower,
+    ):
+        failures.append("biographical sentence does not establish the candidate's education")
+    if _message_words(introduction) > 35:
+        failures.append("biographical sentence is too detailed; keep it under 36 words")
+    if candidate_first_name.casefold() == "ishav":
+        required_prefix = ISHAV_INTRO_PREFIX.casefold()
+        if not intro_lower.startswith(required_prefix):
+            failures.append(f"biographical sentence must begin exactly with: {ISHAV_INTRO_PREFIX}")
+        else:
+            technical_clause = introduction[len(ISHAV_INTRO_PREFIX):].strip(" .")
+            if not technical_clause or _message_words(technical_clause) > 12:
+                failures.append(
+                    "biographical sentence must end with one or two concise, job-relevant technical areas"
+                )
+            if re.search(
+                r"\b(?:caching|fault tolerance|latency|throughput|scalability)\b",
+                technical_clause,
+                re.IGNORECASE,
+            ):
+                failures.append("biographical sentence contains overly detailed technical concerns")
+    return failures
+
+
+def _require_valid_reviewed_introductions(edits: list[tuple[str, str, str]]) -> None:
+    """Reject an edited intro before scheduling or creating external drafts."""
+    profile = config.load_profile()
+    personal = profile.get("personal") or {}
+    outreach = profile.get("outreach") or {}
+    candidate_name = str(personal.get("full_name") or outreach.get("signature") or "").strip()
+    if not candidate_name:
+        raise ValueError("Set a candidate name in the profile before approving outreach")
+    first_name = candidate_name.split()[0]
+    for recipient_id, _subject, body in edits:
+        failures = _introduction_errors(body, first_name)
+        if failures:
+            raise ValueError(f"Recipient {recipient_id}: {failures[0]}")
 
 
 def _introduction_employer(profile: dict, samples: list) -> str:
@@ -481,7 +542,6 @@ def _message_errors(
     seen_subjects: dict[str, str] = {}
     normalized_bodies: dict[str, str] = {}
     role = str(job.get("title") or "").strip()
-    location = str(job.get("location") or "").strip()
     job_link = _outreach_job_link(job)
     candidate_first_name = signature.strip().split()[0] if signature.strip() else ""
 
@@ -495,8 +555,9 @@ def _message_errors(
         body = str(item.get("body_text") or "").strip()
         first_name = str(recipient.get("first_name") or "").strip()
         lowered = f"{subject}\n{body}".lower().replace("’", "'")
-        if not subject or len(subject) > 200:
-            failures.append("subject is missing or too long")
+        subject_words = _message_words(subject)
+        if not subject or len(subject) > 70 or not 2 <= subject_words <= 8:
+            failures.append("subject must be 2-8 words and no more than 70 characters")
         if re.match(r"^(?:re|fwd?)\s*:", subject, flags=re.IGNORECASE):
             failures.append("subject falsely implies a reply or forward")
         letters = re.sub(r"[^A-Za-z]", "", subject)
@@ -516,52 +577,35 @@ def _message_errors(
                 failures.append(f"message uses prohibited phrase: {phrase}")
         if re.search(r"\burgent\b", lowered):
             failures.append("message uses urgency language")
+        if re.search(
+            r"\b(?:applied|applying)\s+(?:for|to)\s+the\s+exact\b.{0,80}\b(?:role|position)\b",
+            lowered,
+        ):
+            failures.append("message unnaturally describes the opening as an exact role")
+        questions = re.findall(r"[^.!?\n]*\?", body)
+        if len(questions) != 1:
+            failures.append("message must contain exactly one question")
+        elif _message_words(questions[0]) > 25:
+            failures.append("closing question must be no more than 25 words")
+        if re.search(
+            r"\b(?:coffee|15[- ]minute)\s+(?:chat|call|conversation|meeting)\b"
+            r"|\bhop on (?:a )?call\b"
+            r"|\b(?:open|available|free|willing)\s+to\s+(?:have\s+)?(?:a\s+)?(?:chat|talk|meet|call)\b",
+            lowered,
+        ):
+            failures.append("first-touch message asks for a chat, call, or meeting")
         count = _message_words(body)
-        if count < 90 or count > 150:
-            failures.append(f"message is {count} words; required range is 90-150")
+        if count < 70 or count > 120:
+            failures.append(f"message is {count} words; required range is 70-120")
         if first_name and not re.match(
             rf"^hi\s+{re.escape(first_name)}\s*,", body, flags=re.IGNORECASE
         ):
             failures.append(f"message must begin with 'Hi {first_name},'")
-        introduction = _introduction_sentence(body)
-        intro_lower = introduction.casefold().replace("’", "'")
-        if candidate_first_name and candidate_first_name.casefold() not in intro_lower:
-            failures.append("first sentence does not introduce the candidate by name")
-        if not re.search(
-            r"\b(?:graduate|graduated|student|degree|university|college|studied)\b",
-            intro_lower,
-        ):
-            failures.append("first sentence does not establish the candidate's education")
-        if _message_words(introduction) > 35:
-            failures.append("first sentence is too detailed; keep the introduction under 36 words")
-        if candidate_first_name.casefold() == "ishav":
-            required_prefix = ISHAV_INTRO_PREFIX.casefold()
-            if not intro_lower.startswith(required_prefix):
-                failures.append(
-                    f"first sentence must begin exactly with: {ISHAV_INTRO_PREFIX}"
-                )
-            else:
-                technical_clause = introduction[len(ISHAV_INTRO_PREFIX):].strip(" .")
-                if not technical_clause or _message_words(technical_clause) > 12:
-                    failures.append(
-                        "first sentence must end with one or two concise, job-relevant technical areas"
-                    )
-                if re.search(
-                    r"\b(?:caching|fault tolerance|latency|throughput|scalability)\b",
-                    technical_clause,
-                    re.IGNORECASE,
-                ):
-                    failures.append(
-                        "first sentence contains overly detailed technical concerns"
-                    )
-        if introduction_employer and introduction_employer.casefold() not in body.casefold():
-            failures.append(
-                f"message does not identify the current employer: {introduction_employer}"
-            )
+        failures.extend(_introduction_errors(body, candidate_first_name))
         if role and role.lower() not in body.lower():
-            failures.append("message does not mention the exact role")
-        if location and location.lower() not in body.lower():
-            failures.append("message does not mention the job location")
+            failures.append("message does not mention the job title")
+        if job_link and job_link not in body:
+            failures.append("message does not include the exact job-posting link")
         used_facts = item.get("used_facts")
         if not isinstance(used_facts, list) or not any(str(fact).strip() for fact in used_facts):
             failures.append("message has no source-backed used_fact")
@@ -624,26 +668,28 @@ def _generate_messages(job: dict, recipients: list[dict], research: dict, profil
             for page in research.get("official_pages", [])
         ],
     }
-    prompt = f"""Write one concise, human networking email per recipient after a job application.
+    prompt = f"""Write one punchy, human networking email per recipient after a job application. The goal is to earn a thoughtful reply that starts a useful professional exchange and improves the candidate's chance of an interview—not to summarize the resume.
 Return ONLY a JSON array with objects: person_id, subject, body_text, used_facts (array of short source-backed facts).
 
 Rules:
 - Silently infer the candidate's recurring formality, contractions, sentence length, vocabulary, directness, and sign-off from the writing samples. Reproduce those traits without copying unrelated facts.
-- 90-150 words, plain text, concise and ordinary rather than polished marketing prose. Begin exactly with "Hi [first name],".
+- Keep the complete email to 70-120 words. Use short sentences, concrete language, and plain text. Begin exactly with "Hi [first name],".
 - Let the email client wrap text naturally: never hard-wrap prose or insert a newline within a paragraph. Separate intentional paragraphs with one blank line.
 - Format the sign-off on exactly two lines, with the closing phrase on one line and the supplied signature on the next (for example, "Thanks,\nIshav Sohal"). Never place them together on one line.
-- The first prose sentence after the greeting must follow REQUIRED INTRODUCTION TEMPLATE below and be no more than 35 words. Replace its bracketed slot with only one or two broad technical areas relevant to this job, such as "backend systems and AI infrastructure."
-- Keep that first sentence high-level. Do not mention the target job or company there, and do not describe projects, responsibilities, accomplishments, tools, architecture, or detailed engineering concerns. Never put scalability, caching, fault tolerance, throughput, or latency in the first sentence.
-- When a current employer appears in INTRODUCTION REQUIREMENTS, identify the current role and employer in a separate short sentence. Do not attach project details to that sentence.
-- Only after this brief biographical introduction should you discuss the application and specific experience. Do not rely on the sign-off or assume the recipient has read your application or resume.
-- Explicitly say you applied for the exact role at the company, mention the job location, and include one grounded company or role detail. Give enough context that the recipient can identify the opening without looking anything up.
-- An optional job-posting reference may be included only if JOB POSTING LINK below is not null. If useful, put that exact URL once on its own line near the end; otherwise omit the link. Never invent, shorten, or change the URL, and never link to an application form, job board, or another site.
-- Connect that background detail to the grounded company or role detail so the introduction feels relevant, not like a pasted mini-resume. Keep it to one candidate fact, not a list of credentials.
-- Tailor the reason and low-pressure question to the recipient kind: recruiter = hiring process or role priorities; manager = team needs or qualities valued; peer = day-to-day work or team experience; leader = function direction or broader priorities.
+- Write a 2-8 word subject (70 characters maximum) around a specific role, team, company priority, or recipient-relevant angle. Make it informative and intriguing, not vague or clickbait. Avoid generic subjects such as "Job application," "Quick question," or "Exciting opportunity."
+- The first prose sentence after the greeting is the hook. In 22 words or fewer, lead with a source-backed detail about the role, company, or recipient and make the reason for writing immediately clear. Do not open with the candidate's biography, generic praise, or "I applied..." by itself. If no individual-specific fact is supplied, personalize to the recipient's function/title and the role; never invent a post, project, shared connection, or familiarity.
+- Follow the hook with one short biographical sentence that uses REQUIRED INTRODUCTION TEMPLATE below and is no more than 35 words. Keep the words "with experience in" before the technical areas; do not place technical areas directly after "with". Replace its bracketed slot with only one or two broad technical areas relevant to this job, such as "backend systems and AI infrastructure."
+- Keep that biographical sentence high-level. Do not describe multiple projects, responsibilities, tools, or detailed engineering concerns there. Never put scalability, caching, fault tolerance, throughput, or latency in it.
+- Then prove relevance with exactly one strong candidate fact: a closely matched accomplishment, skill, or project, preferably with a real outcome or metric. Connect it directly to a stated need in the role. Do not paste a mini-resume, stack credentials, or use unsupported claims. Mention the current employer only when it strengthens this proof.
+- State naturally that the candidate applied, naming the position with the supplied job title and company in either the hook or the next sentence. Prefer wording like "I applied for the Backend Engineer position at Example." Never write "the exact role," "the exact [job title] role," or otherwise insert "exact" into this sentence. Do not spend words repeating the location unless it is genuinely relevant to the connection.
+- If JOB POSTING LINK below is not null, include that exact URL once on its own line near the end so the recipient can immediately identify the opening. Introduce it briefly and naturally, such as "Role for context:". If JOB POSTING LINK is null, omit any job link. Never invent, shorten, or change the URL, and never link to an application form, job board, or another site.
+- State the intention plainly, then end with exactly one concise, insightful question. Ground it in a supplied role, company, or recipient detail and connect it to the recipient's function so it feels uniquely worth answering. Prefer a question about a real priority, tradeoff, challenge, or decision behind the work—not a fact available in the posting or on the company website.
+- Keep the question easy to answer in a reply and under 25 words. Do not ask multiple or compound questions. Do not ask for a coffee chat, call, meeting, referral, resume forwarding, application update, or interview. Those may follow later only if the employee's response supports them.
+- Tailor the question to the recipient kind: recruiter = a non-administrative insight into the role's most important near-term priority; manager = a concrete team tradeoff, challenge, or success measure; peer = a specific aspect of how the advertised work happens in practice; leader = how a stated company or function priority shapes this team. Avoid generic questions such as "What qualities do you value?", "What is the day-to-day like?", or "Do you have any advice?"
 - Explain why contacting this person's function makes sense; never claim they own the opening.
 - Use materially different wording, subject, opening, candidate connection, and question for every recipient.
 - Connect only to candidate facts supplied below. Never invent experience or company facts.
-- Avoid exaggerated enthusiasm, generic praise, invented familiarity, sales language, and automation-like filler.
+- Avoid bullets unless two very short proof points are both essential; prefer one strong proof point. Avoid exaggerated enthusiasm, generic praise, invented familiarity, sales language, and automation-like filler.
 - Never use: "I hope this email finds you well", "I came across your profile", "I wanted to reach out", "I'm reaching out", "pick your brain", "perfect fit", "aligns perfectly", "deeply impressed", "resonates with me", "unique opportunity", "leverage", "synergy", "urgent", "act now", "limited time", "guaranteed", "buy now", or "make money".
 - Subjects must not begin with Re: or Fwd:. Do not use emojis, all caps, repeated punctuation, citations, URLs other than the optional exact JOB POSTING LINK, tracking language, attachments, or an unsubscribe paragraph.
 - Match the writing samples' voice. End with the supplied signature.
@@ -1230,6 +1276,7 @@ def create_gmail_drafts(
         raise ValueError("A selected recipient is no longer eligible for a Gmail draft")
     if any(_is_suppressed(selected[item_id]["apollo_person_id"], selected[item_id]["email"], conn) for item_id in ids):
         raise ValueError("A selected recipient is suppressed")
+    _require_valid_reviewed_introductions(edits)
 
     conn.execute("SAVEPOINT gmail_draft_approval")
     try:
@@ -1357,6 +1404,7 @@ def approve_batch(
     selected_ids = [item[0] for item in normalized_edits]
     if len(set(selected_ids)) != len(selected_ids):
         raise ValueError("A recipient can only be selected once")
+    _require_valid_reviewed_introductions(normalized_edits)
     settings = schedule_settings()
     conn.execute("SAVEPOINT approve_outreach")
     try:
@@ -1627,6 +1675,113 @@ def retry_batch(identifier: str, *, conn: sqlite3.Connection | None = None, apol
         )
     _update_batch_after_send(batch["id"], conn)
     conn.commit()
+    return get_batch(batch["id"], conn) or {}
+
+
+def redraft_batch(identifier: str, *, conn: sqlite3.Connection | None = None) -> dict:
+    """Regenerate every editable message without searching or enriching people again."""
+    conn = conn or get_connection()
+    batch = _batch_row(identifier, conn)
+    if not batch:
+        raise ValueError("Outreach batch not found")
+    if batch["status"] not in {"ready_for_review", "failed", "cancelled"}:
+        raise ValueError("Only an unsent outreach batch can be redrafted")
+
+    rows = conn.execute(
+        "SELECT * FROM outreach_recipients WHERE batch_id = ? ORDER BY relevance_score DESC, created_at",
+        (batch["id"],),
+    ).fetchall()
+    if any(
+        row["status"] not in {"ready", "needs_edit", "failed", "cancelled", "suppressed"}
+        or row["gmail_account_email"] is not None
+        or row["gmail_draft_id"] is not None
+        or row["apollo_contact_id"] is not None
+        or row["apollo_message_id"] is not None
+        or row["sent_at"] is not None
+        for row in rows
+    ):
+        raise ValueError("This batch cannot be redrafted after drafting or sending has started")
+    editable_rows = [row for row in rows if row["status"] != "suppressed"]
+    if not editable_rows:
+        raise ValueError("This batch has no editable outreach emails")
+
+    job_row = conn.execute(
+        "SELECT * FROM jobs WHERE url = ?", (batch["job_url"],)
+    ).fetchone()
+    if not job_row or not job_row["applied_at"]:
+        raise ValueError("The job is no longer marked as applied")
+
+    claim_time = _now()
+    claimed = conn.execute(
+        "UPDATE outreach_batches SET status = 'preparing', error = NULL, updated_at = ? "
+        "WHERE id = ? AND status IN ('ready_for_review', 'failed', 'cancelled')",
+        (claim_time, batch["id"]),
+    ).rowcount
+    conn.commit()
+    if not claimed:
+        raise ValueError("This outreach batch is already being updated")
+
+    recipients = [
+        {
+            **dict(row),
+            "person_id": str(row["apollo_person_id"]),
+            "name": " ".join(
+                part for part in (row["first_name"], row["last_name"]) if part
+            ),
+            "candidate_kind": _candidate_kind(str(row["title"] or "")),
+        }
+        for row in editable_rows
+    ]
+    try:
+        messages = _generate_messages(
+            dict(job_row),
+            recipients,
+            _loads(batch["company_research_json"], {}),
+            config.load_profile(),
+        )
+        by_person_id = {
+            str(item.get("person_id")): item for item in messages if isinstance(item, dict)
+        }
+        if set(by_person_id) != {item["person_id"] for item in recipients}:
+            raise ValueError("The redraft did not return every editable recipient")
+
+        current = conn.execute(
+            "SELECT status, updated_at FROM outreach_batches WHERE id = ?", (batch["id"],)
+        ).fetchone()
+        if not current or current["status"] != "preparing" or current["updated_at"] != claim_time:
+            raise ValueError("This outreach batch changed while it was being redrafted")
+        for recipient in recipients:
+            item = by_person_id[recipient["person_id"]]
+            validation_errors = item.get("validation_errors") or []
+            conn.execute(
+                "UPDATE outreach_recipients SET subject = ?, body_text = ?, source_facts_json = ?, "
+                "status = ?, error = ?, updated_at = ? WHERE id = ? AND batch_id = ?",
+                (
+                    str(item.get("subject") or "")[:200],
+                    str(item.get("body_text") or "")[:4000],
+                    json.dumps(item.get("used_facts") or []),
+                    "needs_edit" if validation_errors else "ready",
+                    "; ".join(validation_errors)[:1000] or None,
+                    _now(),
+                    recipient["id"],
+                    batch["id"],
+                ),
+            )
+        conn.execute(
+            "UPDATE outreach_batches SET status = 'ready_for_review', error = NULL, "
+            "approved_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
+            (_now(), batch["id"]),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.execute(
+            "UPDATE outreach_batches SET status = ?, error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'preparing' AND updated_at = ?",
+            (batch["status"], str(exc)[:1000], _now(), batch["id"], claim_time),
+        )
+        conn.commit()
+        raise
     return get_batch(batch["id"], conn) or {}
 
 

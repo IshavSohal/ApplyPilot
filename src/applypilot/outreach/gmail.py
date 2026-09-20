@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import tempfile
@@ -12,6 +13,15 @@ from pathlib import Path
 from applypilot import config
 
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+
+
+def _html_body(body_text: str) -> str:
+    """Give Gmail flowing paragraphs while preserving intentional line breaks."""
+    body = body_text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = body.split("\n\n")
+    return "<div>" + "</div><div><br></div><div>".join(
+        html.escape(paragraph).replace("\n", "<br>") for paragraph in paragraphs
+    ) + "</div>"
 
 
 def _google_modules():
@@ -89,6 +99,7 @@ class GmailDraftClient:
         message["To"] = recipient_email
         message["Subject"] = subject
         message.set_content(body_text)
+        message.add_alternative(_html_body(body_text), subtype="html")
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
         result = self._service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
         draft_id = str(result.get("id") or "")

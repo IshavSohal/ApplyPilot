@@ -10,6 +10,7 @@ from applypilot.outreach.service import (
     get_batch,
     prepare_batch,
     recover_outreach_dispatcher,
+    redraft_batch,
     retry_batch,
     suppress_recipient,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "get_batch",
     "prepare_batch",
     "recover_outreach_dispatcher",
+    "redraft_batch",
     "retry_batch",
     "suppress_recipient",
 ]

@@ -29,7 +29,11 @@ class FakeGmail:
 
 
 @pytest.fixture
-def batch_db(tmp_path):
+def batch_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "applypilot.outreach.service.config.load_profile",
+        lambda: {"personal": {"full_name": "Test User"}},
+    )
     conn = init_db(tmp_path / "gmail.db")
     conn.execute(
         "INSERT INTO jobs (url, title, company, applied_at) VALUES (?, ?, ?, ?)",
@@ -52,7 +56,12 @@ def batch_db(tmp_path):
 
 def _edits(*ids):
     return [
-        {"id": item_id, "subject": f"Engineer application {item_id}", "body_text": f"Hi, this is {item_id}."}
+        {
+            "id": item_id,
+            "subject": f"Engineer application {item_id}",
+            "body_text": "Hi Morgan,\n\nI'm Test, a Computer Science graduate from Example University "
+                         "with experience in backend systems.",
+        }
         for item_id in ids
     ]
 
@@ -84,17 +93,50 @@ def test_gmail_draft_creation_removes_manual_hard_wraps(batch_db):
     edits = [{
         "id": "recipient-1",
         "subject": "Engineer application",
-        "body_text": "Hi Morgan,\n\nI applied for the Engineer role and have experience\nbuilding Python services.",
+        "body_text": "Hi Morgan,\n\nI'm Test, a Computer Science graduate from Example University "
+                     "with experience\nin backend systems. I applied for the Engineer role.",
     }]
 
     result = create_gmail_drafts(
         "batch-1", edits, confirmed_account="personal@gmail.com", conn=batch_db, gmail=gmail,
     )
 
-    expected = "Hi Morgan,\n\nI applied for the Engineer role and have experience building Python services."
+    expected = ("Hi Morgan,\n\nI'm Test, a Computer Science graduate from Example University "
+                "with experience in backend systems. I applied for the Engineer role.")
     assert gmail.created[0][2] == expected
     recipient = next(item for item in result["recipients"] if item["id"] == "recipient-1")
     assert recipient["body_text"] == expected
+
+
+def test_gmail_draft_creation_rechecks_edited_introduction(batch_db, monkeypatch):
+    monkeypatch.setattr(
+        "applypilot.outreach.service.config.load_profile",
+        lambda: {"personal": {"full_name": "Ishav Sohal"}},
+    )
+    gmail = FakeGmail()
+    bad_intro = (
+        "Hi Morgan,\n\nI'm Ishav, a recent Computer Science graduate from the University of Toronto "
+        "with AI infrastructure and backend systems."
+    )
+    edit = {"id": "recipient-1", "subject": "Engineer application", "body_text": bad_intro}
+
+    with pytest.raises(ValueError, match="biographical sentence must begin exactly"):
+        create_gmail_drafts(
+            "batch-1", [edit], confirmed_account="personal@gmail.com", conn=batch_db, gmail=gmail,
+        )
+
+    assert gmail.created == []
+    row = batch_db.execute(
+        "SELECT status, body_text FROM outreach_recipients WHERE id = 'recipient-1'"
+    ).fetchone()
+    assert (row["status"], row["body_text"]) == ("ready", "Original body")
+
+    edit["body_text"] = bad_intro.replace("with AI infrastructure", "with experience in AI infrastructure")
+    result = create_gmail_drafts(
+        "batch-1", [edit], confirmed_account="personal@gmail.com", conn=batch_db, gmail=gmail,
+    )
+    assert result["status"] == "drafted"
+    assert len(gmail.created) == 1
 
 
 def test_account_confirmation_and_legacy_schedule_guard(batch_db):
@@ -180,7 +222,7 @@ def test_ambiguous_failure_is_not_retried_automatically(batch_db):
     assert len(gmail.created) == 2
 
 
-def test_client_builds_plain_text_draft_without_sending():
+def test_client_builds_flowing_html_draft_with_plain_text_alternative_without_sending():
     calls = []
 
     class Request:
@@ -203,14 +245,24 @@ def test_client_builds_plain_text_draft_without_sending():
     client.email = "personal@gmail.com"
     client._service = Service()
     assert client.create_draft(
-        recipient_email="person@example.com", subject="Engineer role", body_text="Hi Pat,\n\nA short note."
+        recipient_email="person@example.com", subject="Engineer role",
+        body_text="Hi Pat,\n\nA short note about A&B <systems>.\nAnother sentence.\n\nThanks,\nIshav",
     ) == "gmail-draft-id"
     assert len(calls) == 1
     message = BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(calls[0][1]["message"]["raw"]))
     assert message["To"] == "person@example.com"
     assert message["From"] == "personal@gmail.com"
     assert message["Subject"] == "Engineer role"
-    assert message.get_content().startswith("Hi Pat,")
+    assert message.get_content_type() == "multipart/alternative"
+    plain, rich = message.get_payload()
+    assert plain.get_content_type() == "text/plain"
+    assert plain.get_content().startswith("Hi Pat,\n\nA short note about A&B <systems>.")
+    assert rich.get_content_type() == "text/html"
+    assert rich.get_content() == (
+        "<div>Hi Pat,</div><div><br></div>"
+        "<div>A short note about A&amp;B &lt;systems&gt;.<br>Another sentence.</div>"
+        "<div><br></div><div>Thanks,<br>Ishav</div>\n"
+    )
 
 
 def test_connect_stores_account_and_token_privately(tmp_path, monkeypatch):

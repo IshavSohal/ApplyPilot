@@ -30,6 +30,7 @@ from applypilot.outreach.service import (
     preview_batch_schedule,
     rank_people,
     recover_reapplied_batches,
+    redraft_batch,
     schedule_settings,
 )
 
@@ -262,7 +263,11 @@ def test_prepare_review_and_send_are_idempotent(outreach_db, monkeypatch):
             {
                 **recipient,
                 "subject": f"Backend Engineer question for {recipient['first_name']}",
-                "body_text": f"Hi {recipient['first_name']},\n\nA reviewed test message.\n\nTest User",
+                "body_text": (
+                    f"Hi {recipient['first_name']},\n\nI'm Test, a Computer Science graduate from "
+                    "Example University with experience in backend systems. A reviewed test message."
+                    "\n\nTest User"
+                ),
                 "used_facts": ["The role focuses on reliable systems"],
             }
             for recipient in recipients
@@ -311,6 +316,42 @@ def test_prepare_review_and_send_are_idempotent(outreach_db, monkeypatch):
     assert [item["status"] for item in sent["recipients"]].count("excluded") == 3
 
 
+def test_approval_rechecks_edited_introduction(outreach_db, monkeypatch):
+    monkeypatch.setenv("APOLLO_EMAIL_ACCOUNT_ID", "mailbox-1")
+    monkeypatch.setattr(
+        "applypilot.outreach.service.config.load_profile",
+        lambda: {"personal": {"full_name": "Ishav Sohal"}},
+    )
+    outreach_db.execute(
+        "INSERT INTO outreach_batches (id, job_url, status, created_at, updated_at) "
+        "VALUES ('batch-1', 'https://jobs.example.com/backend', 'ready_for_review', 'now', 'now')"
+    )
+    outreach_db.execute(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, subject, body_text, status, created_at, updated_at) "
+        "VALUES ('recipient-1', 'batch-1', 'person-1', 'Original', 'Original body', "
+        "'needs_edit', 'now', 'now')"
+    )
+    outreach_db.commit()
+    bad_intro = (
+        "Hi Morgan,\n\nI'm Ishav, a recent Computer Science graduate from the University of Toronto "
+        "with AI infrastructure and backend systems."
+    )
+    edit = {"id": "recipient-1", "subject": "Backend Engineer application", "body_text": bad_intro}
+
+    with pytest.raises(ValueError, match="biographical sentence must begin exactly"):
+        approve_batch("batch-1", [edit], confirmed=True, conn=outreach_db)
+
+    row = outreach_db.execute(
+        "SELECT status, body_text FROM outreach_recipients WHERE id = 'recipient-1'"
+    ).fetchone()
+    assert (row["status"], row["body_text"]) == ("needs_edit", "Original body")
+
+    edit["body_text"] = bad_intro.replace("with AI infrastructure", "with experience in AI infrastructure")
+    scheduled = approve_batch("batch-1", [edit], confirmed=True, conn=outreach_db)
+    assert scheduled["status"] == "scheduled"
+
+
 def test_rank_people_balances_hiring_circle():
     people = FakeApollo().search_people()
     ranked = rank_people(people, "Backend Engineer", "Python backend platform")
@@ -347,6 +388,126 @@ def test_clear_cancelled_batch_rejects_active_batch(outreach_db, monkeypatch):
 
     with pytest.raises(ValueError, match="Only a cancelled"):
         clear_cancelled_batch(batch["id"], outreach_db)
+
+
+def test_redraft_batch_reuses_recipients_and_preserves_suppressed_contacts(
+    outreach_db, monkeypatch
+):
+    monkeypatch.setenv("OUTREACH_ENABLED", "true")
+    monkeypatch.setattr(
+        "applypilot.outreach.service.config.load_profile",
+        lambda: {"personal": {"full_name": "Test User"}},
+    )
+    batch = enqueue_for_job("https://jobs.example.com/backend", outreach_db)
+    now_text = "2026-09-10T14:00:00+00:00"
+    outreach_db.executemany(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, first_name, last_name, title, email, email_status, "
+        "relevance_score, relevance_reason, subject, body_text, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "recipient-1", batch["id"], "person-1", "Morgan", "Manager",
+                "Engineering Manager", "morgan@example.com", 90, "Relevant manager",
+                "Old subject", "Old body", "ready", now_text, now_text,
+            ),
+            (
+                "recipient-2", batch["id"], "person-2", "Sam", "Senior",
+                "Senior Backend Engineer", "sam@example.com", 70, "Relevant peer",
+                "Suppressed subject", "Suppressed body", "suppressed", now_text, now_text,
+            ),
+        ],
+    )
+    outreach_db.execute(
+        "UPDATE outreach_batches SET status = 'ready_for_review', company_research_json = ? "
+        "WHERE id = ?",
+        (json.dumps({"apollo": {"name": "Example"}}), batch["id"]),
+    )
+    outreach_db.commit()
+    cancelled = cancel_batch(batch["id"], outreach_db)
+    assert cancelled["status"] == "cancelled"
+    assert next(
+        item for item in cancelled["recipients"] if item["id"] == "recipient-1"
+    )["status"] == "cancelled"
+    captured = {}
+
+    def generate(job, recipients, research, profile):
+        captured.update(
+            job=job, recipients=recipients, research=research, profile=profile
+        )
+        return [{
+            **recipients[0],
+            "subject": "Reliable systems at Example",
+            "body_text": "A newly generated body",
+            "used_facts": ["The role focuses on reliable systems"],
+            "validation_errors": [],
+        }]
+
+    monkeypatch.setattr("applypilot.outreach.service._generate_messages", generate)
+
+    result = redraft_batch(batch["id"], conn=outreach_db)
+
+    assert result["status"] == "ready_for_review"
+    assert [item["person_id"] for item in captured["recipients"]] == ["person-1"]
+    assert captured["recipients"][0]["candidate_kind"] == "manager"
+    assert captured["research"] == {"apollo": {"name": "Example"}}
+    by_id = {item["id"]: item for item in result["recipients"]}
+    assert by_id["recipient-1"]["subject"] == "Reliable systems at Example"
+    assert by_id["recipient-1"]["body_text"] == "A newly generated body"
+    assert by_id["recipient-2"]["subject"] == "Suppressed subject"
+    assert by_id["recipient-2"]["status"] == "suppressed"
+
+
+def test_redraft_batch_refuses_after_gmail_drafting_has_started(
+    outreach_db, monkeypatch
+):
+    monkeypatch.setenv("OUTREACH_ENABLED", "true")
+    batch = enqueue_for_job("https://jobs.example.com/backend", outreach_db)
+    outreach_db.execute(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, email, email_status, status, gmail_draft_id, "
+        "created_at, updated_at) VALUES "
+        "('recipient-1', ?, 'person-1', 'morgan@example.com', 'verified', 'drafted', "
+        "'gmail-draft-1', 'now', 'now')",
+        (batch["id"],),
+    )
+    outreach_db.execute(
+        "UPDATE outreach_batches SET status = 'drafted' WHERE id = ?", (batch["id"],)
+    )
+    outreach_db.commit()
+
+    with pytest.raises(ValueError, match="Only an unsent"):
+        redraft_batch(batch["id"], conn=outreach_db)
+
+
+def test_failed_redraft_keeps_the_previous_messages(outreach_db, monkeypatch):
+    monkeypatch.setenv("OUTREACH_ENABLED", "true")
+    batch = enqueue_for_job("https://jobs.example.com/backend", outreach_db)
+    outreach_db.execute(
+        "INSERT INTO outreach_recipients "
+        "(id, batch_id, apollo_person_id, first_name, title, email, email_status, "
+        "subject, body_text, status, created_at, updated_at) VALUES "
+        "('recipient-1', ?, 'person-1', 'Morgan', 'Engineering Manager', "
+        "'morgan@example.com', 'verified', 'Keep subject', 'Keep body', 'ready', 'now', 'now')",
+        (batch["id"],),
+    )
+    outreach_db.execute(
+        "UPDATE outreach_batches SET status = 'ready_for_review' WHERE id = ?", (batch["id"],)
+    )
+    outreach_db.commit()
+    monkeypatch.setattr(
+        "applypilot.outreach.service._generate_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("LLM unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="LLM unavailable"):
+        redraft_batch(batch["id"], conn=outreach_db)
+
+    result = get_batch(batch["id"], outreach_db)
+    assert result["status"] == "ready_for_review"
+    assert result["error"] == "LLM unavailable"
+    assert result["recipients"][0]["subject"] == "Keep subject"
+    assert result["recipients"][0]["body_text"] == "Keep body"
 
 
 def test_schedule_preview_uses_two_waves_and_skips_weekend(outreach_db, monkeypatch):
@@ -587,12 +748,11 @@ def test_message_validation_rejects_generic_spammy_draft():
     failures = " ".join(errors["person-1"])
     assert "reply or forward" in failures
     assert "prohibited phrase" in failures
-    assert "90-150" in failures
-    assert "exact role" in failures
-    assert "job location" in failures
+    assert "70-120" in failures
+    assert "job title" in failures
 
 
-def test_message_validation_requires_identity_and_education_before_technical_details():
+def test_message_validation_allows_a_hook_before_the_short_biography():
     base = {
         "person_id": "person-1",
         "subject": "Backend Engineer application",
@@ -600,17 +760,20 @@ def test_message_validation_requires_identity_and_education_before_technical_det
     }
     job = {"title": "Backend Engineer", "location": "Toronto, Ontario"}
     recipient = [{"person_id": "person-1", "first_name": "Morgan"}]
+    hook = (
+        "Hi Morgan,\n\nThe team's focus on reliable services stood out after I applied for "
+        "the Backend Engineer role. "
+    )
     remainder = (
-        " I applied for the Backend Engineer role in Toronto, Ontario. The team's work on "
-        "reliable services connects with my production experience. I would value your perspective "
-        "on what helps a new engineer contribute effectively. If you have a moment, what qualities "
-        "matter most for someone joining the team? No worries if you are not the right person to ask."
+        " My production Python work maps closely to that need. Where does the team feel the "
+        "sharpest tradeoff between delivery speed and service reliability? No worries if you're "
+        "not the right person to ask."
         "\n\nThanks,\nIshav Sohal"
     )
     bad = {
         **base,
         "body_text": (
-            "Hi Morgan,\n\nI'm Ishav, and I've worked on backend and distributed-systems projects "
+            hook + "I'm Ishav, and I've worked on backend and distributed-systems projects "
             "where I had to think carefully about scalability, caching, fault tolerance, and latency."
             + remainder
         ),
@@ -618,10 +781,16 @@ def test_message_validation_requires_identity_and_education_before_technical_det
     good = {
         **base,
         "body_text": (
-            "Hi Morgan,\n\nI'm Ishav, a recent Computer Science graduate from the University of Toronto "
-            "with experience in backend systems and AI infrastructure. I currently work as an AI "
-            "Solutions Engineer at FGF Brands."
+            hook + "I'm Ishav, a recent Computer Science graduate from the University of Toronto "
+            "with experience in backend systems and AI infrastructure."
             + remainder
+        ),
+    }
+    missing_experience = {
+        **good,
+        "body_text": good["body_text"].replace(
+            "with experience in backend systems and AI infrastructure",
+            "with AI infrastructure and backend systems",
         ),
     }
 
@@ -631,11 +800,37 @@ def test_message_validation_requires_identity_and_education_before_technical_det
     good_failures = _message_errors(
         job, recipient, [good], "Ishav Sohal", "FGF Brands"
     ).get("person-1", [])
+    missing_experience_failures = _message_errors(
+        job, recipient, [missing_experience], "Ishav Sohal", "FGF Brands"
+    )["person-1"]
 
-    assert "first sentence does not establish the candidate's education" in bad_failures
-    assert any("first sentence must begin exactly" in failure for failure in bad_failures)
-    assert "message does not identify the current employer: FGF Brands" in bad_failures
-    assert not any("first sentence" in failure for failure in good_failures)
+    assert "biographical sentence does not establish the candidate's education" in bad_failures
+    assert any("biographical sentence must begin exactly" in failure for failure in bad_failures)
+    assert not any("biographical sentence" in failure for failure in good_failures)
+    unnatural = {
+        **good,
+        "body_text": good["body_text"].replace(
+            "applied for the Backend Engineer role",
+            "applied for the exact Backend Engineer role",
+        ),
+    }
+    assert "message unnaturally describes the opening as an exact role" in _message_errors(
+        job, recipient, [unnatural], "Ishav Sohal", "FGF Brands"
+    )["person-1"]
+    meeting_ask = {
+        **good,
+        "body_text": good["body_text"].replace(
+            "Where does the team feel the sharpest tradeoff between delivery speed and service reliability?",
+            "Would you be open to a 15-minute chat?",
+        ),
+    }
+    assert "first-touch message asks for a chat, call, or meeting" in _message_errors(
+        job, recipient, [meeting_ask], "Ishav Sohal", "FGF Brands"
+    )["person-1"]
+    assert any(
+        "biographical sentence must begin exactly" in failure
+        for failure in missing_experience_failures
+    )
 
 
 def test_current_employer_is_inferred_from_explicit_writing_sample():
@@ -710,6 +905,11 @@ def test_message_validation_allows_only_the_saved_posting_link():
     recipients = [{"person_id": "person-1", "first_name": "Morgan"}]
 
     assert _message_errors(job, recipients, [message], "Test User") == {}
+    message["body_text"] = body.replace("\nhttps://jobs.example.com/backend", "")
+    assert "message does not include the exact job-posting link" in _message_errors(
+        job, recipients, [message], "Test User"
+    )["person-1"]
+    message["body_text"] = body
     message["body_text"] = body + "\nhttps://unrelated.example.com/track"
     assert "message contains a URL" in _message_errors(job, recipients, [message], "Test User")["person-1"]
 
@@ -778,13 +978,21 @@ def test_generation_prompt_enforces_voice_and_human_wording(monkeypatch):
     assert "never hard-wrap prose or insert a newline within a paragraph" in captured["prompt"]
     assert "Format the sign-off on exactly two lines" in captured["prompt"]
     assert 'CANDIDATE NAME: "Test User"' in captured["prompt"]
-    assert "Do not rely on the sign-off or assume the recipient has read your application or resume" in captured["prompt"]
-    assert "not like a pasted mini-resume" in captured["prompt"]
-    assert "must follow REQUIRED INTRODUCTION TEMPLATE" in captured["prompt"]
+    assert "goal is to earn a thoughtful reply" in captured["prompt"]
+    assert "The first prose sentence after the greeting is the hook" in captured["prompt"]
+    assert "Do not open with the candidate's biography" in captured["prompt"]
+    assert "Do not paste a mini-resume" in captured["prompt"]
+    assert "exactly one concise, insightful question" in captured["prompt"]
+    assert "Do not ask for a coffee chat, call, meeting, referral" in captured["prompt"]
+    assert "real priority, tradeoff, challenge, or decision" in captured["prompt"]
+    assert 'Avoid generic questions such as "What qualities do you value?"' in captured["prompt"]
+    assert "2-8 word subject" in captured["prompt"]
     assert "REQUIRED INTRODUCTION TEMPLATE" in captured["prompt"]
     assert "scalability, caching, fault tolerance, throughput, or latency" in captured["prompt"]
-    assert "Explicitly say you applied for the exact role at the company" in captured["prompt"]
+    assert "State naturally that the candidate applied" in captured["prompt"]
+    assert 'Never write "the exact role,"' in captured["prompt"]
     assert 'JOB POSTING LINK: "https://jobs.example.com/backend"' in captured["prompt"]
+    assert "include that exact URL once on its own line near the end" in captured["prompt"]
     assert "URLs other than the optional exact JOB POSTING LINK" in captured["prompt"]
     assert "I hope this email finds you well" in captured["prompt"]
     assert "materially different wording" in captured["prompt"]

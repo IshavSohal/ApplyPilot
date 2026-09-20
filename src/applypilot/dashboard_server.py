@@ -27,7 +27,7 @@ import yaml
 
 from applypilot import config
 from applypilot.database import get_connection
-from applypilot.view import generate_dashboard
+from applypilot.view import applied_view, generate_dashboard
 
 log = logging.getLogger(__name__)
 
@@ -917,12 +917,20 @@ def mark_job_applied(raw_url: str, conn: sqlite3.Connection | None = None) -> di
     conn.commit()
     from applypilot.outreach.service import enqueue_for_job
     outreach = enqueue_for_job(url, conn, reapplied=not bool(row["applied_at"]))
+    has_email_draft = conn.execute(
+        "SELECT 1 FROM outreach_recipients r "
+        "JOIN outreach_batches b ON b.id = r.batch_id "
+        "WHERE b.job_url = ? AND "
+        "(r.gmail_draft_id IS NOT NULL OR r.apollo_message_id IS NOT NULL) LIMIT 1",
+        (url,),
+    ).fetchone() is not None
     return {
         "updated": True,
         "url": url,
         "title": row["title"],
         "status": "applied",
         "applied_at": applied_at,
+        "applied_tab": applied_view(applied_at, has_email_draft),
         "outreach": outreach,
     }
 
@@ -1953,6 +1961,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/outreach/approve",
             "/api/outreach/gmail-drafts",
             "/api/outreach/reset-gmail-draft",
+            "/api/outreach/redraft",
             "/api/outreach/retry",
             "/api/outreach/cancel",
             "/api/outreach/cancel-pending",
@@ -2008,14 +2017,30 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     cancel_pending,
                     clear_cancelled_batch,
                     create_gmail_drafts,
+                    enqueue_for_job,
                     prepare_batch,
                     preview_batch_schedule,
-                    retry_batch,
+                    redraft_batch,
                     reset_uncertain_gmail_draft,
+                    retry_batch,
                     suppress_recipient,
                 )
+                from applypilot.outreach.service import enabled as outreach_enabled
+
                 if path == "/api/outreach/prepare":
-                    identifier = payload.get("batch_id") or payload.get("job_url") or ""
+                    identifier = payload.get("batch_id") or ""
+                    if not identifier:
+                        job_url = payload.get("job_url") or ""
+                        if not outreach_enabled():
+                            raise ValueError(
+                                "Employee outreach is disabled. Set OUTREACH_ENABLED=true and restart ApplyPilot."
+                            )
+                        batch = enqueue_for_job(job_url)
+                        if not batch:
+                            raise ValueError(
+                                "Outreach can only be prepared for a job marked as applied"
+                            )
+                        identifier = batch["id"]
                     self.server.outreach_pool.submit(prepare_batch, identifier)
                     result = {"status": "queued", "id": identifier}
                 elif path == "/api/outreach/preview":
@@ -2041,6 +2066,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         payload.get("recipient_id", ""),
                         confirmed_no_draft=payload.get("confirmed_no_draft") is True,
                     )
+                elif path == "/api/outreach/redraft":
+                    result = redraft_batch(payload.get("batch_id", ""))
                 elif path == "/api/outreach/retry":
                     result = retry_batch(payload.get("batch_id", ""))
                 elif path == "/api/outreach/cancel":
